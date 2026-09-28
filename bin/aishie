@@ -2,6 +2,7 @@
 # Things done by hand on this server's AIShie stack, as root, with the
 # images that run and the settings and mounts they run with:
 #
+#   aishie admin                   the first administrator: asks for a name, an email and a password
 #   aishie core bootstrap --name "Your Name" --email you@example.edu --password-stdin
 #   aishie core token issue --actor ID --label grader-bot --days 90
 #   aishie core migrate version
@@ -17,6 +18,12 @@
 # image the service runs (aishie-update --status), with its env file, its
 # mounts, its user and its network, and pass standard input on: a password
 # given with --password-stdin is on no command line.
+#
+# `aishie admin` makes the first administrator: it asks for a name, an email
+# and a password (twice, not shown), gives the password to Core's bootstrap
+# on its standard input, and then restarts Core, so that its background jobs
+# start as the system actor bootstrap creates. The long form, with
+# `aishie core bootstrap`, does the same in three steps.
 #
 # `aishie backup` is what aishie-backup.timer runs every night: the two
 # databases dumped to /var/backups/aishie/SERVICE-daily-N.dump, N the day of
@@ -77,7 +84,64 @@ backup() {
   exit "$rc"
 }
 
+# ask PROMPT: a line from standard input, in $ans. secret PROMPT: the same,
+# not shown as it is typed when standard input is a terminal.
+ask() {
+  printf '%s' "$1" >&2
+  IFS= read -r ans || [ -n "$ans" ] || die "no answer: nothing was changed"
+}
+secret() {
+  printf '%s' "$1" >&2
+  if [ -t 0 ]; then
+    # Echo comes back however this ends, Ctrl-C included.
+    trap 'stty echo 2>/dev/null' EXIT
+    trap 'exit 130' INT TERM
+    stty -echo
+    IFS= read -r ans || :
+    stty echo
+    echo >&2
+  else
+    IFS= read -r ans || :
+  fi
+}
+
+# admin: the first administrator, as the header says. The password is on no
+# command line and in no output; bootstrap prints the administrator's API
+# token, once.
+admin() {
+  [ -n "$(setting "$STATE/images.env" CORE_REF)" ] ||
+    die "core is not deployed yet: aishie-update deploys it (aishie-update --status)"
+  ask 'Name: '
+  name=$ans
+  [ -n "$name" ] || die "a name is needed: nothing was changed"
+  ask 'Email (to sign in with): '
+  email=$ans
+  case $email in ?*@?*.?*) ;; *) die "«$email» is not an email address: nothing was changed" ;; esac
+  secret 'Password (10 characters or more): '
+  pw=$ans
+  [ "${#pw}" -ge 10 ] || die "the password is shorter than 10 characters: nothing was changed"
+  secret 'The password again: '
+  [ "$ans" = "$pw" ] || die "the two passwords differ: nothing was changed"
+  ans=
+  printf '%s\n' "$pw" | compose run --rm --no-deps -T core bootstrap --name "$name" --email "$email" --password-stdin ||
+    die "bootstrap failed (above): Core was not restarted"
+  pw=
+  echo "aishie: restarting Core, so that its background jobs start" >&2
+  compose restart core >&2
+  host=$(setting "$ETC/aishie.env" HOST)
+  cat >&2 <<EOF
+aishie: done. Sign in at https://$host with $email and that password.
+The line above is the administrator's API token, for scripts: it is shown
+once. Keep it in a password manager, or leave it: aishie core token issue
+makes one whenever one is needed.
+EOF
+}
+
 case ${1:-} in
+  admin)
+    [ $# -eq 1 ] || usage
+    admin
+    ;;
   core | runtime)
     s=$1
     shift

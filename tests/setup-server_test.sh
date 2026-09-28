@@ -222,7 +222,7 @@ grep -q "^WEB_REF=$REG/aishie-frontend@sha256:$C$" "$AISHIE_STATE/images.env" ||
   fail "the web was recreated outside the lock"
 # What is left, said; and no secret anywhere in what it printed.
 said "Point test.aishie.app at this server" || fail "no DNS step: $(cat "$FAKE/out")"
-said "aishie core bootstrap --name .* --password-stdin" || fail "no bootstrap step"
+said "aishie admin" || fail "no step for the first administrator"
 said "install -g 65532 -m 640 tutor.yaml" || fail "no agent step"
 ! said "docker login" || fail "asked to log in, though every pull worked"
 for secret in "$core_pw" "$runtime_pw" "$(setting postgres.env POSTGRES_PASSWORD)" "$(setting core.env SIGNING_KEY)" "$(cat "$kek")"; do
