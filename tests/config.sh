@@ -121,5 +121,33 @@ for host in test.aishie.app localhost; do
   fi
 done
 
+# Caddy's routes, as Caddy reads them: Core's paths to Core, uncompressed;
+# the runtime's API without the browser's cookies, and nothing else of the
+# runtime's (9090 never); everything else to the web. One line per route,
+# in order: its paths => its handlers.
+case="caddy routes"
+if [ -n "$caddy" ]; then
+  adapted=$(HOST=test.aishie.app "$caddy" adapt --config "$root/caddy/Caddyfile" --adapter caddyfile 2>/dev/null) || adapted=
+else
+  adapted=$(docker run --rm -e HOST=test.aishie.app -v "$root/caddy:/etc/caddy:ro" "${CADDY_IMAGE:-caddy:2}" \
+    caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile 2>/dev/null) || adapted=
+fi
+routes=$(jq -r '
+  .apps.http.servers[].routes[] | select(.match[0].host == ["test.aishie.app"]) | .handle[] | .routes[] |
+  ((.match // [{path: ["*"]}])[0].path | join(" ")) + " => " +
+  ([.handle[] | if .handler == "subroute" then .routes[].handle[] else . end |
+    if .handler == "reverse_proxy" then "reverse_proxy " + ([.upstreams[].dial] | join(","))
+    elif .handler == "headers" then "headers -" + (.request.delete | join(" -"))
+    else .handler end] | join(", "))' <<< "${adapted:-null}" 2>&1) || routes="caddy adapt failed: $routes"
+want='/v1/* /mcp /mcp/* /healthz => reverse_proxy core:8080
+/runtime/api/* => headers -Cookie, reverse_proxy runtime:9091
+* => reverse_proxy web:8080'
+[ "$routes" = "$want" ] || fail "the routes are
+$routes
+not
+$want"
+[ "$(jq '[.. | objects | select(.handler? == "reverse_proxy") | .upstreams[].dial | select(test(":9090$"))] | length' <<< "${adapted:-null}")" = 0 ] ||
+  fail "something is routed to the runtime's 9090"
+
 [ "$failed" = 0 ] && echo "config: ok"
 exit "$failed"

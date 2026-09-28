@@ -78,12 +78,15 @@ update || fail "exit $?: $(cat "$FAKE/out")"
 [ "$(running core)" = "$CORE@sha256:$A" ] || fail "core runs $(running core)"
 [ "$(running runtime)" = "$RUNTIME@sha256:$B" ] || fail "runtime runs $(running runtime)"
 [ "$(running web)" = "$WEB@sha256:$C" ] || fail "web runs $(running web)"
-for step in "pull -q $CORE:edge" "up -d --no-recreate --wait" "pg_dump -U postgres -Fc aishie_core" \
+for step in "pull -q $CORE:edge" "pull -q $CORE@sha256:$A" "up -d --no-recreate --wait" "pg_dump -U postgres -Fc aishie_core" \
   "run -d --no-deps core migrate up" "run -d --no-deps core seed" "up -d --no-deps core" \
   "run -d --no-deps runtime check" "pg_dump -U postgres -Fc aishie_runtime" "run -d --no-deps runtime migrate up" \
   "up -d --no-deps runtime" "up -d --no-deps web" "image prune -af --filter label=org.opencontainers.image.source="; do
   called "$step" || fail "no «$step»"
 done
+# Pulled by digest too, before anything else: the name compose runs it by,
+# which stays when the tag moves on.
+[ "$(line "pull -q $CORE@sha256:$A")" -lt "$(line 'aishie_core')" ] || fail "core not pulled by digest before its deploy"
 [ "$(line 'aishie_core')" -lt "$(line 'core migrate up')" ] || fail "core migrated before its backup"
 [ "$(line 'core migrate up')" -lt "$(line 'core seed')" ] || fail "core seeded before migrating"
 [ "$(line 'core seed')" -lt "$(line 'up -d --no-deps core')" ] || fail "core started before seeding"
@@ -98,9 +101,9 @@ grep -q "CORE_REF=$CORE@sha256:$A docker compose .* run -d --no-deps core migrat
   fail "migrate up not with the new image: $(grep 'migrate up' "$CALLS" | head -n 1)"
 [ "$(count 'docker wait')" = "$(count ' run -d --no-deps')" ] || fail "not every one-off waited for"
 [ "$(count 'docker rm -f oneoff')" = "$(count ' run -d --no-deps')" ] || fail "not every one-off removed"
-called "curl -fsS --max-time 5 http://127.0.0.1:8080/healthz" || fail "core's health asked elsewhere"
-called "curl -fsS --max-time 5 http://127.0.0.1:9090/healthz" || fail "the runtime's health asked elsewhere"
-called "curl -fsS --max-time 5 http://127.0.0.1:8081/version.json" || fail "the web's health asked elsewhere"
+called "curl -fsS --noproxy \\* --max-time 5 http://127.0.0.1:8080/healthz" || fail "core's health asked elsewhere"
+called "curl -fsS --noproxy \\* --max-time 5 http://127.0.0.1:9090/healthz" || fail "the runtime's health asked elsewhere"
+called "curl -fsS --noproxy \\* --max-time 5 http://127.0.0.1:8081/version.json" || fail "the web's health asked elsewhere"
 [ "$(logged ': deployed')" = 3 ] || fail "log: $(cat "$FAKE/log")"
 grep -q "core none -> sha256:$A: deployed v0.2.0 (abc1234)" "$FAKE/log" || fail "log: $(cat "$FAKE/log")"
 grep -q "web none -> sha256:$C: deployed v0.3.0 (cde3456)" "$FAKE/log" || fail "log: $(cat "$FAKE/log")"

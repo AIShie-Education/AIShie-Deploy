@@ -385,8 +385,14 @@ MSG
 
   say "The stack, the scripts and the timers"
   install_files "$here"
+  # The newest PostgreSQL 18 and Caddy 2. Caddy takes its own when it is
+  # started below; PostgreSQL's waits for a person (README.md, PostgreSQL's
+  # major version). Docker Hub may refuse for a while (it limits pulls): the
+  # images this server has do until then, and one it lacks is pulled when it
+  # is first needed, or the step that needs it says why not.
+  compose pull -q postgres caddy ||
+    echo "could not pull the newest postgres:18 and caddy:2 (above): going on with the ones this server has"
   # Caddy checks its configuration here before it is the one Caddy runs.
-  compose pull -q postgres caddy
   host=$(sed -n 's/^HOST=//p' "$ETC/aishie.env" | tail -n 1)
   docker run --rm --network none -e "HOST=$host" -v "$APP/caddy:/etc/caddy:ro" caddy:2 \
     caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>"$STATE/caddy.err" ||

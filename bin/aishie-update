@@ -266,7 +266,8 @@ version_of() {
 # runtime: /healthz, status "ok" with the version and the commit. The web:
 # /version.json with the commit.
 says() {
-  body=$(curl -fsS --max-time 5 "$(health_url "$1")" 2>/dev/null | tr -d ' \t\r\n') || true
+  # This machine's loopback, never through a proxy an operator's shell names.
+  body=$(curl -fsS --noproxy '*' --max-time 5 "$(health_url "$1")" 2>/dev/null | tr -d ' \t\r\n') || true
   case $1 in
     core | runtime)
       case $body in *'"status":"ok"'*) ;; *) return 1 ;; esac
@@ -348,6 +349,11 @@ prune() {
 # deploy SERVICE OLD NEW: the steps above. Exits on failure.
 deploy() {
   s=$1 old=$2 new=$3
+  # The image by its digest too, the name compose runs it by. With Docker's
+  # containerd image store, an image pulled by tag alone loses its only name
+  # here when the tag moves on; so named, it stays, and a rollback to it, or
+  # a start after a reboot, needs no registry. Its layers are here already.
+  docker pull -q "$new" >/dev/null 2>&1 || true
   src=$(label "$new" org.opencontainers.image.source)
   if [ "$(lower "$src")" != "$(lower "$(source_of "$s")")" ]; then
     fail_image "$s" "$old" "$new" "refused: its source is ${src:-not labelled}, not $(source_of "$s")"

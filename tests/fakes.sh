@@ -18,7 +18,8 @@
 #   volumes/NAME           a volume Docker has
 #
 # Knobs, in the environment: PULL_FAIL, MIGRATE_FAIL, SEED_FAIL, CHECK_FAIL,
-# BACKUP_FAIL, POSTGRES_FAIL, CADDY_FAIL and FLOCK_FAIL make that step fail.
+# BACKUP_FAIL, POSTGRES_FAIL, CADDY_FAIL, COMPOSE_PULL_FAIL and FLOCK_FAIL make
+# that step fail.
 
 # make_fakes DIR: the stand-ins, in DIR, to put first on PATH.
 make_fakes() {
@@ -56,6 +57,7 @@ compose() {
   done
   case "$*" in
     "version --short") cat "$FAKE/compose-version" 2>/dev/null || echo "${COMPOSE_VERSION:-2.27.0}" ;;
+    "pull -q "*) exit "${COMPOSE_PULL_FAIL:-0}" ;;
     "up -d --no-recreate --wait"*) exit "${POSTGRES_FAIL:-0}" ;;
     "up -d --no-deps "*) service_image "$4" > "$FAKE/running/$4" ;;
     "rm -s -f "*) rm -f "$FAKE/running/$4" ;;

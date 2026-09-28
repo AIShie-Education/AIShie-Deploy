@@ -1,6 +1,7 @@
 # The checks CI runs, one target each, so that `make ci` here and a green
-# pipeline mean the same thing. The end to end is CI's alone: it needs the
-# real images and a Docker that can run them (tests/e2e.sh).
+# pipeline mean the same thing. The end to end is apart: it sets the machine
+# it runs on up as a server, as root, with the real images (tests/e2e.sh), so
+# CI runs it on a runner it throws away.
 
 SHELL       := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
@@ -41,3 +42,7 @@ test: ## the scripts against stand-ins for docker, curl and flock
 .PHONY: config
 config: ## docker compose config against the example settings, and caddy validate
 	tests/config.sh
+
+.PHONY: e2e
+e2e: ## the whole stack for real: as root, on a machine that can be thrown away
+	tests/e2e.sh

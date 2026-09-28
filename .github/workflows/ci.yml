@@ -1,0 +1,88 @@
+name: CI
+
+# Runs on every pull request and on main, and every day: the images the stack
+# runs move on their own (each repository's :edge), so the end to end shows
+# when the stack stops working with them, pushed or not. Nothing here reaches
+# a server: servers pull their updates themselves (README.md).
+#
+# Every check but the end to end calls a Makefile target, so `make ci`
+# locally is the same thing.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "41 4 * * *" # daily
+  workflow_dispatch:
+
+# A newer push to a pull request makes the older run moot; every push to
+# main is checked in a run of its own.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+# Each run block is bash with -o pipefail: a pipeline fails when any command
+# in it does, not only when its last one does.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # actionlint, by `go run` at the version the Makefile names.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27"
+          cache: false
+      - run: shellcheck --version
+      - run: make lint
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # aishie-update, aishie and setup-server.sh against stand-ins for
+      # docker, curl, flock, apt and systemctl.
+      - run: make test
+
+  config:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: docker compose version
+      # docker compose config against the example settings, and caddy
+      # validate and adapt of the Caddyfile, in Caddy's image.
+      - run: make config
+
+  # The whole stack, for real, on this runner, which is thrown away after:
+  # setup-server.sh as root with the real :edge images, the first update,
+  # then every route through Caddy with its local authority, the runtime's
+  # way to Core by the name inside the network, the operator's commands, and
+  # a second update that does nothing (tests/e2e.sh).
+  e2e:
+    name: end to end, with the :edge images
+    needs: [test, config]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read # the three images, which are private
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # As root, as the server does it: setup-server.sh and aishie-update
+      # run as root and read root's Docker login. The packages are private:
+      # this works once an owner of the organization has let this
+      # repository read each of them, and tests/e2e.sh says so when a pull
+      # is refused.
+      - name: Log in to GHCR
+        env:
+          TOKEN: ${{ github.token }}
+        run: printf '%s\n' "$TOKEN" | sudo docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - run: sudo --preserve-env=GITHUB_ACTIONS tests/e2e.sh

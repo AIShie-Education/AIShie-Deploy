@@ -73,7 +73,7 @@ setup() {
   export AISHIE_ETC=$FAKE/etc AISHIE_STATE=$FAKE/state AISHIE_APP=$FAKE/opt AISHIE_DATA=$FAKE/srv \
     AISHIE_BACKUPS=$FAKE/backups AISHIE_BIN=$FAKE/usr-local-bin AISHIE_UNITS=$FAKE/units \
     AISHIE_LOCK_FILE=$FAKE/lock AISHIE_LOG_FILE=$FAKE/log AISHIE_HEALTH_TRIES=3
-  unset PULL_FAIL CADDY_FAIL FLOCK_FAIL APT_COMPOSE DOCKER_CE UFW_ACTIVE NOT_ROOT COMPOSE_VERSION INVOCATION_ID
+  unset PULL_FAIL CADDY_FAIL FLOCK_FAIL COMPOSE_PULL_FAIL APT_COMPOSE DOCKER_CE UFW_ACTIVE NOT_ROOT COMPOSE_VERSION INVOCATION_ID
   image core "$A" v0.2.0 abc1234
   image runtime "$B" v0.4.0 bcd2345
   image web "$C" v0.3.0 cde3456
@@ -253,6 +253,13 @@ setup ufw
 UFW_ACTIVE=1 setup_server test.aishie.app staging || fail "exit $?: $(cat "$FAKE/out")"
 for rule in 80/tcp 443/tcp 443/udp; do called "ufw allow $rule" || fail "ufw: no $rule"; done
 [ "$(grep -c 'ufw allow' "$CALLS")" = 3 ] || fail "ufw: $(grep 'ufw allow' "$CALLS")"
+
+# Docker Hub refuses the newest postgres:18 and caddy:2 for a while: the
+# set-up goes on with the ones the server has.
+setup docker-hub-refuses
+COMPOSE_PULL_FAIL=1 setup_server test.aishie.app staging || fail "exit $?: $(cat "$FAKE/out")"
+said "could not pull the newest postgres:18 and caddy:2 (above): going on with the ones this server has" || fail "said: $(cat "$FAKE/out")"
+grep -q "^CORE_REF=" "$AISHIE_STATE/images.env" || fail "stopped before the first update"
 
 # The images cannot be pulled: how to log in, said exactly, and the run
 # fails once it has said what is left.
