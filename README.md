@@ -595,3 +595,7 @@ the `AISHIE_` paths at the top of each script move where it writes.
 
 The scripts are POSIX sh, as the server runs them, and shellcheck-clean;
 the tests are bash. Comments say what is true and why.
+
+## License
+
+AIShie Deploy is source-available under the [Elastic License 2.0](LICENSE) (ELv2). You may use, copy, change and redistribute it on the terms in LICENSE, which include that you may not offer it to others as a hosted or managed service.
