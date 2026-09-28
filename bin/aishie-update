@@ -1,0 +1,505 @@
+#!/bin/sh
+# Keeps this server's AIShie stack on the images its channels name. The
+# timer aishie-update.timer runs it every five minutes; as root, by hand:
+#
+#   aishie-update                    one run: core, runtime and web, in that order
+#   aishie-update --dry-run          what one run would do; it changes nothing
+#   aishie-update --status           what runs, what each follows, how the last check went
+#   aishie-update --retry SERVICE    forget SERVICE's failed images, then one run
+#   aishie-update --pin SERVICE REF  deploy exactly REF (a tag, or a digest) and stay on it
+#   aishie-update --unpin SERVICE    follow SERVICE's channel again, then one run
+#
+# For each service, a run pulls the tag its channel names (CORE_IMAGE,
+# RUNTIME_IMAGE and WEB_IMAGE in /etc/aishie/aishie.env) and reads the digest
+# it names now. The digest that runs already: nothing to do. A digest that
+# failed before: nothing either, said once in the log, until another digest
+# comes or --retry. Any other is deployed, step by step:
+#
+#   core     its source label; its version; a backup of the database
+#            aishie_core; `migrate up` and `seed` with the new image; Core
+#            recreated on it; /healthz on 127.0.0.1:8080 reporting the new
+#            version and commit.
+#   runtime  its source label; its version; `check` of the agents'
+#            configuration with the new image; a backup of aishie_runtime;
+#            `migrate up`; the runtime recreated; /healthz on 127.0.0.1:9090
+#            reporting status ok and the new version and commit.
+#   web      its source label; recreated; /version.json on 127.0.0.1:8081
+#            reporting the commit of its revision label.
+#
+# The run stops at the first step that fails, and up to the recreate the
+# version that runs goes on running. A new version that does not report
+# healthy is replaced by the one before it, which is waited for in turn, and
+# its digest is recorded as failed. The one before can take over because
+# every migration leaves the release before it working (Core's and the
+# runtime's CONTRIBUTING.md, Migrations): the migrations go in before the
+# switch, and nothing ever migrates down.
+#
+# What runs is in /var/lib/aishie/images.env, repo@sha256:... per service,
+# which compose.yaml reads, and which nothing but this script writes: a
+# reboot or `docker compose up -d` starts the same images again. Each
+# outcome is a line in /var/log/aishie-update.log and in the journal.
+#
+# Secrets stay in the env files, which only Docker reads: this script never
+# reads them, and prints nothing of theirs.
+#
+# The variables that move the paths below are for the tests
+# (tests/aishie-update_test.sh), and AISHIE_REGISTRY for a registry of their
+# own.
+set -eu
+# The state, the log and the backups are root's alone.
+umask 077
+
+ETC=${AISHIE_ETC:-/etc/aishie}
+STATE=${AISHIE_STATE:-/var/lib/aishie}
+APP=${AISHIE_APP:-/opt/aishie}
+BACKUPS=${AISHIE_BACKUPS:-/var/backups/aishie}
+LOG_FILE=${AISHIE_LOG_FILE:-/var/log/aishie-update.log}
+LOCK_FILE=${AISHIE_LOCK_FILE:-/run/aishie-update.lock}
+LOCK_WAIT=${AISHIE_LOCK_WAIT:-600}
+HEALTH_TRIES=${AISHIE_HEALTH_TRIES:-30}
+REGISTRY=${AISHIE_REGISTRY:-ghcr.io/aishie-education}
+SETTINGS=$ETC/aishie.env
+IMAGES=$STATE/images.env
+KEEP_BACKUPS=10
+SERVICES="core runtime web"
+# The tests move the state; the real thing runs as root.
+MOVED=${AISHIE_STATE:+yes}
+
+# compose.yaml reads these from aishie.env and images.env, and the same
+# names in this process's environment would win over both files.
+unset HOST ENVIRONMENT CORE_IMAGE RUNTIME_IMAGE WEB_IMAGE CORE_REF RUNTIME_REF WEB_REF \
+  AISHIE_SUBNET AISHIE_CADDY_IP RUNTIME_STOP_GRACE
+export AISHIE_ETC="$ETC" AISHIE_STATE="$STATE"
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: aishie-update                    one run: deploy what the channels name now
+       aishie-update --dry-run          say what a run would do, and change nothing
+       aishie-update --status           what runs, what each service follows, the last check
+       aishie-update --retry SERVICE    forget SERVICE's failed images, then one run
+       aishie-update --pin SERVICE REF  deploy exactly REF (tag, repo@sha256:..., or sha256:...) and stay on it
+       aishie-update --unpin SERVICE    follow SERVICE's channel again, then one run
+SERVICE is core, runtime or web.
+USAGE
+  exit 2
+}
+die() { echo "aishie-update: $*" >&2; exit 1; }
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# setting FILE NAME: NAME's last value in an env file, as Docker reads it.
+setting() { sed -n "s/^$2=//p" "$1" 2>/dev/null | tr -d '\r' | tail -n 1; }
+
+# Each service's repository, and the repository its images must come from.
+repo_of() {
+  case $1 in
+    core) echo "$REGISTRY/aishie-core" ;;
+    runtime) echo "$REGISTRY/aishie-agent-runtime" ;;
+    web) echo "$REGISTRY/aishie-frontend" ;;
+  esac
+}
+source_of() {
+  case $1 in
+    core) echo https://github.com/AIShie-Education/AIShie-Core ;;
+    runtime) echo https://github.com/AIShie-Education/AIShie-Agent-Runtime ;;
+    web) echo https://github.com/AIShie-Education/AIShie-Frontend ;;
+  esac
+}
+# Where each answers on this machine's loopback (stack.yaml's ports).
+health_url() {
+  case $1 in
+    core) echo http://127.0.0.1:8080/healthz ;;
+    runtime) echo http://127.0.0.1:9090/healthz ;;
+    web) echo http://127.0.0.1:8081/version.json ;;
+  esac
+}
+is_service() { case $1 in core | runtime | web) return 0 ;; *) return 1 ;; esac; }
+
+# docker compose for the stack. compose.yaml finds aishie.env and images.env
+# by AISHIE_ETC and AISHIE_STATE, exported above.
+compose() { docker compose --project-directory "$APP" -f "$APP/compose.yaml" "$@"; }
+# compose_with SERVICE REF ARGS...: the same, with SERVICE's image REF instead
+# of the one images.env names.
+compose_with() {
+  var=$(upper "$1")_REF ref=$2
+  shift 2
+  env "$var=$ref" docker compose --project-directory "$APP" -f "$APP/compose.yaml" "$@"
+}
+
+# The state, per service, in $STATE: images.env, the image each runs;
+# SERVICE.failed, the digests that failed, one per line; SERVICE.pin, the
+# image it is pinned to by hand; SERVICE.last, the last line logged;
+# SERVICE.checked, the last check and what it found; SERVICE.noted, what was
+# last logged of an outcome that is logged once.
+deployed() { setting "$IMAGES" "$(upper "$1")_REF"; }
+set_deployed() {
+  {
+    echo "# The image each service of this server's AIShie stack runs, by digest."
+    echo "# aishie-update writes it after each deploy and compose.yaml reads it:"
+    echo "# change it with aishie-update --pin, not by hand."
+    for _s in $SERVICES; do
+      if [ "$_s" = "$1" ]; then _v=$2; else _v=$(deployed "$_s"); fi
+      [ -z "$_v" ] || echo "$(upper "$_s")_REF=$_v"
+    done
+  } > "$IMAGES.new"
+  mv "$IMAGES.new" "$IMAGES"
+}
+digest_in() { printf '%s\n' "${1#*@}"; }
+is_failed() { [ -f "$STATE/$1.failed" ] && grep -qxF -- "$(digest_in "$2")" "$STATE/$1.failed"; }
+record_failed() { is_failed "$1" "$2" || digest_in "$2" >> "$STATE/$1.failed"; }
+pinned() { cat "$STATE/$1.pin" 2>/dev/null || true; }
+checked() { printf '%s %s\n' "$(now)" "$2" > "$STATE/$1.checked"; }
+# arrow OLD NEW: the two images by digest, "none" for nothing.
+arrow() { printf '%s -> %s' "$(digest_in "${1:-none}")" "$(digest_in "${2:-none}")"; }
+
+# log SERVICE MESSAGE: one line, with the time, in the log file, in the
+# journal and on standard output. Run by systemd, standard output is the
+# journal; run by hand, logger puts it there.
+log() {
+  line="$(now) $1 $2"
+  printf '%s\n' "$line" >> "$LOG_FILE"
+  printf '%s\n' "$line" > "$STATE/$1.last"
+  printf '%s\n' "$line"
+  if [ -z "${INVOCATION_ID:-}" ] && command -v logger >/dev/null 2>&1; then
+    logger -t aishie-update -- "$1 $2" 2>/dev/null || true
+  fi
+}
+# log_once SERVICE MESSAGE: log, unless it is what was last logged of the
+# kind: a failed image skipped, or a failure every run meets until someone
+# acts, is logged once and not every five minutes.
+log_once() {
+  if [ "$(cat "$STATE/$1.noted" 2>/dev/null || true)" = "$2" ]; then
+    printf '%s %s %s (as before: not logged again)\n' "$(now)" "$1" "$2"
+  else
+    log "$1" "$2"
+    printf '%s\n' "$2" > "$STATE/$1.noted"
+  fi
+}
+# fail_image SERVICE OLD NEW MESSAGE: NEW is recorded as failed, so that the
+# runs after this one leave it be, and this run stops.
+fail_image() {
+  record_failed "$1" "$3"
+  rm -f "$STATE/$1.noted"
+  checked "$1" "failed: $4"
+  log "$1" "$(arrow "$2" "$3"): $4; recorded as failed (aishie-update --retry $1 to try it again)"
+  exit 1
+}
+# fail_run SERVICE MESSAGE: this run stops; the next one tries again, and the
+# log has it once while it stays the same. For what is not the image's fault.
+fail_run() {
+  checked "$1" "failed: $2"
+  log_once "$1" "$2"
+  exit 1
+}
+
+# check_ref SERVICE REF: whether REF is an image of SERVICE's repository, by
+# tag or by digest, and nothing that is not part of such a name; in
+# production, a release (X.Y.Z) or a digest. Says why not on standard output.
+check_ref() {
+  repo=$(repo_of "$1")
+  case $2 in
+    *[!A-Za-z0-9._:@/-]*) echo "«$2» is not an image name"; return 1 ;;
+    "$repo"@sha256:*)
+      d=${2#"$repo"@sha256:}
+      case $d in *[!0-9a-f]*) echo "«$2» is not a digest of $repo"; return 1 ;; esac
+      [ "${#d}" = 64 ] || { echo "«$2» is not a digest of $repo"; return 1; }
+      return 0 ;;
+    "$repo":*) ;;
+    *) echo "$2 is not an image of $repo"; return 1 ;;
+  esac
+  tag=${2#"$repo":}
+  if [ "$(setting "$SETTINGS" ENVIRONMENT)" = production ] &&
+    ! printf '%s\n' "$tag" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+'; then
+    echo "production follows releases: $2 is not a release (X.Y.Z) nor a digest"
+    return 1
+  fi
+}
+
+# resolve SERVICE REF: pulls REF and prints the image it names, by digest.
+# On failure, prints Docker's error.
+resolve() {
+  repo=$(repo_of "$1")
+  if ! err=$(docker pull -q "$2" 2>&1 >/dev/null); then
+    printf '%s\n' "$err" | tail -n 3
+    return 1
+  fi
+  d=$(docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$2" 2>/dev/null |
+    awk -v p="$repo@" 'index($0, p) == 1 { d = substr($0, length(p) + 1); if (d ~ /^sha256:[0-9a-f]+$/ && length(d) == 71) { print d; exit } }') || true
+  if [ -z "$d" ]; then
+    echo "pulled $2, but Docker names no digest of $repo for it"
+    return 1
+  fi
+  echo "$repo@$d"
+}
+
+# label IMAGE NAME: one of the image's labels, empty when it has none.
+label() {
+  v=$(docker image inspect -f "{{index .Config.Labels \"$2\"}}" "$1" 2>/dev/null || true)
+  [ "$v" = "<no value>" ] || printf '%s\n' "$v"
+}
+
+# version_of SERVICE IMAGE: sets ver and commit, what the image says it is:
+# for Core and the runtime, their `version` ("v0.2.0 (abc1234, date)", the
+# runtime's after its name), run with no network; for the web, its labels.
+version_of() {
+  ver='' commit=''
+  case $1 in
+    core | runtime)
+      line=$(docker run --rm --network none "$2" version 2>/dev/null || true)
+      v=${line%% (*}
+      ver=${v##* }
+      commit=$(printf '%s\n' "$line" | sed -n 's/^[^(]*(\([^,]*\),.*/\1/p')
+      ;;
+    web)
+      commit=$(printf '%.7s' "$(label "$2" org.opencontainers.image.revision)")
+      ver=$(label "$2" org.opencontainers.image.version)
+      [ -n "$ver" ] || ver=$commit
+      ;;
+  esac
+  case $commit in '' | *[!A-Za-z0-9._-]*) commit='' ;; esac
+  case $ver in *[!A-Za-z0-9._+-]*) ver='' ;; esac
+  [ -n "$ver" ] && [ -n "$commit" ]
+}
+
+# says SERVICE VERSION COMMIT: whether it reports them now. Core and the
+# runtime: /healthz, status "ok" with the version and the commit. The web:
+# /version.json with the commit.
+says() {
+  body=$(curl -fsS --max-time 5 "$(health_url "$1")" 2>/dev/null | tr -d ' \t\r\n') || true
+  case $1 in
+    core | runtime)
+      case $body in *'"status":"ok"'*) ;; *) return 1 ;; esac
+      case $body in *"\"version\":\"$2\""*) ;; *) return 1 ;; esac
+      ;;
+  esac
+  case $body in *"\"commit\":\"$3\""*) ;; *) return 1 ;; esac
+}
+# healthy SERVICE VERSION COMMIT: whether it does within the tries.
+healthy() {
+  i=0
+  until says "$1" "$2" "$3"; do
+    i=$((i + 1))
+    [ "$i" -lt "$HEALTH_TRIES" ] || return 1
+    sleep 2
+  done
+}
+
+# oneoff SERVICE IMAGE ARGS...: ARGS in a one-off container of SERVICE with
+# IMAGE, and the service's env file, mounts and network, as it will run. It
+# runs detached, and this script waits for it: a Ctrl-C, or a stop of the
+# service that runs this script, leaves a migration to finish rather than
+# cutting it off half way. Its output is shown when it ends.
+oneoff() {
+  s=$1 img=$2
+  shift 2
+  id=$(compose_with "$s" "$img" run -d --no-deps "$s" "$@") || return 1
+  code=$(docker wait "$id" 2>/dev/null) || code=1
+  docker logs "$id" 2>&1 || true
+  docker rm -f "$id" >/dev/null 2>&1 || true
+  [ "$code" = 0 ]
+}
+
+# PostgreSQL, started if it is not running (never recreated: that is for a
+# person to do), and healthy.
+postgres_up() { compose up -d --no-recreate --wait --wait-timeout 180 postgres; }
+
+# backup SERVICE: the service's database dumped to
+# $BACKUPS/SERVICE-deploy-<UTC time>.dump, by pg_dump in PostgreSQL's
+# container, on its socket. Under another name until it is whole: a dump cut
+# short is not a backup. The newest ten are kept.
+backup() {
+  f=$BACKUPS/$1-deploy-$(date -u +%Y%m%dT%H%M%SZ).dump
+  if compose exec -T postgres pg_dump -U postgres -Fc "aishie_$1" > "$f.part" && [ -s "$f.part" ]; then
+    mv "$f.part" "$f"
+  else
+    rm -f "$f.part"
+    return 1
+  fi
+  echo "database aishie_$1 backed up: $f"
+  # shellcheck disable=SC2012 # the names are this script's own: no spaces
+  ls -1t "$BACKUPS/$1"-deploy-*.dump 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)) | while read -r old; do rm -f -- "$old"; done
+}
+
+# switch SERVICE IMAGE: from now on SERVICE runs IMAGE, or nothing when IMAGE
+# is empty. images.env first, then compose recreates the one service.
+switch() {
+  set_deployed "$1" "$2"
+  if [ -n "$2" ]; then
+    compose up -d --no-deps "$1" || echo "aishie-update: docker compose could not start $1 on $2 (above)"
+  else
+    compose rm -s -f "$1" || true
+  fi
+}
+
+# The images of the three repositories that no container uses, the one
+# before included (a rollback pulls it again), and never any other: by the
+# source label each deployed image has.
+prune() {
+  for _s in $SERVICES; do
+    _img=$(deployed "$_s")
+    [ -n "$_img" ] || continue
+    _src=$(label "$_img" org.opencontainers.image.source)
+    [ -n "$_src" ] || continue
+    docker image prune -af --filter "label=org.opencontainers.image.source=$_src" >/dev/null 2>&1 || true
+  done
+}
+
+# deploy SERVICE OLD NEW: the steps above. Exits on failure.
+deploy() {
+  s=$1 old=$2 new=$3
+  src=$(label "$new" org.opencontainers.image.source)
+  if [ "$(lower "$src")" != "$(lower "$(source_of "$s")")" ]; then
+    fail_image "$s" "$old" "$new" "refused: its source is ${src:-not labelled}, not $(source_of "$s")"
+  fi
+  version_of "$s" "$new" || fail_image "$s" "$old" "$new" "refused: cannot read its version and commit"
+  new_ver=$ver new_commit=$commit
+  echo "$s: deploying $new_ver ($new_commit), $new"
+
+  if [ "$s" = runtime ]; then
+    oneoff runtime "$new" check ||
+      fail_image "$s" "$old" "$new" "the agents' configuration in $ETC/runtime/agents does not pass \`check\` with it (above); nothing was changed"
+  fi
+  if [ "$s" != web ]; then
+    postgres_up || fail_run "$s" "PostgreSQL is not up and healthy (aishie logs postgres); nothing was changed"
+    backup "$s" || fail_run "$s" "the backup of the database aishie_$s failed; nothing was changed (is $BACKUPS full?)"
+    oneoff "$s" "$new" migrate up ||
+      fail_image "$s" "$old" "$new" "migrate up failed (above); ${old:-nothing} goes on running (docs/troubleshooting.md, A migration failed)"
+    if [ "$s" = core ]; then
+      oneoff core "$new" seed ||
+        fail_image "$s" "$old" "$new" "seed failed (above); ${old:-nothing} goes on running"
+    fi
+  fi
+
+  switch "$s" "$new"
+  if healthy "$s" "$new_ver" "$new_commit"; then
+    rm -f "$STATE/$s.noted"
+    checked "$s" "deployed $new_ver ($new_commit)"
+    log "$s" "$(arrow "$old" "$new"): deployed $new_ver ($new_commit)"
+    prune
+    return 0
+  fi
+
+  echo "aishie-update: $s $new_ver ($new_commit) did not report healthy within $((HEALTH_TRIES * 2)) seconds. Its last log lines:"
+  compose logs --no-color --tail 30 "$s" 2>&1 || true
+  why="not healthy within $((HEALTH_TRIES * 2)) seconds (docs/troubleshooting.md, The new version did not report healthy)"
+  if [ -z "$old" ]; then
+    switch "$s" ''
+    fail_image "$s" "$old" "$new" "$why; nothing ran before it, and nothing runs now"
+  fi
+  switch "$s" "$old"
+  if version_of "$s" "$old" && healthy "$s" "$ver" "$commit"; then
+    fail_image "$s" "$old" "$new" "$why; rolled back: $(digest_in "$old") runs again"
+  fi
+  fail_image "$s" "$old" "$new" "$why; rolled back to $(digest_in "$old"), which does not report healthy either: most likely an env file (aishie logs $s)"
+}
+
+# update SERVICE: one run's work for one service. Exits on failure.
+update() {
+  s=$1
+  on=$(pinned "$s")
+  if [ -n "$on" ]; then
+    if [ -n "$DRY" ]; then
+      echo "$s: pinned by hand to $on; nothing to do"
+    else
+      checked "$s" "pinned by hand to $on"
+      log_once "$s" "$(pinned_note "$s" "$on")"
+    fi
+    return 0
+  fi
+  var=$(upper "$s")_IMAGE
+  channel=$(setting "$SETTINGS" "$var")
+  [ -n "$channel" ] || fail_run "$s" "no channel: set $var in $SETTINGS, e.g. $(repo_of "$s"):edge (production: a release, X.Y.Z)"
+  why=$(check_ref "$s" "$channel") || fail_run "$s" "$var refused: $why"
+  new=$(resolve "$s" "$channel") ||
+    fail_run "$s" "could not pull $channel: $(printf '%s' "$new" | tr '\n' ' ') (is this server logged in to ghcr.io? docs/troubleshooting.md, GHCR login expired)"
+  old=$(deployed "$s")
+  if [ "$new" = "$old" ]; then
+    [ -n "$DRY" ] || { rm -f "$STATE/$s.noted"; checked "$s" "up to date"; }
+    echo "$s: up to date, $new"
+    return 0
+  fi
+  if is_failed "$s" "$new"; then
+    [ -n "$DRY" ] || {
+      checked "$s" "skipped $(digest_in "$new"), which failed before"
+      log_once "$s" "$(arrow "$old" "$new"): skipped: it failed before (aishie-update --retry $s to try it again)"
+    }
+    [ -z "$DRY" ] || echo "$s: would skip $new, which failed before (--retry $s)"
+    return 0
+  fi
+  if [ -n "$DRY" ]; then
+    echo "$s: would deploy $new (from $channel), in place of ${old:-nothing}"
+    return 0
+  fi
+  deploy "$s" "$old" "$new"
+}
+
+# pin SERVICE REF: REF deployed by the same steps, and SERVICE left on it.
+pin() {
+  s=$1 ref=$2
+  case $ref in sha256:*) ref=$(repo_of "$s")@$ref ;; esac
+  why=$(check_ref "$s" "$ref") || die "$why"
+  new=$(resolve "$s" "$ref") || die "could not pull $ref: $new"
+  old=$(deployed "$s")
+  if [ "$new" != "$old" ]; then deploy "$s" "$old" "$new"; fi
+  echo "$new" > "$STATE/$s.pin"
+  checked "$s" "pinned by hand to $new"
+  log "$s" "$(arrow "$old" "$new"): pinned by hand ($ref); its channel is not followed until aishie-update --unpin $s"
+  # Said now: the runs after this one need not say it again.
+  pinned_note "$s" "$new" > "$STATE/$s.noted"
+}
+pinned_note() { echo "pinned by hand to $(digest_in "$2"): its channel is not followed (aishie-update --unpin $1)"; }
+
+status() {
+  echo "$(setting "$SETTINGS" HOST) ($(setting "$SETTINGS" ENVIRONMENT))"
+  for s in $SERVICES; do
+    echo
+    echo "$s"
+    echo "  running:     $(deployed "$s" | grep . || echo "nothing yet")"
+    echo "  channel:     $(setting "$SETTINGS" "$(upper "$s")_IMAGE" | grep . || echo "none")"
+    on=$(pinned "$s")
+    [ -z "$on" ] || echo "  pinned:      $on (aishie-update --unpin $s)"
+    echo "  last check:  $(cat "$STATE/$s.checked" 2>/dev/null || echo "never")"
+    echo "  last result: $(cat "$STATE/$s.last" 2>/dev/null || echo "none")"
+    if [ -s "$STATE/$s.failed" ]; then
+      echo "  failed:      $(paste -sd ' ' "$STATE/$s.failed") (aishie-update --retry $s)"
+    fi
+  done
+}
+
+DRY=
+case ${1:-} in
+  '') [ $# -eq 0 ] || usage ;;
+  --dry-run) [ $# -eq 1 ] || usage; DRY=1 ;;
+  --status) [ $# -eq 1 ] || usage ;;
+  --retry | --unpin) { [ $# -eq 2 ] && is_service "$2"; } || usage ;;
+  --pin) { [ $# -eq 3 ] && is_service "$2"; } || usage ;;
+  *) usage ;;
+esac
+[ -n "$MOVED" ] || [ "$(id -u)" = 0 ] || die "run this as root"
+[ -r "$SETTINGS" ] || die "$SETTINGS is missing: set the server up with setup-server.sh (README.md)"
+mkdir -p "$STATE" "$BACKUPS"
+if [ "${1:-}" = --status ]; then status; exit 0; fi
+
+# One run at a time, by the timer or by hand; aishie backup takes the same
+# lock. /run, unlike /run/lock, is root's: nobody else can hold it.
+exec 9>"$LOCK_FILE"
+flock -w "$LOCK_WAIT" 9 ||
+  die "another aishie-update, or aishie backup, has held the lock for $LOCK_WAIT seconds: see journalctl -u aishie-update -u aishie-backup"
+[ -e "$IMAGES" ] || set_deployed core ''
+
+case ${1:-} in
+  --retry)
+    rm -f "$STATE/$2.failed" "$STATE/$2.noted"
+    log "$2" "the images that failed are forgotten (--retry): the channel's is deployed again"
+    ;;
+  --unpin)
+    rm -f "$STATE/$2.pin" "$STATE/$2.noted"
+    log "$2" "unpinned: it follows $(setting "$SETTINGS" "$(upper "$2")_IMAGE") again"
+    ;;
+  --pin)
+    pin "$2" "$3"
+    exit 0
+    ;;
+esac
+for s in $SERVICES; do update "$s"; done
