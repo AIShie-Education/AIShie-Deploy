@@ -1,0 +1,25 @@
+# The AIShie stack of one server, the Docker Compose project aishie:
+# PostgreSQL, Core, the agent runtime, the web front end and Caddy. The
+# services are in stack.yaml. This file names the project and the two files
+# their settings come from:
+#
+# - /etc/aishie/aishie.env, the operator's: the host name, the channel each
+#   image follows, the network (env/aishie.env.example);
+# - /var/lib/aishie/images.env, aishie-update's: the image each service runs,
+#   by digest (CORE_REF, RUNTIME_REF and WEB_REF).
+#
+# So `docker compose up -d` in this directory, or a reboot, starts what
+# aishie-update deployed last and nothing else. No tag is followed outside
+# aishie-update, which deploys a new image only after the backup, the
+# migrations and the health check.
+#
+# A variable of the same name in the shell's environment would win over both
+# files. aishie-update and aishie clear them, and a root shell sets none of
+# them. AISHIE_ETC and AISHIE_STATE move the two directories, for the tests.
+name: aishie
+
+include:
+  - path: stack.yaml
+    env_file:
+      - ${AISHIE_ETC:-/etc/aishie}/aishie.env
+      - ${AISHIE_STATE:-/var/lib/aishie}/images.env

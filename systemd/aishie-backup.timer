@@ -1,0 +1,13 @@
+# aishie backup every night at about three; one missed while the server was
+# off is taken at boot.
+[Unit]
+Description=AIShie: the nightly backup of the databases
+Documentation=https://github.com/AIShie-Education/AIShie-Deploy
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

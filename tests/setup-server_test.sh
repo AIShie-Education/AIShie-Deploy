@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+# setup-server.sh against stand-ins. Its pure parts are sourced with
+# AISHIE_SETUP_LIB=1, in sh as the server runs them; then whole runs, as root
+# would make them, with docker, apt, ufw, systemctl and id played by
+# tests/fakes.sh and the stand-ins below. The first update is the real
+# aishie-update, against the fake registry.
+#
+#   make test
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+root=$(cd "$here/.." && pwd)
+work=$(mktemp -d)
+trap '[ -n "${KEEP:-}" ] || rm -rf "$work"' EXIT
+. "$here/fakes.sh"
+make_fakes "$work/bin"
+
+# The stand-ins setup-server.sh needs besides: apt (APT_COMPOSE is the
+# docker-compose-v2 version Ubuntu offers, none by default; installing it
+# makes that the compose `docker compose version` says), dpkg-query
+# (DOCKER_CE: docker-ce is installed), cloud-init, systemctl, ufw
+# (UFW_ACTIVE) and id (NOT_ROOT).
+cat > "$work/bin/apt-get" <<'EOF'
+#!/bin/sh
+echo "apt-get $*" >> "$CALLS"
+case "$*" in
+  *" install "*docker-compose-v2*) echo "${APT_COMPOSE%%+*}" > "$FAKE/compose-version" ;;
+  *" install "*docker-compose-plugin*) echo 2.39.4 > "$FAKE/compose-version" ;;
+esac
+EOF
+cat > "$work/bin/apt-cache" <<'EOF'
+#!/bin/sh
+echo "apt-cache $*" >> "$CALLS"
+printf '%s:\n  Installed: (none)\n  Candidate: %s\n  Version table:\n' "${2:-}" "${APT_COMPOSE:-(none)}"
+EOF
+cat > "$work/bin/dpkg-query" <<'EOF'
+#!/bin/sh
+if [ -n "${DOCKER_CE:-}" ]; then printf 'install ok installed'; else exit 1; fi
+EOF
+printf '#!/bin/sh\nexit 0\n' > "$work/bin/cloud-init"
+cat > "$work/bin/systemctl" <<'EOF'
+#!/bin/sh
+echo "systemctl $*" >> "$CALLS"
+EOF
+cat > "$work/bin/ufw" <<'EOF'
+#!/bin/sh
+echo "ufw $*" >> "$CALLS"
+if [ "$1" = status ]; then
+  if [ -n "${UFW_ACTIVE:-}" ]; then echo "Status: active"; else echo "Status: inactive"; fi
+fi
+EOF
+cat > "$work/bin/id" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = -u ]; then echo "${NOT_ROOT:-0}"; else exec /usr/bin/id "$@"; fi
+EOF
+chmod +x "$work/bin"/*
+
+REG=ghcr.io/aishie-education
+A=$(printf 'a%.0s' $(seq 64))
+B=$(printf 'b%.0s' $(seq 64))
+C=$(printf 'c%.0s' $(seq 64))
+
+failed=0
+fail() { echo "FAIL setup-server $case: $*" >&2; failed=1; }
+
+# setup CASE: a fresh server, with the paths moved into the test's own
+# directory, and a registry where each :edge names a healthy image.
+setup() {
+  case=$1
+  export FAKE=$work/$case CALLS=$work/$case/calls
+  mkdir -p "$FAKE"
+  : > "$CALLS"
+  export AISHIE_ETC=$FAKE/etc AISHIE_STATE=$FAKE/state AISHIE_APP=$FAKE/opt AISHIE_DATA=$FAKE/srv \
+    AISHIE_BACKUPS=$FAKE/backups AISHIE_BIN=$FAKE/usr-local-bin AISHIE_UNITS=$FAKE/units \
+    AISHIE_LOCK_FILE=$FAKE/lock AISHIE_LOG_FILE=$FAKE/log AISHIE_HEALTH_TRIES=3
+  unset PULL_FAIL CADDY_FAIL FLOCK_FAIL COMPOSE_PULL_FAIL APT_COMPOSE DOCKER_CE UFW_ACTIVE NOT_ROOT COMPOSE_VERSION INVOCATION_ID
+  image core "$A" v0.2.0 abc1234
+  image runtime "$B" v0.4.0 bcd2345
+  image web "$C" v0.3.0 cde3456
+  tag "$REG/aishie-core:edge" "$A"
+  tag "$REG/aishie-agent-runtime:edge" "$B"
+  tag "$REG/aishie-frontend:edge" "$C"
+}
+# lib FUNCTION ARGS...: one of setup-server.sh's functions, in sh.
+lib() { PATH="$work/bin:$PATH" AISHIE_SETUP_LIB=1 sh -c '. "$0"; "$@"' "$root/setup-server.sh" "$@"; }
+# setup_server ARGS...: a whole run, as root; chown and systemd are only
+# recorded (the tests are not root, and need not run under systemd).
+setup_server() {
+  PATH="$work/bin:$PATH" AISHIE_SETUP_LIB=1 sh -c '
+    . "$0"
+    own() { echo "chown $*" >> "$CALLS"; }
+    systemd() { true; }
+    main "$@"' "$root/setup-server.sh" "$@" < /dev/null > "$FAKE/out" 2>&1
+}
+called() { grep -q -- "$1" "$CALLS"; }
+said() { grep -q -- "$1" "$FAKE/out"; }
+setting() { sed -n "s/^$2=//p" "$AISHIE_ETC/$1" | tail -n 1; }
+mode() { stat -c %a "$1"; }
+sums() { (cd "$AISHIE_ETC" && find . -type f -exec sha256sum {} + | sort); }
+
+# The arguments.
+case=args
+for good in "test.aishie.app staging" "localhost production" "aishie.localhost staging" "a-b.example.edu staging"; do
+  # shellcheck disable=SC2086 # the arguments, split
+  lib check_args $good || fail "refused «$good»"
+done
+for bad in "'' staging" "a\ b staging" "-x staging" "../etc staging" "a..b staging" ".a staging" "a;id staging" \
+  "test.aishie.app" "test.aishie.app dev" "test.aishie.app Staging"; do
+  if eval "lib check_args $bad" 2>/dev/null; then fail "took «$bad»"; fi
+done
+
+# Versions of compose, as Docker's and Ubuntu's packages write them.
+case=versions
+for v in 2.24.0 2.24.6+ds1-0ubuntu1~24.04.1 v2.27.0 2.39.4 5.1.1 3.0; do
+  lib version_at_least "$v" 2.24 || fail "$v is not taken as 2.24 or later"
+done
+for v in 2.23.3 2.20.2+ds1-0ubuntu1~22.04.1 1.29.2 v2.9.0 ''; do
+  if lib version_at_least "$v" 2.24; then fail "«$v» is taken as 2.24 or later"; fi
+done
+
+# Where Docker comes from: Ubuntu's packages when they have compose 2.24 or
+# later, else Docker's apt repository, which also wins when docker-ce is
+# installed already.
+case=docker-source
+setup docker-source
+[ "$(APT_COMPOSE=2.24.6+ds1-0ubuntu1~24.04.1 lib docker_source)" = "ubuntu 2.24.6+ds1-0ubuntu1~24.04.1" ] ||
+  fail "noble's compose: $(APT_COMPOSE=2.24.6+ds1-0ubuntu1~24.04.1 lib docker_source)"
+[ "$(APT_COMPOSE=2.20.2+ds1-0ubuntu1~22.04.1 lib docker_source)" = docker ] || fail "jammy's compose is taken"
+[ "$(lib docker_source)" = docker ] || fail "no candidate: $(lib docker_source)"
+[ "$(DOCKER_CE=1 APT_COMPOSE=2.24.6 lib docker_source)" = docker ] || fail "Ubuntu's, beside docker-ce"
+
+# Docker and compose there already: left alone.
+case=docker-there
+setup docker-there
+lib install_docker > "$FAKE/out" 2>&1 || fail "exit $?: $(cat "$FAKE/out")"
+! called "apt-get" || fail "installed something: $(grep apt-get "$CALLS")"
+said "compose 2.27.0 are installed: left as they are" || fail "said: $(cat "$FAKE/out")"
+# Compose too old: Ubuntu's, when they are recent enough.
+setup docker-old
+COMPOSE_VERSION=2.20.2 APT_COMPOSE=2.24.6+ds1-0ubuntu1~24.04.1 lib install_docker > "$FAKE/out" 2>&1 || fail "exit $?: $(cat "$FAKE/out")"
+called "install -y -q docker.io docker-compose-v2" || fail "ran: $(cat "$CALLS")"
+said "installing Docker from Ubuntu's packages" || fail "said: $(cat "$FAKE/out")"
+
+# A fresh server, staging: everything, then the first update.
+setup fresh
+setup_server test.aishie.app staging || fail "exit $?: $(cat "$FAKE/out")"
+# Its settings, from the arguments.
+[ "$(setting aishie.env HOST)" = test.aishie.app ] || fail "HOST=$(setting aishie.env HOST)"
+[ "$(setting aishie.env ENVIRONMENT)" = staging ] || fail "ENVIRONMENT=$(setting aishie.env ENVIRONMENT)"
+[ "$(setting aishie.env CORE_IMAGE)" = "$REG/aishie-core:edge" ] || fail "CORE_IMAGE=$(setting aishie.env CORE_IMAGE)"
+[ "$(setting aishie.env RUNTIME_IMAGE)" = "$REG/aishie-agent-runtime:edge" ] || fail "RUNTIME_IMAGE=$(setting aishie.env RUNTIME_IMAGE)"
+[ "$(setting aishie.env WEB_IMAGE)" = "$REG/aishie-frontend:edge" ] || fail "WEB_IMAGE=$(setting aishie.env WEB_IMAGE)"
+[ -z "$(setting aishie.env FRAME_ANCESTORS)" ] || fail "FRAME_ANCESTORS is set: $(setting aishie.env FRAME_ANCESTORS)"
+# Every setting the example has, with the example's value (it is a staging
+# server named test.aishie.app too), so that compose.yaml finds each.
+while IFS='=' read -r n v; do
+  [ "$(setting aishie.env "$n")" = "$v" ] || fail "$n=$(setting aishie.env "$n"), the example has $v"
+done < <(grep -E '^[A-Z_]+=' "$root/env/aishie.env.example")
+# The secrets: generated, root's alone, and the same password on both
+# sides of each database.
+for f in aishie core runtime postgres; do
+  [ "$(mode "$AISHIE_ETC/$f.env")" = 600 ] || fail "$f.env is $(mode "$AISHIE_ETC/$f.env")"
+done
+core_pw=$(setting postgres.env AISHIE_CORE_DB_PASSWORD)
+runtime_pw=$(setting postgres.env AISHIE_RUNTIME_DB_PASSWORD)
+[[ $core_pw =~ ^[0-9a-f]{48}$ ]] || fail "the core database's password is not 24 random bytes in hex"
+[[ $runtime_pw =~ ^[0-9a-f]{48}$ ]] || fail "the runtime database's password is not 24 random bytes in hex"
+[[ $(setting postgres.env POSTGRES_PASSWORD) =~ ^[0-9a-f]{48}$ ]] || fail "POSTGRES_PASSWORD is not 24 random bytes in hex"
+[ "$core_pw" != "$runtime_pw" ] || fail "the two databases have one password"
+[ "$(setting core.env DATABASE_URL)" = "postgres://aishie_core:$core_pw@postgres:5432/aishie_core?sslmode=disable" ] ||
+  fail "core's DATABASE_URL does not match postgres.env"
+[ "$(setting runtime.env DATABASE_URL)" = "postgres://aishie_runtime:$runtime_pw@postgres:5432/aishie_runtime?sslmode=disable" ] ||
+  fail "the runtime's DATABASE_URL does not match postgres.env"
+[[ $(setting core.env SIGNING_KEY) =~ ^[0-9a-f]{64}$ ]] || fail "SIGNING_KEY is not 32 random bytes in hex"
+[ "$(setting core.env BLOB_FS_ROOT)" = /data/blobs ] || fail "BLOB_FS_ROOT=$(setting core.env BLOB_FS_ROOT)"
+[ "$(setting runtime.env KMS_KEY_ID)" = local:/secrets/kek/v1 ] || fail "KMS_KEY_ID=$(setting runtime.env KMS_KEY_ID)"
+# The key that will wrap the runtime's secrets: 32 random bytes, base64, in
+# the secrets directory, readable by the runtime's group alone.
+kek=$AISHIE_ETC/runtime/secrets/kek/v1
+[ "$(base64 -d < "$kek" | wc -c)" = 32 ] || fail "kek/v1 is not 32 bytes in base64"
+[ "$(mode "$kek")" = 640 ] || fail "kek/v1 is $(mode "$kek")"
+called "chown root:65532 $kek.new" || fail "kek/v1 not given to the runtime's group"
+# The directories, each with its owner and mode.
+for d in "$AISHIE_ETC" "$AISHIE_ETC/runtime" "$AISHIE_STATE" "$AISHIE_BACKUPS"; do
+  [ "$(mode "$d")" = 700 ] || fail "$d is $(mode "$d")"
+done
+for d in agents secrets secrets/kek; do
+  [ "$(mode "$AISHIE_ETC/runtime/$d")" = 750 ] || fail "runtime/$d is $(mode "$AISHIE_ETC/runtime/$d")"
+  called "chown root:65532 $AISHIE_ETC/runtime/$d$" || fail "runtime/$d not given to the runtime's group"
+done
+called "chown 65532:65532 $AISHIE_DATA/core$" || fail "Core's files not given to Core's user"
+# This copy's stack, scripts and units, installed.
+for f in compose.yaml stack.yaml README.md caddy/Caddyfile postgres/initdb/10-aishie.sh env/core.env.example docs/troubleshooting.md; do
+  cmp -s "$root/$f" "$AISHIE_APP/$f" || fail "$f not installed in $AISHIE_APP"
+done
+[ -x "$AISHIE_APP/postgres/initdb/10-aishie.sh" ] || fail "the init script is not executable"
+for f in aishie-update aishie; do
+  if ! cmp -s "$root/bin/$f" "$AISHIE_BIN/$f" || [ ! -x "$AISHIE_BIN/$f" ]; then fail "$f not installed in $AISHIE_BIN"; fi
+done
+for f in aishie-update.service aishie-update.timer aishie-backup.service aishie-backup.timer; do
+  cmp -s "$root/systemd/$f" "$AISHIE_UNITS/$f" || fail "$f not installed in $AISHIE_UNITS"
+done
+called "systemctl daemon-reload" || fail "no daemon-reload"
+called "systemctl enable --now aishie-update.timer aishie-backup.timer" || fail "the timers are not on"
+# Caddy's configuration checked before Caddy runs it; PostgreSQL started and
+# never recreated; the three images pulled.
+called "docker run --rm --network none -e HOST=test.aishie.app .* caddy:2 caddy validate" || fail "no caddy validate"
+[ "$(grep -n 'caddy validate' "$CALLS" | head -n 1 | cut -d: -f1)" -lt "$(grep -n 'up -d --no-deps caddy' "$CALLS" | head -n 1 | cut -d: -f1)" ] ||
+  fail "Caddy started before its Caddyfile was checked"
+called "up -d --no-recreate --wait --wait-timeout 180 postgres" || fail "PostgreSQL not started"
+! called "up -d postgres" || fail "PostgreSQL recreated"
+for img in "$REG/aishie-core:edge" "$REG/aishie-agent-runtime:edge" "$REG/aishie-frontend:edge"; do
+  said "can pull $img" || fail "did not check the pull of $img: $(cat "$FAKE/out")"
+done
+# The first update deployed the three, in order; then each is recreated
+# under the updater's lock, for a change to stack.yaml.
+grep -q "^CORE_REF=$REG/aishie-core@sha256:$A$" "$AISHIE_STATE/images.env" || fail "core not deployed: $(cat "$AISHIE_STATE/images.env")"
+grep -q "^RUNTIME_REF=$REG/aishie-agent-runtime@sha256:$B$" "$AISHIE_STATE/images.env" || fail "the runtime not deployed"
+grep -q "^WEB_REF=$REG/aishie-frontend@sha256:$C$" "$AISHIE_STATE/images.env" || fail "the web not deployed"
+[ "$(grep -c 'flock -w 600 9' "$CALLS")" = 2 ] || fail "the recreate did not take aishie-update's lock"
+[ "$(grep -n 'flock -w 600 9' "$CALLS" | tail -n 1 | cut -d: -f1)" -lt "$(grep -n 'up -d --no-deps web' "$CALLS" | tail -n 1 | cut -d: -f1)" ] ||
+  fail "the web was recreated outside the lock"
+# What is left, said; and no secret anywhere in what it printed.
+said "Point test.aishie.app at this server" || fail "no DNS step: $(cat "$FAKE/out")"
+said "aishie core bootstrap --name .* --password-stdin" || fail "no bootstrap step"
+said "install -g 65532 -m 640 tutor.yaml" || fail "no agent step"
+! said "docker login" || fail "asked to log in, though every pull worked"
+for secret in "$core_pw" "$runtime_pw" "$(setting postgres.env POSTGRES_PASSWORD)" "$(setting core.env SIGNING_KEY)" "$(cat "$kek")"; do
+  if grep -qF -- "$secret" "$FAKE/out" "$CALLS" "$FAKE/log"; then fail "a secret is in the output, a command line or the log"; fi
+done
+
+# Run again: this copy's files over the old ones, and the settings, the
+# secrets and the key as they were.
+case=again
+before=$(sums)
+echo "an old aishie" > "$AISHIE_BIN/aishie"
+: > "$CALLS"
+setup_server test.aishie.app staging || fail "exit $?: $(cat "$FAKE/out")"
+[ "$(sums)" = "$before" ] || fail "changed $AISHIE_ETC: $(diff <(echo "$before") <(sums))"
+cmp -s "$root/bin/aishie" "$AISHIE_BIN/aishie" || fail "did not install aishie again"
+said "aishie.env is there already: left as it is (HOST=test.aishie.app)" || fail "said: $(cat "$FAKE/out")"
+said "core.env and runtime.env are there already: left as they are" || fail "said: $(cat "$FAKE/out")"
+said "kek/v1 is there already: left as it is" || fail "said: $(cat "$FAKE/out")"
+[ "$(grep -c 'up to date' "$FAKE/out")" = 3 ] || fail "the update did something: $(cat "$FAKE/out")"
+! called "pg_dump" || fail "backed up, with nothing to deploy"
+# ... another name, given by mistake: said, and aishie.env left as it is.
+setup_server other.aishie.app staging || fail "exit $?: $(cat "$FAKE/out")"
+said "warning: .*aishie.env says HOST=test.aishie.app, not other.aishie.app" || fail "no warning: $(cat "$FAKE/out")"
+[ "$(setting aishie.env HOST)" = test.aishie.app ] || fail "HOST changed to $(setting aishie.env HOST)"
+
+# ufw on: 80 and 443 opened, and nothing else.
+setup ufw
+UFW_ACTIVE=1 setup_server test.aishie.app staging || fail "exit $?: $(cat "$FAKE/out")"
+for rule in 80/tcp 443/tcp 443/udp; do called "ufw allow $rule" || fail "ufw: no $rule"; done
+[ "$(grep -c 'ufw allow' "$CALLS")" = 3 ] || fail "ufw: $(grep 'ufw allow' "$CALLS")"
+
+# Docker Hub refuses the newest postgres:18 and caddy:2 for a while: the
+# set-up goes on with the ones the server has.
+setup docker-hub-refuses
+COMPOSE_PULL_FAIL=1 setup_server test.aishie.app staging || fail "exit $?: $(cat "$FAKE/out")"
+said "could not pull the newest postgres:18 and caddy:2 (above): going on with the ones this server has" || fail "said: $(cat "$FAKE/out")"
+grep -q "^CORE_REF=" "$AISHIE_STATE/images.env" || fail "stopped before the first update"
+
+# The images cannot be pulled: how to log in, said exactly, and the run
+# fails once it has said what is left.
+setup no-login
+if PULL_FAIL=1 setup_server test.aishie.app staging; then fail "passed though nothing could be pulled"; fi
+said "cannot pull $REG/aishie-core:edge" || fail "said: $(cat "$FAKE/out")"
+said "docker login ghcr.io -u <that account's GitHub user name> --password-stdin" || fail "no login help: $(cat "$FAKE/out")"
+said "read:packages" || fail "the token's scope is not said"
+said "(classic)" || fail "the token's kind is not said"
+[ -e "$AISHIE_ETC/core.env" ] || fail "the settings were not written before the pull"
+! grep -q "_REF=" "$AISHIE_STATE/images.env" || fail "deployed something: $(cat "$AISHIE_STATE/images.env")"
+
+# Production: no channel until a person sets the releases, so no update.
+setup production
+setup_server aishie.example.edu production || fail "exit $?: $(cat "$FAKE/out")"
+[ "$(setting aishie.env ENVIRONMENT)" = production ] || fail "ENVIRONMENT=$(setting aishie.env ENVIRONMENT)"
+for n in CORE_IMAGE RUNTIME_IMAGE WEB_IMAGE; do
+  grep -qx "$n=" "$AISHIE_ETC/aishie.env" || fail "$n=$(setting aishie.env "$n")"
+done
+! called "docker pull" || fail "pulled something: $(grep 'docker pull' "$CALLS")"
+said "Set the releases production runs" || fail "said: $(cat "$FAKE/out")"
+
+# Some of the env files there, not all: refused, and nothing written.
+setup partial
+mkdir -p "$AISHIE_ETC"
+echo "DATABASE_URL=kept" > "$AISHIE_ETC/core.env"
+if setup_server test.aishie.app staging; then fail "passed with core.env alone"; fi
+said "Some of .*postgres.env, core.env and runtime.env are there, but not all" || fail "said: $(cat "$FAKE/out")"
+[ ! -e "$AISHIE_ETC/postgres.env" ] || fail "wrote postgres.env"
+[ "$(cat "$AISHIE_ETC/core.env")" = "DATABASE_URL=kept" ] || fail "changed core.env"
+
+# The database's volume without postgres.env: its passwords are unknown.
+setup volume-without-env
+mkdir -p "$FAKE/volumes"
+touch "$FAKE/volumes/aishie_postgres"
+if setup_server test.aishie.app staging; then fail "passed with a volume and no postgres.env"; fi
+said "volume aishie_postgres is there, but" || fail "said: $(cat "$FAKE/out")"
+[ ! -e "$AISHIE_ETC/postgres.env" ] || fail "wrote postgres.env"
+
+# A Caddyfile Caddy refuses: Caddy is not started on it.
+setup caddy-refuses
+if CADDY_FAIL=1 setup_server test.aishie.app staging; then fail "passed while caddy validate failed"; fi
+said "caddy validate refused" || fail "said: $(cat "$FAKE/out")"
+! called "up -d --no-deps caddy" || fail "started Caddy"
+
+# Not root, or wrong arguments: nothing is done.
+setup not-root
+if NOT_ROOT=1000 setup_server test.aishie.app staging; then fail "ran as a user"; fi
+said "run this as root" || fail "said: $(cat "$FAKE/out")"
+[ ! -s "$CALLS" ] || fail "ran something: $(head -n 3 "$CALLS")"
+for args in "" "test.aishie.app" "test.aishie.app dev" "bad_name staging" "a b c"; do
+  setup usage
+  # shellcheck disable=SC2086 # the arguments, split
+  if setup_server $args; then fail "took «$args»"; fi
+  said "usage: setup-server.sh HOSTNAME staging|production" || fail "said for «$args»: $(cat "$FAKE/out")"
+  if [ -s "$CALLS" ] || [ -e "$AISHIE_ETC" ]; then fail "did something for «$args»"; fi
+done
+
+[ "$failed" = 0 ] && echo "setup-server.sh: ok"
+exit "$failed"
