@@ -473,13 +473,10 @@ $n. Point $host at this server in DNS (A, and AAAA if it has IPv6). Caddy gets
 EOF
   n=$((n + 1))
   cat <<EOF
-$n. The first administrator, once Core runs (aishie-update --status). It
-   prints the administrator's API token once: keep it in a password manager.
-   Then restart Core, so that its background jobs start as the system actor
-   bootstrap creates:
-     read -rsp 'Password (10 characters or more): ' PW; echo
-     printf '%s\\n' "\$PW" | aishie core bootstrap --name "Your Name" --email you@example.edu --password-stdin; unset PW
-     aishie compose restart core
+$n. The first administrator, once Core runs (aishie-update --status): it asks
+   for a name, an email and a password, then restarts Core. It prints the
+   administrator's API token once, for scripts:
+     aishie admin
 EOF
   n=$((n + 1))
   cat <<EOF

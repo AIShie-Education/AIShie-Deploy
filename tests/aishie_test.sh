@@ -52,6 +52,43 @@ grep -q "^docker compose --project-directory $root -f $root/compose.yaml run --r
 ! grep -q "$PASSWORD" "$CALLS" "$FAKE/out" || fail "the password is on a command line or in the output"
 said "core bootstrap .* with $CORE" || fail "not with the image that runs: $(cat "$FAKE/out")"
 
+# aishie admin: the same, asked for, and then Core restarted.
+setup admin deployed
+printf 'Your Name\nyou@example.edu\n%s\n%s\n' "$PASSWORD" "$PASSWORD" > "$FAKE/answers"
+STDIN=$FAKE/answers aishie admin || fail "exit $?: $(cat "$FAKE/out")"
+grep -q "^docker compose --project-directory $root -f $root/compose.yaml run --rm --no-deps -T core bootstrap --name Your Name --email you@example.edu --password-stdin$" "$CALLS" ||
+  fail "ran: $(cat "$CALLS")"
+[ "$(cat "$FAKE/stdin")" = "$PASSWORD" ] || fail "the password did not reach bootstrap's standard input"
+! grep -q "$PASSWORD" "$CALLS" "$FAKE/out" || fail "the password is on a command line or in the output"
+called "compose.yaml restart core" || fail "Core was not restarted: $(cat "$CALLS")"
+said "Sign in at https://test.aishie.app with you@example.edu" || fail "said: $(cat "$FAKE/out")"
+# admin_refused CASE ANSWERS WHY: aishie admin fails, says WHY, and neither
+# bootstraps nor restarts anything.
+admin_refused() {
+  setup "$1" deployed
+  printf '%b' "$2" > "$FAKE/answers"
+  if STDIN=$FAKE/answers aishie admin; then fail "made an administrator"; fi
+  said "$3" || fail "said: $(cat "$FAKE/out")"
+  ! called bootstrap || fail "bootstrapped: $(cat "$CALLS")"
+  ! called restart || fail "restarted: $(cat "$CALLS")"
+}
+admin_refused admin-mismatch "Your Name\nyou@example.edu\n$PASSWORD\nsomething-else-here\n" "the two passwords differ"
+admin_refused admin-short "Your Name\nyou@example.edu\nshort\nshort\n" "shorter than 10 characters"
+admin_refused admin-email "Your Name\nnot-an-email\n$PASSWORD\n$PASSWORD\n" "is not an email address"
+admin_refused admin-name "\nyou@example.edu\n$PASSWORD\n$PASSWORD\n" "a name is needed"
+admin_refused admin-eof "Your Name\n" "no answer"
+# bootstrap refused (an administrator already, say): Core is left alone.
+setup admin-bootstrap-fails deployed
+printf 'Your Name\nyou@example.edu\n%s\n%s\n' "$PASSWORD" "$PASSWORD" > "$FAKE/answers"
+if STDIN=$FAKE/answers RUN_FAIL=1 aishie admin; then fail "succeeded though bootstrap failed"; fi
+said "bootstrap failed" || fail "said: $(cat "$FAKE/out")"
+! called restart || fail "restarted: $(cat "$CALLS")"
+# Before Core is deployed: nothing to bootstrap with.
+setup admin-undeployed
+printf 'Your Name\nyou@example.edu\n%s\n%s\n' "$PASSWORD" "$PASSWORD" > "$FAKE/answers"
+if STDIN=$FAKE/answers aishie admin; then fail "went ahead with no Core"; fi
+said "core is not deployed yet" || fail "said: $(cat "$FAKE/out")"
+
 # The runtime's commands, with the image it runs.
 setup runtime deployed
 aishie runtime check --live || fail "exit $?: $(cat "$FAKE/out")"

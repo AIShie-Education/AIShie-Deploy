@@ -123,15 +123,22 @@ institution allows for that.
    Caddy gets a certificate as soon as the name resolves there:
    `curl https://test.aishie.app/healthz`.
 
-5. The first administrator. `bootstrap` prints the administrator's API token
-   once: keep it in a password manager. Then restart Core, so that its
-   background jobs start as the system actor `bootstrap` creates:
+5. The first administrator: the account you sign in to the site with. It
+   asks for a name, an email and a password (twice, not shown), makes the
+   account, and restarts Core, so that its background jobs start as the
+   system actor it makes too:
 
    ```
-   read -rsp 'Password (10 characters or more): ' PW; echo
-   printf '%s\n' "$PW" | aishie core bootstrap --name "Your Name" --email you@example.edu --password-stdin; unset PW
-   aishie compose restart core
+   aishie admin
    ```
+
+   It also prints the administrator's API token once. That is for scripts,
+   not for signing in: keep it in a password manager, or leave it, since
+   `aishie core token issue` makes one when one is needed. It is not kept on
+   the server, and does not belong in `/etc/aishie`. The long form, for a
+   script: the password on standard input to
+   `aishie core bootstrap --name … --email … --password-stdin`, then
+   `aishie compose restart core`.
 
 6. Copy `/etc/aishie` somewhere safe, apart from the database backups
    ([What to keep off the server](#what-to-keep-off-the-server)).

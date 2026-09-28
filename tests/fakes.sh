@@ -79,7 +79,8 @@ compose() {
       svc=$5
       shift 5
       cat > "$FAKE/stdin"
-      echo "$svc $* with $(service_image "$svc")" ;;
+      echo "$svc $* with $(service_image "$svc")"
+      exit "${RUN_FAIL:-0}" ;;
     "exec -T postgres pg_dump"*)
       echo "PGDMP a dump of ${*: -1}"
       exit "${BACKUP_FAIL:-0}" ;;
