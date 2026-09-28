@@ -57,7 +57,7 @@ ENV
   tag "$RUNTIME:edge" "$B"
   tag "$WEB:edge" "$C"
 }
-update() { PATH="$work/bin:$PATH" "$root/bin/aishie-update" "$@" > "$FAKE/out" 2>&1; }
+update() { PATH="$work/bin:$PATH" "$root/bin/aishie-update" "$@" < /dev/null > "$FAKE/out" 2>&1; }
 called() { grep -q -- "$1" "$CALLS"; }
 count() { grep -c -- "$1" "$CALLS" || true; }
 # line PATTERN: the first line of the record that matches, 0 if none.

@@ -1,0 +1,14 @@
+# aishie-update every five minutes, each start moved by up to a minute so
+# that servers do not all ask GHCR at once. A run missed while the server was
+# off happens at boot.
+[Unit]
+Description=AIShie: look for new images every five minutes
+Documentation=https://github.com/AIShie-Education/AIShie-Deploy
+
+[Timer]
+OnCalendar=*:0/5
+RandomizedDelaySec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target

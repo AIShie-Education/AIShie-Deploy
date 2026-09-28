@@ -106,7 +106,9 @@ case $1 in
       prune) : ;;
     esac ;;
   run)
-    # docker run --rm --network none IMAGE version
+    # aishie runtime-status: a wget in the runtime's network namespace.
+    case "$*" in *"--entrypoint wget"*) echo '{"worker":"w","agents":[]}'; exit 0 ;; esac
+    # aishie-update: docker run --rm --network none IMAGE version
     ref=${*: -2:1}
     h=$(local_hex "$ref") || exit 125
     cat "$reg/img/$h/version" ;;

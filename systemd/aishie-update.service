@@ -1,0 +1,17 @@
+# One run of aishie-update: the images the channels in /etc/aishie/aishie.env
+# name, deployed if they are new. aishie-update.timer starts it every five
+# minutes; `systemctl start aishie-update` starts one now. Its output is in
+# the journal (journalctl -u aishie-update), and each outcome is also a line
+# in /var/log/aishie-update.log.
+[Unit]
+Description=AIShie: deploy the images the channels name (aishie-update)
+Documentation=https://github.com/AIShie-Education/AIShie-Deploy
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/aishie-update
+# A run waits up to ten minutes for the lock, and a deploy takes minutes.
+TimeoutStartSec=45min

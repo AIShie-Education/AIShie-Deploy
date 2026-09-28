@@ -1,0 +1,15 @@
+# The nightly backup: both databases, dumped to
+# /var/backups/aishie/core-daily-N.dump and runtime-daily-N.dump, N the day
+# of the week, so that seven of each are kept (`aishie backup`). The backups
+# before each deploy are aishie-update's, apart from these.
+[Unit]
+Description=AIShie: the nightly backup of the databases (aishie backup)
+Documentation=https://github.com/AIShie-Education/AIShie-Deploy
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/aishie backup
+# It waits up to an hour for a deploy to finish.
+TimeoutStartSec=3h

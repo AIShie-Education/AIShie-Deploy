@@ -1,0 +1,117 @@
+#!/bin/sh
+# Things done by hand on this server's AIShie stack, as root, with the
+# images that run and the settings and mounts they run with:
+#
+#   aishie core bootstrap --name "Your Name" --email you@example.edu --password-stdin
+#   aishie core token issue --actor ID --label grader-bot --days 90
+#   aishie core migrate version
+#   aishie runtime check --live
+#   aishie runtime migrate version
+#   aishie runtime-status          the runtime's /status: its agents, seats and spend
+#   aishie logs SERVICE [OPTIONS]  core, runtime, web, caddy or postgres
+#   aishie ps                      the stack's containers
+#   aishie backup                  both databases, now, as the nightly backup does
+#   aishie compose ARGS...         docker compose for the stack, e.g. aishie compose up -d core
+#
+# `aishie core ...` and `aishie runtime ...` run a one-off container of the
+# image the service runs (aishie-update --status), with its env file, its
+# mounts, its user and its network, and pass standard input on: a password
+# given with --password-stdin is on no command line.
+#
+# `aishie backup` is what aishie-backup.timer runs every night: the two
+# databases dumped to /var/backups/aishie/SERVICE-daily-N.dump, N the day of
+# the week (1 to 7), so that seven are kept.
+#
+# The variables that move the paths below are for the tests
+# (tests/aishie_test.sh).
+set -eu
+# The backups are root's alone.
+umask 077
+
+ETC=${AISHIE_ETC:-/etc/aishie}
+STATE=${AISHIE_STATE:-/var/lib/aishie}
+APP=${AISHIE_APP:-/opt/aishie}
+BACKUPS=${AISHIE_BACKUPS:-/var/backups/aishie}
+LOCK_FILE=${AISHIE_LOCK_FILE:-/run/aishie-update.lock}
+# The image stack.yaml's Caddy runs, which has a wget.
+CADDY_IMAGE=caddy:2
+
+# compose.yaml reads these from aishie.env and images.env, and the same
+# names in this process's environment would win over both files.
+unset HOST ENVIRONMENT CORE_IMAGE RUNTIME_IMAGE WEB_IMAGE CORE_REF RUNTIME_REF WEB_REF \
+  AISHIE_SUBNET AISHIE_CADDY_IP RUNTIME_STOP_GRACE
+export AISHIE_ETC="$ETC" AISHIE_STATE="$STATE"
+
+usage() {
+  echo "usage:" >&2
+  sed -n 's/^#   \(aishie .*\)/  \1/p' "$0" >&2
+  exit 2
+}
+die() { echo "aishie: $*" >&2; exit 1; }
+upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
+setting() { sed -n "s/^$2=//p" "$1" 2>/dev/null | tr -d '\r' | tail -n 1; }
+compose() { docker compose --project-directory "$APP" -f "$APP/compose.yaml" "$@"; }
+
+# backup: both databases, by pg_dump in PostgreSQL's container, each under
+# another name until it is whole: a dump cut short is not a backup. One that
+# fails leaves last week's of the same day in place.
+backup() {
+  # Not in the middle of a deploy, which takes its own backup.
+  exec 9>"$LOCK_FILE"
+  flock -w 3600 9 || die "aishie-update has held the lock for an hour: no backup taken (journalctl -u aishie-update)"
+  [ -n "$(compose ps -q postgres)" ] || die "PostgreSQL is not running (aishie ps): no backup taken"
+  mkdir -p "$BACKUPS"
+  day=$(date +%u)
+  rc=0
+  for s in core runtime; do
+    f=$BACKUPS/$s-daily-$day.dump
+    if compose exec -T postgres pg_dump -U postgres -Fc "aishie_$s" > "$f.part" && [ -s "$f.part" ]; then
+      mv "$f.part" "$f"
+      echo "aishie_$s backed up: $f"
+    else
+      rm -f "$f.part"
+      echo "aishie: the backup of aishie_$s failed (above); the last one of day $day, if any, is still $f" >&2
+      rc=1
+    fi
+  done
+  exit "$rc"
+}
+
+case ${1:-} in
+  core | runtime)
+    s=$1
+    shift
+    [ $# -gt 0 ] || die "usage: aishie $s COMMAND..., e.g. aishie $s migrate version (aishie $s help lists them)"
+    [ -n "$(setting "$STATE/images.env" "$(upper "$s")_REF")" ] ||
+      die "$s is not deployed yet: aishie-update deploys it (aishie-update --status)"
+    exec docker compose --project-directory "$APP" -f "$APP/compose.yaml" run --rm --no-deps -T "$s" "$@"
+    ;;
+  runtime-status)
+    [ $# -eq 1 ] || usage
+    id=$(compose ps -q runtime)
+    [ -n "$id" ] || die "the runtime is not running (aishie ps)"
+    # /status answers the runtime's own loopback alone, not the host's
+    # published port: a wget, from Caddy's image, in the runtime's network
+    # namespace, is on it.
+    exec docker run --rm --network "container:$id" --entrypoint wget "$CADDY_IMAGE" -qO- http://127.0.0.1:9090/status
+    ;;
+  logs)
+    shift
+    [ $# -gt 0 ] || die "usage: aishie logs SERVICE [docker compose logs options], SERVICE core, runtime, web, caddy or postgres"
+    if [ $# -eq 1 ]; then set -- -f --tail 100 "$1"; fi
+    exec docker compose --project-directory "$APP" -f "$APP/compose.yaml" logs "$@"
+    ;;
+  ps)
+    shift
+    exec docker compose --project-directory "$APP" -f "$APP/compose.yaml" ps "$@"
+    ;;
+  compose)
+    shift
+    exec docker compose --project-directory "$APP" -f "$APP/compose.yaml" "$@"
+    ;;
+  backup)
+    [ $# -eq 1 ] || usage
+    backup
+    ;;
+  *) usage ;;
+esac
