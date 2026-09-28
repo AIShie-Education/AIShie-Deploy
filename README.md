@@ -57,12 +57,51 @@ provider's firewall; `setup-server.sh` opens them in ufw when ufw is on). It
 keeps grades and students' work, so pick a provider and a region your
 institution allows for that.
 
-1. Copy this repository to the server and run the set-up as root, with the
-   server's DNS name and its environment:
+1. Give the server a copy of this repository. It is private, so the server
+   reads it with a deploy key of its own, one that can read this repository
+   and nothing else, and write nothing. As root:
 
    ```
-   git clone https://github.com/AIShie-Education/AIShie-Deploy.git   # or scp -r a copy
-   sudo sh AIShie-Deploy/setup-server.sh test.aishie.app staging
+   ssh-keygen -t ed25519 -N '' -C "$(hostname): AIShie-Deploy read-only" -f /root/.ssh/aishie_deploy_ro
+   cat /root/.ssh/aishie_deploy_ro.pub
+   ```
+
+   Add the line it prints in this repository's Settings → Deploy keys → Add
+   deploy key, titled with the server's name, and leave "Allow write access"
+   unticked. Then, in root's home:
+
+   ```
+   export GIT_SSH_COMMAND='ssh -i /root/.ssh/aishie_deploy_ro -o IdentitiesOnly=yes'
+   git clone git@github.com:AIShie-Education/AIShie-Deploy.git
+   git -C AIShie-Deploy config core.sshCommand "$GIT_SSH_COMMAND"
+   ```
+
+   The first connection asks whether to trust github.com: say yes only if
+   the fingerprint is GitHub's own, `SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU`
+   ([GitHub's SSH key fingerprints](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints)).
+   The last line has later `git pull`s use the same key.
+
+2. Log the server in to ghcr.io. The three images are private packages, and
+   the server pulls them with a personal access token (classic, not
+   fine-grained: GHCR takes no other) that has the `read:packages` scope and
+   nothing else. Make it on an account that can read the three packages and
+   nothing more, give it a long expiry, and put the date in a calendar.
+   Never paste it anywhere but here. As root, paste the token when asked,
+   then Enter and Ctrl-D:
+
+   ```
+   docker login ghcr.io -u <that account's GitHub user name> --password-stdin
+   ```
+
+   On a server with no Docker yet there is no `docker` to log in with: run
+   step 3 first, which installs it. It finishes even when it cannot pull
+   the images, and ends by saying how to log in. Log in then, and run
+   `aishie-update`, or leave it to the timer, within five minutes.
+
+3. Run the set-up as root, with the server's DNS name and its environment:
+
+   ```
+   sh AIShie-Deploy/setup-server.sh test.aishie.app staging
    ```
 
    It installs Docker Engine and the compose plugin if they are missing.
@@ -80,23 +119,11 @@ institution allows for that.
    If it stops, fix what it names and run it again: it never overwrites a
    setting, a secret or data.
 
-2. If it said it cannot pull the images: they are private packages, and the
-   server logs in to ghcr.io with a personal access token (classic, not
-   fine-grained) that has the `read:packages` scope and nothing else. Make
-   it on an account that can read the three packages and nothing more, give
-   it a long expiry, and put the date in a calendar. Then, as root, paste
-   the token when asked, then Enter and Ctrl-D:
-
-   ```
-   docker login ghcr.io -u <that account's GitHub user name> --password-stdin
-   aishie-update
-   ```
-
-3. Point the name at the server (an A record, and AAAA if it has IPv6).
+4. Point the name at the server (an A record, and AAAA if it has IPv6).
    Caddy gets a certificate as soon as the name resolves there:
    `curl https://test.aishie.app/healthz`.
 
-4. The first administrator. `bootstrap` prints the administrator's API token
+5. The first administrator. `bootstrap` prints the administrator's API token
    once: keep it in a password manager. Then restart Core, so that its
    background jobs start as the system actor `bootstrap` creates:
 
@@ -106,10 +133,10 @@ institution allows for that.
    aishie compose restart core
    ```
 
-5. Copy `/etc/aishie` somewhere safe, apart from the database backups
+6. Copy `/etc/aishie` somewhere safe, apart from the database backups
    ([What to keep off the server](#what-to-keep-off-the-server)).
 
-6. The day after, check that the nightly backup ran:
+7. The day after, check that the nightly backup ran:
    `ls -l /var/backups/aishie/*-daily-*`.
 
 For production, the same with `production`. Its channels start empty: set
@@ -203,6 +230,12 @@ secret someone gives you, goes in single quotes, `'like$this'`, which
 Compose takes as it is. `env/*.env.example` explains every setting; the
 ones `stack.yaml` sets from `aishie.env` (`PUBLIC_URL`, `TRUSTED_PROXIES`,
 `HTTP_ADDR`, `CORE_BASE_URL_ALLOWLIST`, …) win over the files.
+
+**Updating this repository's files on the server** (the compose files,
+`aishie-update`, `aishie`, the units; images update themselves): as root,
+`git -C AIShie-Deploy pull`, then `sh AIShie-Deploy/setup-server.sh
+<name> <environment>` again. It installs the new files and leaves the
+settings, the secrets and the data as they are.
 
 **Changing the host name:** `HOST` in `aishie.env`, then
 `aishie compose up -d`: Core, the runtime and Caddy are recreated with the
