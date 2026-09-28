@@ -168,6 +168,12 @@ case $status in
 esac
 get mcp "https://$name/mcp" -X POST -H 'Content-Type: application/json' -d '{}'
 check "/mcp is Core's: it wants a token" is "$status" 401
+# An MCP client asks these before it signs in with OAuth; Core has none, and
+# says so, where the web's page would pass for an authorization server.
+for p in /.well-known/oauth-protected-resource /.well-known/oauth-protected-resource/mcp /.well-known/oauth-authorization-server; do
+  get wellknown "https://$name$p"
+  check "$p is Core's 404, not the app" is "$status $(header wellknown Content-Type | cut -d';' -f1)" "404 application/json"
+done
 
 # The first administrator, with the password on standard input, and a
 # call with the token it prints, which stays in this shell.
