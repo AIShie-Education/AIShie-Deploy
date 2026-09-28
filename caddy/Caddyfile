@@ -1,0 +1,32 @@
+# Caddy, the stack's one door to the internet: HTTPS for HOST (from the
+# container's environment, which compose.yaml sets from aishie.env), with a
+# certificate it gets and renews itself once HOST points at this server. A
+# name that cannot have a public certificate, such as localhost, gets one
+# from Caddy's own local authority instead.
+#
+# Its admin endpoint stays on localhost inside Caddy's own container, where
+# `caddy reload` reaches it and nothing else does.
+
+{$HOST} {
+	# AIShie Core: the API, the MCP endpoint and the health check. Not
+	# compressed: the MCP endpoint streams.
+	@core path /v1/* /mcp /mcp/* /healthz
+	handle @core {
+		reverse_proxy core:8080
+	}
+
+	# The runtime's API, and only it: its /healthz, /metrics and /status on
+	# 9090 are never proxied. The API takes bearer tokens alone, so the
+	# browser's cookies for this site (Core's session) are not passed on.
+	# Until the runtime serves it (M2), this answers 502.
+	handle /runtime/api/* {
+		request_header -Cookie
+		reverse_proxy runtime:9091
+	}
+
+	# Everything else is the web front end, which sets its own caching and
+	# compression, and answers every path that is not a file with the app.
+	handle {
+		reverse_proxy web:8080
+	}
+}

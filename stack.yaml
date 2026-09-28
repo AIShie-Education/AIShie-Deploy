@@ -1,0 +1,167 @@
+# The services of the AIShie stack. compose.yaml includes this file with the
+# two files it is interpolated from: read that first.
+#
+# Only Caddy listens on the server's public interfaces, on 80 and 443. Core,
+# the runtime and the web front end are published on 127.0.0.1 alone, for
+# aishie-update's health checks and for tools run by hand; PostgreSQL is not
+# published at all. The services reach each other on the network
+# aishie_default, whose subnet is fixed (AISHIE_SUBNET) so that Caddy's
+# address in it (AISHIE_CADDY_IP) can be the one proxy Core trusts.
+#
+# The images of core, runtime and web are what aishie-update deployed, by
+# digest. Before a service's first deploy its image is a name that cannot be
+# pulled (the .invalid domain never resolves), so that nothing starts in its
+# place.
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 20m
+    max-file: "5"
+
+services:
+  postgres:
+    # One major version, pinned: a new major version cannot read an older
+    # one's files. Moving to the next is a dump and a restore, by hand
+    # (README.md, PostgreSQL's major version), never an update.
+    image: postgres:18
+    # POSTGRES_PASSWORD, and the passwords of the two roles the init script
+    # creates.
+    env_file: ${AISHIE_ETC:-/etc/aishie}/postgres.env
+    volumes:
+      # Since 18, the image keeps its data in /var/lib/postgresql/18/docker:
+      # the volume holds a directory per major version.
+      - postgres:/var/lib/postgresql
+      # Run once, when the volume is empty: the databases aishie_core and
+      # aishie_runtime, each with a role of its own.
+      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # Over TCP: while the init script runs, the entrypoint's server listens
+      # on its socket alone, and a check there would pass too early.
+      test: ["CMD", "pg_isready", "-q", "-h", "127.0.0.1", "-U", "postgres", "-d", "postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    restart: unless-stopped
+    # Time for a clean shutdown, so that the next start needs no recovery.
+    stop_grace_period: 60s
+    logging: *logging
+
+  core:
+    image: ${CORE_REF:-aishie.invalid/aishie-core:not-deployed-yet}
+    user: "65532:65532"
+    # DATABASE_URL, SIGNING_KEY and the rest (env/core.env.example). What
+    # this stack decides is set here, and wins over the file.
+    env_file: ${AISHIE_ETC:-/etc/aishie}/core.env
+    environment:
+      HTTP_ADDR: ":8080"
+      PUBLIC_URL: https://${HOST:?set HOST in /etc/aishie/aishie.env}
+      # Caddy, and nothing else: Core takes a client's address from the
+      # X-Forwarded-For of this proxy alone.
+      TRUSTED_PROXIES: ${AISHIE_CADDY_IP:?set AISHIE_CADDY_IP in /etc/aishie/aishie.env}/32
+      # For the runtime's API (M2): the audience of the assertions Core
+      # issues for it. Core reads it once it has that API; until then,
+      # nothing does.
+      RUNTIME_AUDIENCES: https://${HOST}/runtime
+    volumes:
+      # The files people upload (BLOB_FS_ROOT=/data/blobs), in a directory
+      # setup-server.sh gives to Core's user.
+      - ${AISHIE_DATA:-/srv/aishie}/core:/data
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 20s
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging: *logging
+
+  runtime:
+    image: ${RUNTIME_REF:-aishie.invalid/aishie-agent-runtime:not-deployed-yet}
+    user: "65532:65532"
+    # DATABASE_URL, the runtime's own database and never Core's, and the rest
+    # (env/runtime.env.example).
+    env_file: ${AISHIE_ETC:-/etc/aishie}/runtime.env
+    environment:
+      # /healthz, /metrics and /status. Published on the host's loopback
+      # alone, and never proxied: /status names agents, courses and members.
+      HTTP_ADDR: ":9090"
+      CONFIG: /config
+      SECRETS_DIR: /secrets
+      # The one Core its agents may connect to. Inside this network
+      # https://HOST is Caddy, by its alias below.
+      CORE_BASE_URL_ALLOWLIST: https://${HOST:?set HOST in /etc/aishie/aishie.env}
+      # For the runtime's API (M2), which Caddy proxies to 9091. The runtime
+      # reads these once it has that API; until then, nothing does, and
+      # Caddy answers 502 there.
+      API_ADDR: ":9091"
+      API_AUDIENCE: https://${HOST}/runtime
+      CORE_BASE_URL: https://${HOST}
+      API_TRUSTED_PROXIES: ${AISHIE_CADDY_IP:?set AISHIE_CADDY_IP in /etc/aishie/aishie.env}/32
+    volumes:
+      # The agents' YAML and the secrets it refers to, root's, which the
+      # runtime reads through their group, 65532.
+      - ${AISHIE_ETC:-/etc/aishie}/runtime/agents:/config:ro
+      - ${AISHIE_ETC:-/etc/aishie}/runtime/secrets:/secrets:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    # The runtime finishes the answers in flight for SHUTDOWN_GRACE (15s by
+    # default), then releases its leases: it needs that and 15 seconds more.
+    stop_grace_period: ${RUNTIME_STOP_GRACE:-30s}
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging: *logging
+
+  web:
+    # The front end's build and a static server of its own, as the image's
+    # contract says (README.md, The images): plain HTTP on 8080, its own
+    # caching and compression, and /version.json.
+    image: ${WEB_REF:-aishie.invalid/aishie-frontend:not-deployed-yet}
+    ports:
+      - "127.0.0.1:8081:8080"
+    restart: unless-stopped
+    logging: *logging
+
+  caddy:
+    image: caddy:2
+    environment:
+      HOST: ${HOST:?set HOST in /etc/aishie/aishie.env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      # A directory, not the file alone: setup-server.sh replaces the
+      # Caddyfile, and a file mounted by itself would stay the old one.
+      - ./caddy:/etc/caddy:ro
+      # The certificates and their keys: kept when Caddy is recreated.
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      default:
+        ipv4_address: ${AISHIE_CADDY_IP:?set AISHIE_CADDY_IP in /etc/aishie/aishie.env}
+        # Inside this network, HOST is Caddy: the runtime calling Core at
+        # https://HOST gets there directly, with the valid certificate, and
+        # does not go out to the public address and back in.
+        aliases:
+          - ${HOST}
+    restart: unless-stopped
+    logging: *logging
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${AISHIE_SUBNET:?set AISHIE_SUBNET in /etc/aishie/aishie.env}
+
+volumes:
+  postgres:
+  caddy-data:
+  caddy-config:
