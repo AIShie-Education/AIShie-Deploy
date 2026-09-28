@@ -13,8 +13,12 @@
 #   oneoff/ID/             a one-off container: its exit code and output
 #   journal                what logger was given
 #
+#   compose-version        what `docker compose version --short` says
+#                          (else COMPOSE_VERSION, else 2.27.0)
+#   volumes/NAME           a volume Docker has
+#
 # Knobs, in the environment: PULL_FAIL, MIGRATE_FAIL, SEED_FAIL, CHECK_FAIL,
-# BACKUP_FAIL, POSTGRES_FAIL and FLOCK_FAIL make that step fail.
+# BACKUP_FAIL, POSTGRES_FAIL, CADDY_FAIL and FLOCK_FAIL make that step fail.
 
 # make_fakes DIR: the stand-ins, in DIR, to put first on PATH.
 make_fakes() {
@@ -51,6 +55,7 @@ compose() {
     case $1 in --project-directory | -f) shift 2 ;; *) break ;; esac
   done
   case "$*" in
+    "version --short") cat "$FAKE/compose-version" 2>/dev/null || echo "${COMPOSE_VERSION:-2.27.0}" ;;
     "up -d --no-recreate --wait"*) exit "${POSTGRES_FAIL:-0}" ;;
     "up -d --no-deps "*) service_image "$4" > "$FAKE/running/$4" ;;
     "rm -s -f "*) rm -f "$FAKE/running/$4" ;;
@@ -105,9 +110,13 @@ case $1 in
         esac ;;
       prune) : ;;
     esac ;;
+  version) echo 29.0.0 ;;
+  volume) [ "$2" = inspect ] && [ -e "$FAKE/volumes/$3" ] || exit 1 ;;
   run)
     # aishie runtime-status: a wget in the runtime's network namespace.
     case "$*" in *"--entrypoint wget"*) echo '{"worker":"w","agents":[]}'; exit 0 ;; esac
+    # setup-server.sh: caddy validate of the Caddyfile, in Caddy's image.
+    case "$*" in *" caddy validate "*) exit "${CADDY_FAIL:-0}" ;; esac
     # aishie-update: docker run --rm --network none IMAGE version
     ref=${*: -2:1}
     h=$(local_hex "$ref") || exit 125

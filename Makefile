@@ -23,9 +23,11 @@ ci: lint test config ## everything CI checks but the end to end
 lint: shellcheck actionlint ## shellcheck and actionlint
 
 .PHONY: shellcheck
+# In a UTF-8 locale: shellcheck stops at the first « » it has to print in any
+# other.
 shellcheck: ## the scripts: POSIX sh for the server's, bash for the tests'
-	shellcheck -s sh $(SH_SCRIPTS)
-	shellcheck $(BASH_SCRIPTS)
+	LC_ALL=C.UTF-8 shellcheck -s sh $(SH_SCRIPTS)
+	LC_ALL=C.UTF-8 shellcheck $(BASH_SCRIPTS)
 
 .PHONY: actionlint
 actionlint: ## the GitHub Actions workflows (and shellcheck over their run blocks)
