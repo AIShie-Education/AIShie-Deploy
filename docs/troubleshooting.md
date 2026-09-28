@@ -1,0 +1,178 @@
+# When something goes wrong
+
+Everything here is done as root on the server. Three things say what
+happened:
+
+- `aishie-update --status`: for each service, the image it runs, the
+  channel it follows, the last check and what it found, the last outcome,
+  and the images recorded as failed;
+- `/var/log/aishie-update.log`: one line per outcome, with the time, the
+  service, the digest before and after, and what happened;
+- `journalctl -u aishie-update`: every run in full, with the output of each
+  step (the migrations', the health checks', the new version's last log
+  lines).
+
+`aishie logs SERVICE` shows a service's own log (`core`, `runtime`, `web`,
+`caddy`, `postgres`).
+
+Whatever went wrong, the rule of a deploy holds: up to the moment the
+service is recreated, the version that ran goes on running, and the run
+stops at the step that failed. A run never starts the next service after a
+failure; the next run, five minutes later, goes on with the others.
+
+## A migration failed
+
+The log says `migrate up failed`, and the journal has the migration's
+error. The version that ran goes on running, and the new digest is recorded
+as failed, so the runs after leave it alone. A backup was taken just before
+(`/var/backups/aishie/core-deploy-*.dump`, or `runtime-deploy-*`).
+
+Each migration runs in one transaction, so a failed one has usually left
+nothing behind, but the schema is marked dirty at its number, N:
+
+```
+aishie core migrate version       # schema version N ... DIRTY
+aishie runtime migrate version
+```
+
+Core: `/healthz` answers 503 while the schema is dirty, and the old version
+keeps serving requests. The runtime: no version starts on a dirty schema,
+though the one running keeps running.
+
+1. Fix the cause the error names. Most often it is data the migration did
+   not expect; then the fix is a new image, and the channel moves on to it
+   by itself.
+2. Record the migration before the failed one as the last one applied:
+
+   ```
+   aishie core migrate force <N - 1>
+   aishie compose exec postgres psql -U postgres -d aishie_runtime \
+     -c 'UPDATE schema_migrations SET version = <N - 1>, dirty = false'   # the runtime has no migrate force
+   ```
+
+3. Try again: `aishie-update --retry core` (or `runtime`), which forgets the
+   failed digest and runs.
+
+If you are not sure what the failed migration left, restore the backup
+taken before it instead (README.md, Restoring a backup).
+
+## The new version did not report healthy
+
+The log says `not healthy within 60 seconds`, then one of three things:
+
+- **`rolled back: sha256:… runs again`.** The version before was started
+  again and reports healthy. The new digest is recorded as failed. The
+  journal has the new version's last 30 log lines: that is where the reason
+  is. The new schema stays (it was migrated before the switch), and the
+  version before works with it: every migration leaves the release before
+  it working (Core's and the runtime's CONTRIBUTING.md, Migrations).
+- **`rolled back to sha256:…, which does not report healthy either`.**
+  Neither version starts. What they share is the settings: most likely an
+  env file (`/etc/aishie/core.env`, `runtime.env`) or, for the runtime, the
+  agents' configuration. `aishie logs core` says which setting. Fix it,
+  then `aishie compose up -d core` starts the version the state names, and
+  `aishie-update --retry core` tries the new one again.
+- **`nothing ran before it, and nothing runs now`.** The first deploy of the
+  service did not come up. Its container was removed, so that nothing half
+  started stays. Read the journal, fix what it names, then
+  `aishie-update --retry SERVICE`.
+
+What each checks: Core's `/healthz` on 127.0.0.1:8080 must answer status
+`ok` with the version and commit the image's `version` prints (it answers
+503 while its database cannot be reached or its schema is behind); the
+runtime's on 127.0.0.1:9090 the same; the web's `/version.json` on
+127.0.0.1:8081 the commit of the image's revision label.
+
+## The updater keeps skipping a failed digest
+
+`aishie-update --status` shows the digest under `failed:`, and the log has
+one line: `skipped: it failed before`. That is on purpose: a digest that
+failed is not tried every five minutes. It is left alone until either
+
+- the channel names another digest (a fix pushed to main, for staging; a
+  new release set in `aishie.env`, for production), which is deployed as
+  usual; or
+- you run `aishie-update --retry SERVICE`, once the cause is fixed on the
+  server (an env file, the agents' configuration, a migration forced back).
+  It forgets that service's failed digests and runs.
+
+A service pinned by hand (`aishie-update --pin`) is not updated at all
+until `aishie-update --unpin SERVICE`; `--status` shows `pinned:`.
+
+## GHCR login expired
+
+The log says `could not pull …: … denied` or `unauthorized`, once, and every
+run after fails the same way without logging it again (the journal has
+each). Nothing is changed: what runs goes on running. The server logs in to
+ghcr.io with a personal access token (classic) with `read:packages`, kept in
+`/root/.docker/config.json`; it has expired or been revoked, or the account
+has lost access to one of the three packages.
+
+1. Make a new token (GitHub → Settings → Developer settings → Personal
+   access tokens → Tokens (classic)), with the scope `read:packages` and
+   nothing else, on the account that reads the packages. Put its expiry in
+   a calendar.
+2. Log in again, pasting the token when asked, then Enter and Ctrl-D:
+
+   ```
+   docker login ghcr.io -u <that account's GitHub user name> --password-stdin
+   ```
+
+3. `aishie-update` runs now instead of in five minutes.
+
+The same `denied` comes from a package the account cannot read, or one not
+published yet: `docker pull ghcr.io/aishie-education/aishie-frontend:edge`
+by hand shows which image it is. An owner of the AIShie-Education
+organization grants an account read access in each package's settings
+(Manage access).
+
+## Other things
+
+- **`another aishie-update … has held the lock`.** A deploy (or the nightly
+  backup) is running, or a run was killed and its process lingers:
+  `journalctl -u aishie-update -u aishie-backup`, and `ps -ef | grep
+  aishie`.
+- **`CORE_IMAGE refused`.** The channel in `aishie.env` is not an image of
+  its repository, or, in production, not a release (`X.Y.Z`) nor a digest.
+- **`PostgreSQL is not up and healthy`.** `aishie logs postgres`. A full disk
+  is the usual cause: `df -h /var/lib/docker /var/backups`.
+- **`the backup of the database … failed`.** Nothing was changed, and the
+  next run tries again. Usually the disk is full.
+- **The runtime's `check` refused the configuration.** The new version does
+  not accept the agents' YAML as it is. `aishie runtime check` shows why with
+  the running version; the journal has what the new one said. Fix the YAML
+  (it must pass both), `aishie compose kill -s HUP runtime`, then
+  `aishie-update --retry runtime`.
+- **Caddy has no certificate.** `aishie logs caddy`. The DNS name must
+  resolve to this server, and 80 and 443 must be open to the internet (the
+  provider's firewall; ufw does not matter for Docker's published ports).
+- **An LMS cannot show AIShie in its frame.** The browser's console says the
+  page refused to be framed. `curl -sI https://HOST/ | grep -i
+  content-security-policy` shows what the web sends: the LMS's origin must
+  be in it. `FRAME_ANCESTORS` in `aishie.env` must be in double quotes,
+  `FRAME_ANCESTORS="'self' https://lms.example.edu"`: without them Docker
+  cuts the value at the first single quote and the header says
+  `frame-ancestors self`, which lets nothing frame the app. Then
+  `aishie compose up -d web` (README.md, Frames).
+- **In the LMS's frame, a sign-in does not hold.** The next page finds
+  nobody signed in. Core's session cookie is a third-party cookie there:
+  `COOKIE_SAMESITE=none` in `core.env`, then `aishie compose up -d core`.
+  Safari, and every browser on iOS, refuses it whatever Core says; so may a
+  browser whose owner turned third-party cookies off. There the app works
+  in a tab of its own.
+- **The web does not start after FRAME_ANCESTORS was changed.**
+  `aishie logs web` has Caddy's error: a value on more than one line stops
+  it. Fix the line in `aishie.env`, then `aishie compose up -d web`. While
+  the value is wrong, every new web image fails its health check too and is
+  rolled back to the one before, which fails the same way: the log says
+  `which does not report healthy either`.
+- **The single sign-on button does not show.**
+  `curl -s 127.0.0.1:8080/v1/auth/methods` says what the sign-in page is
+  told: `"sso": null` means `OIDC_ISSUER` is not set in the `core.env` Core
+  runs with (after an edit, `aishie compose up -d core`; the page may keep
+  the old answer for a minute). A 404 is a Core from before that route: the
+  web image then shows no button until Core is updated.
+- **`could not pull the newest postgres:18 and caddy:2`** (from
+  `setup-server.sh`). Docker Hub limits how often a server may pull, and
+  refused for a while (`429 Too Many Requests`). The set-up goes on with
+  the images the server has; run it again later for the newest ones.
