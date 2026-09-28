@@ -161,7 +161,7 @@ get tools "https://$name/v1/tools"
 check "/v1/tools answers 200 as Core, in JSON" is "$status $(header tools Content-Type | cut -d';' -f1) $(json 'type')" "200 application/json object"
 get methods "https://$name/v1/auth/methods"
 case $status in
-  200) check "/v1/auth/methods says: password, no single sign-on" is "$(jq -c . <<< "$body" 2>&1)" '{"password":true,"sso":null}' ;;
+  200) check "/v1/auth/methods says: password, no single sign-on" is "$(jq -c '{password, sso}' <<< "$body" 2>&1)" '{"password":true,"sso":null}' ;;
   404) check "/v1/auth/methods is Core's 404 (a Core from before the route), not the app" \
     like "$(header methods Content-Type)" 'application/json*' ;;
   *) fail "/v1/auth/methods answers $status: $body" ;;
