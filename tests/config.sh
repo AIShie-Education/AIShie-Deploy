@@ -139,7 +139,7 @@ routes=$(jq -r '
     if .handler == "reverse_proxy" then "reverse_proxy " + ([.upstreams[].dial] | join(","))
     elif .handler == "headers" then "headers -" + (.request.delete | join(" -"))
     else .handler end] | join(", "))' <<< "${adapted:-null}" 2>&1) || routes="caddy adapt failed: $routes"
-want='/v1/* /mcp /mcp/* /healthz => reverse_proxy core:8080
+want='/v1/* /mcp /mcp/* /healthz /.well-known/oauth-protected-resource /.well-known/oauth-protected-resource/* /.well-known/oauth-authorization-server /.well-known/oauth-authorization-server/* /.well-known/openid-configuration => reverse_proxy core:8080
 /runtime/api/* => headers -Cookie, reverse_proxy runtime:9091
 * => reverse_proxy web:8080'
 [ "$routes" = "$want" ] || fail "the routes are

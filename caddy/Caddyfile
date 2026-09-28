@@ -9,8 +9,11 @@
 
 {$HOST} {
 	# AIShie Core: the API, the MCP endpoint and the health check. Not
-	# compressed: the MCP endpoint streams.
-	@core path /v1/* /mcp /mcp/* /healthz
+	# compressed: the MCP endpoint streams. And the documents an MCP client
+	# looks for before it signs in with OAuth: Core answers them, today with
+	# a JSON 404 (it has no OAuth), where the web would answer its page with
+	# 200 and a client would take that for an authorization server.
+	@core path /v1/* /mcp /mcp/* /healthz /.well-known/oauth-protected-resource /.well-known/oauth-protected-resource/* /.well-known/oauth-authorization-server /.well-known/oauth-authorization-server/* /.well-known/openid-configuration
 	handle @core {
 		reverse_proxy core:8080
 	}
