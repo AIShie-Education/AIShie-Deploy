@@ -39,7 +39,7 @@ CADDY_IMAGE=caddy:2
 # compose.yaml reads these from aishie.env and images.env, and the same
 # names in this process's environment would win over both files.
 unset HOST ENVIRONMENT CORE_IMAGE RUNTIME_IMAGE WEB_IMAGE CORE_REF RUNTIME_REF WEB_REF \
-  AISHIE_SUBNET AISHIE_CADDY_IP RUNTIME_STOP_GRACE
+  AISHIE_SUBNET AISHIE_CADDY_IP RUNTIME_STOP_GRACE FRAME_ANCESTORS
 export AISHIE_ETC="$ETC" AISHIE_STATE="$STATE"
 
 usage() {

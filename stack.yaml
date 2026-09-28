@@ -122,10 +122,23 @@ services:
   web:
     # The front end's build and a static server of its own, as the image's
     # contract says (README.md, The images): plain HTTP on 8080, its own
-    # caching and compression, and /version.json.
+    # caching and compression, /version.json, and a HEALTHCHECK of its own
+    # (a wget of /version.json). It writes nothing and needs no capability.
     image: ${WEB_REF:-aishie.invalid/aishie-frontend:not-deployed-yet}
+    user: "65532:65532"
+    environment:
+      # Which sites may show the app in a frame: the image's
+      # Content-Security-Policy frame-ancestors (README.md, Frames). The image
+      # takes 'self' only while the variable is unset; set but empty, it
+      # would let no page frame the app, its own included. So it is always
+      # set here: to aishie.env's FRAME_ANCESTORS, or to 'self', quotes and
+      # all, when that is unset or empty.
+      FRAME_ANCESTORS: ${FRAME_ANCESTORS:-'self'}
     ports:
       - "127.0.0.1:8081:8080"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
     restart: unless-stopped
     logging: *logging
 

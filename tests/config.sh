@@ -24,7 +24,7 @@ mkdir -p "$work/etc" "$work/state"
 for f in aishie core runtime postgres; do cp "$root/env/$f.env.example" "$work/etc/$f.env"; done
 export AISHIE_ETC=$work/etc AISHIE_STATE=$work/state
 # Names the settings would otherwise take from this shell.
-unset HOST CORE_REF RUNTIME_REF WEB_REF AISHIE_SUBNET AISHIE_CADDY_IP
+unset HOST CORE_REF RUNTIME_REF WEB_REF AISHIE_SUBNET AISHIE_CADDY_IP RUNTIME_STOP_GRACE FRAME_ANCESTORS
 compose() { docker compose --project-directory "$root" -f "$root/compose.yaml" "$@"; }
 hex() { printf "$1%.0s" $(seq 64); }
 CORE=ghcr.io/aishie-education/aishie-core@sha256:$(hex a)
@@ -65,6 +65,15 @@ for case in before-any-deploy deployed; do
   [ "$(q '.services.runtime.user')" = 65532:65532 ] || fail "the runtime's user: $(q '.services.runtime.user')"
   [ "$(q '.services.runtime.stop_grace_period')" = 30s ] || fail "the runtime's stop grace: $(q '.services.runtime.stop_grace_period')"
   [ "$(q '.services.postgres.image')" = postgres:18 ] || fail "PostgreSQL: $(q '.services.postgres.image')"
+  # The web runs as its image's contract allows: its user, a read-only file
+  # system, no capability, no new privileges.
+  [ "$(q '.services.web.user')" = 65532:65532 ] || fail "the web's user: $(q '.services.web.user')"
+  [ "$(q '.services.web.read_only')" = true ] || fail "the web's file system is writable"
+  [ "$(q '.services.web.cap_drop | join(" ")')" = ALL ] || fail "the web's capabilities: $(q '.services.web.cap_drop')"
+  [ "$(q '.services.web.security_opt | join(" ")')" = no-new-privileges:true ] || fail "the web's security_opt: $(q '.services.web.security_opt')"
+  # aishie.env sets no FRAME_ANCESTORS: the web gets 'self', quotes and all,
+  # never an empty value (which would let no page frame the app).
+  [ "$(q '.services.web.environment.FRAME_ANCESTORS')" = "'self'" ] || fail "FRAME_ANCESTORS: «$(q '.services.web.environment.FRAME_ANCESTORS')»"
   if [ $case = deployed ]; then
     [ "$(q '.services.core.image')" = "$CORE" ] || fail "core runs $(q '.services.core.image')"
     [ "$(q '.services.runtime.image')" = "$RUNTIME" ] || fail "the runtime runs $(q '.services.runtime.image')"
@@ -73,6 +82,26 @@ for case in before-any-deploy deployed; do
     [ "$(q '.services.core.image')" = aishie.invalid/aishie-core:not-deployed-yet ] || fail "core runs $(q '.services.core.image')"
   fi
 done
+
+# FRAME_ANCESTORS, as the operator may write it in aishie.env: given, it
+# reaches the web as it is, CSP's single quotes included; empty, it is
+# 'self', as unset.
+case=frame-ancestors
+cp "$work/etc/aishie.env" "$work/aishie.env.orig"
+for given in "\"'self' https://canvas.example.edu\"=>'self' https://canvas.example.edu" \
+  "\"'none'\"=>'none'" "\"'self'\"=>'self'" "=>'self'" "\"\"=>'self'"; do
+  cp "$work/aishie.env.orig" "$work/etc/aishie.env"
+  printf 'FRAME_ANCESTORS=%s\n' "${given%%=>*}" >> "$work/etc/aishie.env"
+  got=$(compose config --format json | jq -r '.services.web.environment.FRAME_ANCESTORS')
+  [ "$got" = "${given#*=>}" ] || fail "FRAME_ANCESTORS=${given%%=>*} reached the web as «$got», not «${given#*=>}»"
+done
+# ... and one left in the operator's shell does not: aishie-update and aishie
+# clear it, as they clear the stack's other names.
+for script in aishie-update aishie; do
+  grep -q '^  AISHIE_SUBNET AISHIE_CADDY_IP RUNTIME_STOP_GRACE FRAME_ANCESTORS$' "$root/bin/$script" ||
+    fail "bin/$script does not clear FRAME_ANCESTORS from its environment"
+done
+cp "$work/aishie.env.orig" "$work/etc/aishie.env"
 
 # Settings missing: compose refuses, and names the one.
 case=no-host
