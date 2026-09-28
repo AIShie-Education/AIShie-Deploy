@@ -229,7 +229,10 @@ check "the web's own health check passes" is "$(docker inspect -f '{{.State.Heal
 # namespace, with its /etc/hosts and Docker's DNS.
 runtime=$(aishie ps -q runtime)
 caddy_ip=$(sed -n 's/^AISHIE_CADDY_IP=//p' "$ETC/aishie.env" | tail -n 1)
-seen=$(docker run --rm --network "container:$runtime" -v "$work/root.crt:/ca.crt:ro" "$CURL_IMAGE" \
+# curl's image is pulled first, and the check's container never pulls: what
+# it prints is curl's alone, not Docker's progress on a machine without it.
+docker pull -q "$CURL_IMAGE" > /dev/null || fail "could not pull $CURL_IMAGE"
+seen=$(docker run --rm --pull never --network "container:$runtime" -v "$work/root.crt:/ca.crt:ro" "$CURL_IMAGE" \
   -sS --noproxy '*' --max-time 10 --cacert /ca.crt -o /dev/null -w '%{http_code} %{remote_ip}' "https://$name/healthz" 2>&1) || true
 check "from the runtime, https://$name is Caddy ($caddy_ip), with a valid certificate, and Core answers" is "$seen" "200 $caddy_ip"
 
