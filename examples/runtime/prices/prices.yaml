@@ -1,0 +1,23 @@
+# An example price table (the runtime's package pricing), for
+# /etc/aishie/runtime/agents/prices/prices.yaml, which runtime.yaml's
+# prices_ref: prices/prices.yaml names (or PRICES=/config/prices/prices.yaml
+# in runtime.env).
+#
+# ILLUSTRATIVE ONLY: these numbers show the format, not what any provider
+# charges. Check each row against the provider's own price page, and add a
+# row with a new `from` whenever a price changes; never edit an old one, as
+# the runtime's ledger keeps the version of every cost it records.
+#
+# US dollars per million tokens. A cache price left out is the input
+# price. `provider` is the runtime's name for who serves the model
+# (anthropic, openai, deepseek, …); `model` is exact, or a glob with *.
+version: "school-example-2026-09-29"
+prices:
+  - provider: anthropic
+    model: claude-haiku-4*
+    from: 2025-10-15
+    usd_per_mtok: {input: 1.00, cache_read: 0.10, cache_write: 1.25, output: 5.00}
+  - provider: deepseek
+    model: deepseek-chat
+    from: 2025-09-29
+    usd_per_mtok: {input: "0.28", cache_read: "0.028", output: "0.42"}
