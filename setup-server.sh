@@ -1,5 +1,5 @@
 #!/bin/sh
-# Sets up an Ubuntu server (24.04 or later) to run the AIShie stack, or
+# Sets up an Ubuntu server (24.04 or later) to run the AIshiestack, or
 # brings one set up before up to date. Run as root, with this repository
 # copied to the server (README.md, A new server):
 #
@@ -170,7 +170,7 @@ write_settings() {
     channel=
   fi
   cat > "$f.new" <<EOF
-# The operator's settings of this server's AIShie stack; every one is
+# The operator's settings of this server's AIshiestack; every one is
 # explained in /opt/aishie/env/aishie.env.example. setup-server.sh wrote it
 # once and leaves it alone: edit it by hand. One NAME=value per line, no
 # quotes, no comment after a value.
@@ -190,7 +190,7 @@ WEB_IMAGE=${channel:+$REGISTRY/aishie-frontend:$channel}
 AISHIE_SUBNET=172.30.83.0/24
 AISHIE_CADDY_IP=172.30.83.10
 RUNTIME_STOP_GRACE=30s
-# Optional, and unset: FRAME_ANCESTORS, the other sites that may show AIShie
+# Optional, and unset: FRAME_ANCESTORS, the other sites that may show AIshie
 # in a frame (only its own pages may while it is unset). The example file
 # says how to write it.
 EOF
@@ -233,7 +233,7 @@ AISHIE_CORE_DB_PASSWORD=$core_pw
 AISHIE_RUNTIME_DB_PASSWORD=$runtime_pw
 EOF
   cat > "$ETC/core.env.new" <<EOF
-# AIShie Core's settings: every one is explained in
+# AIshieCore's settings: every one is explained in
 # /opt/aishie/env/core.env.example. One NAME=value per line, no quotes, no
 # comment after a value. After a change: aishie compose up -d core
 DATABASE_URL=postgres://aishie_core:$core_pw@postgres:5432/aishie_core?sslmode=disable
@@ -243,7 +243,7 @@ BLOB_STORE=fs
 BLOB_FS_ROOT=/data/blobs
 EOF
   cat > "$ETC/runtime.env.new" <<EOF
-# The AIShie Agent Runtime's settings: every one is explained in
+# The AIshieAgent Runtime's settings: every one is explained in
 # /opt/aishie/env/runtime.env.example. One NAME=value per line, no quotes,
 # no comment after a value. After a change: aishie compose up -d runtime
 DATABASE_URL=postgres://aishie_runtime:$runtime_pw@postgres:5432/aishie_runtime?sslmode=disable

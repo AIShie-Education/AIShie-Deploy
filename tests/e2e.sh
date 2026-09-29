@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The whole stack, for real: setup-server.sh on this machine with the images
 # the channels name, then what a person, the operator and the runtime see,
-# through Caddy. It sets the machine up as an AIShie server, as root, and
+# through Caddy. It sets the machine up as an AIshie server, as root, and
 # leaves it so: run it only where that can be thrown away, as CI's end to
 # end does (.github/workflows/ci.yml, which runs it on a fresh runner):
 #

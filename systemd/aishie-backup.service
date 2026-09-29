@@ -3,7 +3,7 @@
 # of the week, so that seven of each are kept (`aishie backup`). The backups
 # before each deploy are aishie-update's, apart from these.
 [Unit]
-Description=AIShie: the nightly backup of the databases (aishie backup)
+Description=AIshie:the nightly backup of the databases (aishie backup)
 Documentation=https://github.com/AIShie-Education/AIShie-Deploy
 After=docker.service
 Requires=docker.service

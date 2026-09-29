@@ -1,5 +1,5 @@
 #!/bin/sh
-# Things done by hand on this server's AIShie stack, as root, with the
+# Things done by hand on this server's AIshie stack, as root, with the
 # images that run and the settings and mounts they run with:
 #
 #   aishie admin                   the first administrator: asks for a name, an email and a password

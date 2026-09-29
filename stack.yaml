@@ -1,4 +1,4 @@
-# The services of the AIShie stack. compose.yaml includes this file with the
+# The services of the AIshie stack. compose.yaml includes this file with the
 # two files it is interpolated from: read that first.
 #
 # Only Caddy listens on the server's public interfaces, on 80 and 443. Core,

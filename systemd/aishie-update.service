@@ -4,7 +4,7 @@
 # the journal (journalctl -u aishie-update), and each outcome is also a line
 # in /var/log/aishie-update.log.
 [Unit]
-Description=AIShie: deploy the images the channels name (aishie-update)
+Description=AIshie:deploy the images the channels name (aishie-update)
 Documentation=https://github.com/AIShie-Education/AIShie-Deploy
 Wants=network-online.target
 After=network-online.target docker.service
