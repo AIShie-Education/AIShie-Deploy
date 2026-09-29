@@ -1,7 +1,7 @@
 # aishie backup every night at about three; one missed while the server was
 # off is taken at boot.
 [Unit]
-Description=AIShie: the nightly backup of the databases
+Description=AIshie:the nightly backup of the databases
 Documentation=https://github.com/AIShie-Education/AIShie-Deploy
 
 [Timer]

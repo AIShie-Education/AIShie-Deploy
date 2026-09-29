@@ -1,6 +1,6 @@
 # AIShie-Deploy
 
-How an AIShie server runs: one Docker Compose stack per server, which the
+How an AIshie server runs: one Docker Compose stack per server, which the
 server keeps up to date itself by pulling images from GitHub's registry.
 
 The stack is five containers on one network:
@@ -425,22 +425,22 @@ then shows no button.) To see what it says:
 
 Framing goes two ways, and this stack allows both.
 
-- **AIShie showing another site in a frame**, such as a similarity
+- **AIshie showing another site in a frame**, such as a similarity
   checker's viewer (Turnitin's, say): nothing limits it. It is governed by
   the page's own `frame-src`, and neither the web image's header (only
   `frame-ancestors`) nor `index.html`'s policy (only `img-src`) sets it.
   Keep it that way for such a viewer to work.
-- **Another site showing AIShie in a frame**, such as an LMS that opens it
+- **Another site showing AIshie in a frame**, such as an LMS that opens it
   in an iframe (an LTI launch, say): governed by
   `Content-Security-Policy: frame-ancestors`, which only a header can set
   and which the web image sends with every answer. By default only
-  AIShie's own pages may frame it, `frame-ancestors 'self'`. To let other
+  AIshie's own pages may frame it, `frame-ancestors 'self'`. To let other
   sites, set `FRAME_ANCESTORS` in `/etc/aishie/aishie.env`, in double
   quotes, because CSP's keywords carry single quotes of their own (without
   the double quotes Docker cuts the value at the first one):
 
   ```
-  FRAME_ANCESTORS="'self' https://canvas.example.edu"   # AIShie, and that LMS
+  FRAME_ANCESTORS="'self' https://canvas.example.edu"   # AIshie, and that LMS
   FRAME_ANCESTORS="'none'"                              # no page at all
   ```
 
@@ -459,7 +459,7 @@ Framing goes two ways, and this stack allows both.
   `COOKIE_SAMESITE=none` in `core.env` too (`aishie compose up -d core`), or
   a sign-in inside the frame does not hold. Even then Safari, and every
   browser on iOS, refuses third-party cookies, as can people in other
-  browsers; there AIShie works only in a tab of its own. Single sign-on
+  browsers; there AIshie works only in a tab of its own. Single sign-on
   inside a frame takes the frame to the provider's page, which most
   providers do not let be framed.
 
@@ -653,4 +653,4 @@ the tests are bash. Comments say what is true and why.
 
 ## License
 
-AIShie Deploy is copyright 2026 XIE Hanming, and source-available under the [Elastic License 2.0](LICENSE) (ELv2), governed by the laws of Hong Kong. You may use, copy, change and redistribute it on the terms in LICENSE, which include that you may not offer it to others as a hosted or managed service.
+AIshie Deploy is copyright 2026 XIE Hanming, and source-available under the [Elastic License 2.0](LICENSE) (ELv2), governed by the laws of Hong Kong. You may use, copy, change and redistribute it on the terms in LICENSE, which include that you may not offer it to others as a hosted or managed service.

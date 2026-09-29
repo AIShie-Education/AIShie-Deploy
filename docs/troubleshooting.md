@@ -146,7 +146,7 @@ organization grants an account read access in each package's settings
 - **Caddy has no certificate.** `aishie logs caddy`. The DNS name must
   resolve to this server, and 80 and 443 must be open to the internet (the
   provider's firewall; ufw does not matter for Docker's published ports).
-- **An LMS cannot show AIShie in its frame.** The browser's console says the
+- **An LMS cannot show AIshie in its frame.** The browser's console says the
   page refused to be framed. `curl -sI https://HOST/ | grep -i
   content-security-policy` shows what the web sends: the LMS's origin must
   be in it. `FRAME_ANCESTORS` in `aishie.env` must be in double quotes,

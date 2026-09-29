@@ -8,7 +8,7 @@
 # `caddy reload` reaches it and nothing else does.
 
 {$HOST} {
-	# AIShie Core: the API, the MCP endpoint and the health check. Not
+	# AIshie Core: the API, the MCP endpoint and the health check. Not
 	# compressed: the MCP endpoint streams. And the documents an MCP client
 	# looks for before it signs in with OAuth: Core answers them, today with
 	# a JSON 404 (it has no OAuth), where the web would answer its page with

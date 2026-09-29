@@ -1,4 +1,4 @@
-# The AIShie stack of one server, the Docker Compose project aishie:
+# The AIshie stack of one server, the Docker Compose project aishie:
 # PostgreSQL, Core, the agent runtime, the web front end and Caddy. The
 # services are in stack.yaml. This file names the project and the two files
 # their settings come from:

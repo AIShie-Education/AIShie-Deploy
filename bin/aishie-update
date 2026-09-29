@@ -1,5 +1,5 @@
 #!/bin/sh
-# Keeps this server's AIShie stack on the images its channels name. The
+# Keeps this server's AIshie stack on the images its channels name. The
 # timer aishie-update.timer runs it every five minutes; as root, by hand:
 #
 #   aishie-update                    one run: core, runtime and web, in that order
@@ -135,7 +135,7 @@ compose_with() {
 deployed() { setting "$IMAGES" "$(upper "$1")_REF"; }
 set_deployed() {
   {
-    echo "# The image each service of this server's AIShie stack runs, by digest."
+    echo "# The image each service of this server's AIshie stack runs, by digest."
     echo "# aishie-update writes it after each deploy and compose.yaml reads it:"
     echo "# change it with aishie-update --pin, not by hand."
     for _s in $SERVICES; do

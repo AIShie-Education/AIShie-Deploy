@@ -1,5 +1,5 @@
 #!/bin/sh
-# The databases of AIShie Core and of the agent runtime, each owned by a role
+# The databases of AIshie Core and of the agent runtime, each owned by a role
 # of its own. PostgreSQL's image runs this once, when its volume is empty,
 # against the server it starts for the purpose.
 #
