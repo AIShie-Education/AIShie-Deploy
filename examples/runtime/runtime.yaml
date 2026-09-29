@@ -1,0 +1,51 @@
+# An example of the runtime's own settings with the school's AI plan: the
+# models the school offers the people who host their agents on this server,
+# on keys of the school's that nobody sees. No secret is written here: each
+# key_ref names a file in /etc/aishie/runtime/secrets (README.md, The
+# school's AI plan).
+#
+# Put it in /etc/aishie/runtime/agents/ (at most one runtime: document there
+# in all), edit it, and check it:
+#
+#   install -g 65532 -m 640 runtime.yaml /etc/aishie/runtime/agents/
+#   aishie runtime check --live
+#   aishie compose kill -s HUP runtime
+#
+# The runtime's docs/deploying.md says what every setting does.
+runtime:
+  # Optional. A price table makes the costs of model calls known, and is
+  # needed for any quota in dollars (usd:). It goes in a subdirectory: a
+  # .yaml beside the agents is read as an agent's.
+  # prices_ref: prices/prices.yaml
+
+  school:
+    # Each offer: the id owners choose it by, the label they are shown, and
+    # the model, as an agent's model: section is written. Its key is a file
+    # under secret://school/keys/.
+    offers:
+      - id: standard
+        label: "School AI (Claude Haiku)"
+        adapter: anthropic
+        model: claude-haiku-4-5
+        key_ref: secret://school/keys/anthropic-main
+        params: {max_output_tokens: 1500}
+      - id: deepseek
+        label: "School AI (DeepSeek)"
+        adapter: openai_chat
+        model: deepseek-chat
+        base_url: https://api.deepseek.com
+        key_ref: secret://school/keys/deepseek
+
+    # Answers a day, counted from 00:00 UTC: per person, across all of their
+    # agents (100 unless set); per person who asks, per agent and course (20
+    # unless set); and, optionally, a ceiling across everything on the
+    # school's keys. Each may also take usd:, with a price table that
+    # prices every offer.
+    per_owner_day: {answers: 100}
+    per_asker_day: {answers: 20}
+    # per_day: {answers: 5000}
+
+    # Optional: the words posted when a quota is spent and the owner has no
+    # key of their own behind the plan. Left out, a built-in notice says it
+    # in English and Chinese.
+    # on_quota_text: "今天的學校 AI 額度已用完，請明天再試。 Today's school AI allowance is used up. Please try again tomorrow."

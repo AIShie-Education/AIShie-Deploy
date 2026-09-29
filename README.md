@@ -35,6 +35,7 @@ In this repository, and where `setup-server.sh` puts it:
 | `caddy/Caddyfile` | `/opt/aishie/caddy/` | Caddy's routes, for `HOST` |
 | `postgres/initdb/10-aishie.sh` | `/opt/aishie/postgres/initdb/` | the two databases and their roles, made once |
 | `env/*.env.example` | `/opt/aishie/env/` | every setting, explained |
+| `examples/runtime/` | | a runtime document with [the school's AI plan](#the-schools-ai-plan), and a price table |
 | `README.md`, `docs/` | `/opt/aishie/` | this, and [when something goes wrong](docs/troubleshooting.md) |
 | | `/etc/aishie/aishie.env` | the operator's settings: `HOST`, `ENVIRONMENT`, the channels, the network |
 | | `/etc/aishie/core.env`, `runtime.env`, `postgres.env` | each service's settings and secrets, root's (0600) |
@@ -336,6 +337,56 @@ configuration again. An agent's Core token comes from Core:
 `https://HOST`, the only Core the runtime here may connect to; inside the
 stack's network that name is Caddy (below), so the agents reach Core without
 leaving the server.
+
+## The school's AI plan
+
+The school may offer the people who host their agents here a model on its
+own key, so that they need no API key of their own: the `school:` section
+of the runtime's settings, a `runtime:` document in
+`/etc/aishie/runtime/agents` (at most one there in all).
+[`examples/runtime/runtime.yaml`](examples/runtime/runtime.yaml) is one to
+start from; the runtime's `docs/deploying.md` (The school's AI plan) says
+what each setting does. Without it, hosted agents run on their owners' own
+keys alone.
+
+Each offer's key is a file under `/etc/aishie/runtime/secrets/school/keys/`,
+which its `key_ref: secret://school/keys/<name>` names, root's and readable
+by group 65532, the runtime's user (`user: "65532:65532"` in
+`stack.yaml`): the file `0640 root:65532`, the directories `school` and
+`school/keys` `0750 root:65532`. The key never leaves the server: the
+runtime reads it when it calls the model, and it is not stored in the
+database, shown, audited or sent to a browser.
+
+```
+install -d -m 750 -g 65532 /etc/aishie/runtime/secrets/school /etc/aishie/runtime/secrets/school/keys
+install -m 640 -g 65532 /dev/stdin /etc/aishie/runtime/secrets/school/keys/anthropic-main
+    (paste the key, Enter, Ctrl-D)
+install -g 65532 -m 640 runtime.yaml /etc/aishie/runtime/agents/
+aishie runtime check --live
+aishie compose kill -s HUP runtime
+```
+
+`check` lists the offers and the quotas; `HUP` puts them in force, and the
+front end offers 「學校方案」 / "School plan" once the runtime's
+`/runtime/api/v1/info` says `school_key: true`. The quotas count answers
+from 00:00 UTC: per person across all of their agents (`per_owner_day`, 100
+unless set), per person who asks (`per_asker_day`, 20 unless set), and,
+optionally, across the school (`per_day`). A person may put their own key
+behind the plan, which answers once their allowance is spent; without one,
+the asker is told the school's allowance is used up for the day.
+
+Quotas in dollars (`usd:`) need a price table that prices every offer, or
+the runtime does not start. It goes in a subdirectory of the agents' (a
+`.yaml` beside them would be read as an agent's):
+`/etc/aishie/runtime/agents/prices/prices.yaml`, named by `prices_ref:
+prices/prices.yaml` in the runtime document, or by
+`PRICES=/config/prices/prices.yaml` in `runtime.env`
+([`examples/runtime/prices/prices.yaml`](examples/runtime/prices/prices.yaml)).
+Without one, costs are unknown and answers alone are counted.
+
+The runtime's administrators (Core's root and admins, or those
+`ADMIN_ACTOR_IDS` names) read today's use of the plan per person at
+`https://HOST/runtime/api/v1/admin/school-plan/usage`.
 
 ## Single sign-on
 
