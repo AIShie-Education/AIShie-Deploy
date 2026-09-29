@@ -62,6 +62,18 @@ grep -q "^docker compose --project-directory $root -f $root/compose.yaml run --r
 ! grep -q "$PASSWORD" "$CALLS" "$FAKE/out" || fail "the password is on a command line or in the output"
 called "compose.yaml restart core" || fail "Core was not restarted: $(cat "$CALLS")"
 said "Sign in at https://test.aishie.app with you@example.edu" || fail "said: $(cat "$FAKE/out")"
+! said "API token" || fail "spoke of an API token: $(cat "$FAKE/out")"
+# A Core from before people held no API tokens prints one for the
+# administrator at bootstrap: it is not shown, nor its heading, and what
+# else bootstrap says is.
+setup admin-old-core deployed
+printf 'Your Name\nyou@example.edu\n%s\n%s\n' "$PASSWORD" "$PASSWORD" > "$FAKE/answers"
+TOKEN=ais_abcdefghijkl_$(printf 'z%.0s' $(seq 40))
+STDIN=$FAKE/answers BOOTSTRAP_TOKEN=$TOKEN aishie admin || fail "exit $?: $(cat "$FAKE/out")"
+! said "$TOKEN" || fail "the token bootstrap printed was shown"
+! said "API token" || fail "the token's heading was shown: $(cat "$FAKE/out")"
+said "system actor 0192f3c1" || fail "what bootstrap said was not shown: $(cat "$FAKE/out")"
+said "Sign in at https://test.aishie.app with you@example.edu" || fail "said: $(cat "$FAKE/out")"
 # admin_refused CASE ANSWERS WHY: aishie admin fails, says WHY, and neither
 # bootstraps nor restarts anything.
 admin_refused() {

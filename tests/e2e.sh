@@ -175,21 +175,49 @@ for p in /.well-known/oauth-protected-resource /.well-known/oauth-protected-reso
   check "$p is Core's 404, not the app" is "$status $(header wellknown Content-Type | cut -d';' -f1)" "404 application/json"
 done
 
-# The first administrator, with the password on standard input, and a
-# call with the token it prints, which stays in this shell.
+# The first administrator, with the password on standard input, who then
+# signs in with it through Caddy (POST /v1/auth/login), as the web's sign-in
+# page does, and calls the API with the session Core gives: people hold no
+# API tokens, only agents do. Bootstrap's standard output goes nowhere: a
+# Core from before that prints one for root there, which is never read. The
+# password and the session stay in this shell, and reach curl on its
+# standard input.
 password=$(openssl rand -hex 16)
-token=$(printf '%s\n' "$password" | aishie core bootstrap --name Root --email root@e2e.test --password-stdin 2>"$work/bootstrap.err") ||
-  { cat "$work/bootstrap.err" >&2; token=; }
-unset password
-if in_actions && [ -n "$token" ]; then echo "::add-mask::$token"; fi
-check "aishie core bootstrap makes the first administrator, and prints a token" like "$token" 'ais_?*'
+if in_actions; then echo "::add-mask::$password"; fi
+if printf '%s\n' "$password" | aishie core bootstrap --name Root --email root@e2e.test --password-stdin >/dev/null 2>"$work/bootstrap.err"; then
+  ok "aishie core bootstrap makes the first administrator"
+else
+  cat "$work/bootstrap.err" >&2
+  fail "aishie core bootstrap makes the first administrator"
+fi
 get anonymous "https://$name/v1/actors"
 check "/v1/actors refuses a call with no token" is "$status" 401
-status=$(printf 'header = "Authorization: Bearer %s"\n' "$token" |
-  curl -sS --noproxy '*' --max-time 10 --config - --resolve "$name:443:127.0.0.1" --cacert "$work/root.crt" \
-    -o "$work/actors.body" -w '%{http_code}' "https://$name/v1/actors") || status=000
-unset token
-check "/v1/actors answers the administrator" is "$status" 200
+get signin "https://$name/v1/auth/login" -H 'Content-Type: application/json' --data-binary @- \
+  <<< "$(printf '{"email":"root@e2e.test","password":"%s"}' "$password")"
+unset password
+session=$(header signin Set-Cookie | sed -n 's/^ais_session=\([^;]*\).*/\1/p')
+rm -f "$work/signin.headers"
+if in_actions && [ -n "$session" ]; then echo "::add-mask::$session"; fi
+check "the administrator signs in with the email and password given to bootstrap, and is given a session" \
+  is "$status $(json .password_change_required) $([ -n "$session" ] && echo session)" "200 false session"
+# with_session KIND SESSION PATH: the status of GET PATH through Caddy,
+# with the session as a bearer token (bearer) or as the cookie a browser
+# sends (cookie).
+with_session() {
+  local config code
+  case $1 in
+    bearer) config='header = "Authorization: Bearer %s"' ;;
+    cookie) config='cookie = "ais_session=%s"' ;;
+  esac
+  # shellcheck disable=SC2059 # the format is one of the two above
+  code=$(printf "$config\n" "$2" |
+    curl -sS --noproxy '*' --max-time 10 --config - --resolve "$name:443:127.0.0.1" --cacert "$work/root.crt" \
+      -o "$work/session.body" -w '%{http_code}' "https://$name$3") || code=000
+  echo "$code"
+}
+check "/v1/actors answers the administrator, with the session as a bearer token" is "$(with_session bearer "$session" /v1/actors)" 200
+check "/v1/me answers the administrator, with the session's cookie, as the web asks" is "$(with_session cookie "$session" /v1/me)" 200
+unset session
 
 # The runtime's own endpoints are never routed: /runtime/api/* goes to its
 # API on 9091 (nothing listens there until M2: 502), and its 9090 is not
