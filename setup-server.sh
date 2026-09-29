@@ -474,8 +474,8 @@ EOF
   n=$((n + 1))
   cat <<EOF
 $n. The first administrator, once Core runs (aishie-update --status): it asks
-   for a name, an email and a password, then restarts Core. It prints the
-   administrator's API token once, for scripts:
+   for a name, an email and a password, then restarts Core, and the
+   administrator signs in at https://$host with that email and password:
      aishie admin
 EOF
   n=$((n + 1))

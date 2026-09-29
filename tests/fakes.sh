@@ -19,7 +19,9 @@
 #
 # Knobs, in the environment: PULL_FAIL, MIGRATE_FAIL, SEED_FAIL, CHECK_FAIL,
 # BACKUP_FAIL, POSTGRES_FAIL, CADDY_FAIL, COMPOSE_PULL_FAIL and FLOCK_FAIL make
-# that step fail.
+# that step fail. BOOTSTRAP_TOKEN has a one-off bootstrap print it as a Core
+# from before people held no API tokens prints root's: under a heading on
+# standard error, the token alone on standard output.
 
 # make_fakes DIR: the stand-ins, in DIR, to put first on PATH.
 make_fakes() {
@@ -80,6 +82,10 @@ compose() {
       shift 5
       cat > "$FAKE/stdin"
       echo "$svc $* with $(service_image "$svc")"
+      if [ "$1" = bootstrap ] && [ -n "${BOOTSTRAP_TOKEN:-}" ]; then
+        printf 'root actor   0192f3c1-0000-7000-8000-000000000001\nsystem actor 0192f3c1-0000-7000-8000-000000000002\n\nAPI token for root, shown once:\n' >&2
+        echo "$BOOTSTRAP_TOKEN"
+      fi
       exit "${RUN_FAIL:-0}" ;;
     "exec -T postgres pg_dump"*)
       echo "PGDMP a dump of ${*: -1}"

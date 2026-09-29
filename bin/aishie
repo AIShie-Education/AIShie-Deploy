@@ -22,8 +22,10 @@
 # `aishie admin` makes the first administrator: it asks for a name, an email
 # and a password (twice, not shown), gives the password to Core's bootstrap
 # on its standard input, and then restarts Core, so that its background jobs
-# start as the system actor bootstrap creates. The long form, with
-# `aishie core bootstrap`, does the same in three steps.
+# start as the system actor bootstrap creates. The administrator then signs
+# in to the site with that email and password: people hold no API tokens,
+# only agents do. The long form, with `aishie core bootstrap`, does the same
+# in three steps.
 #
 # `aishie backup` is what aishie-backup.timer runs every night: the two
 # databases dumped to /var/backups/aishie/SERVICE-daily-N.dump, N the day of
@@ -106,8 +108,11 @@ secret() {
 }
 
 # admin: the first administrator, as the header says. The password is on no
-# command line and in no output; bootstrap prints the administrator's API
-# token, once.
+# command line and in no output. Bootstrap's standard output goes nowhere: a
+# Core from before people held no API tokens prints one for the
+# administrator there, which nobody needs, and which is neither shown nor
+# kept. What it says on standard error is shown, but for that token's
+# heading.
 admin() {
   [ -n "$(setting "$STATE/images.env" CORE_REF)" ] ||
     die "core is not deployed yet: aishie-update deploys it (aishie-update --status)"
@@ -123,17 +128,17 @@ admin() {
   secret 'The password again: '
   [ "$ans" = "$pw" ] || die "the two passwords differ: nothing was changed"
   ans=
-  printf '%s\n' "$pw" | compose run --rm --no-deps -T core bootstrap --name "$name" --email "$email" --password-stdin ||
+  said=$(printf '%s\n' "$pw" | compose run --rm --no-deps -T core bootstrap --name "$name" --email "$email" --password-stdin 2>&1 >/dev/null) || {
+    printf '%s\n' "$said" >&2
     die "bootstrap failed (above): Core was not restarted"
+  }
   pw=
+  printf '%s\n' "$said" | grep -v '^API token for ' >&2 || :
   echo "aishie: restarting Core, so that its background jobs start" >&2
   compose restart core >&2
   host=$(setting "$ETC/aishie.env" HOST)
   cat >&2 <<EOF
 aishie: done. Sign in at https://$host with $email and that password.
-The line above is the administrator's API token, for scripts: it is shown
-once. Keep it in a password manager, or leave it: aishie core token issue
-makes one whenever one is needed.
 EOF
 }
 

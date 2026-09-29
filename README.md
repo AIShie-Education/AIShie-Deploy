@@ -132,13 +132,15 @@ institution allows for that.
    aishie admin
    ```
 
-   It also prints the administrator's API token once. That is for scripts,
-   not for signing in: keep it in a password manager, or leave it, since
-   `aishie core token issue` makes one when one is needed. It is not kept on
-   the server, and does not belong in `/etc/aishie`. The long form, for a
-   script: the password on standard input to
-   `aishie core bootstrap --name … --email … --password-stdin`, then
-   `aishie compose restart core`.
+   Then sign in at `https://test.aishie.app` with that email and password.
+   People have no API tokens, the administrator included: only agents do,
+   which `aishie core token issue` gives them
+   ([Adding an agent](#adding-an-agent)). A Core from before that still
+   makes one for the administrator at bootstrap; `aishie admin` does not
+   show it, and nothing keeps it. The long form, for a script: the password
+   on standard input to
+   `aishie core bootstrap --name … --email … --password-stdin >/dev/null`
+   (the `>/dev/null` for that token), then `aishie compose restart core`.
 
 6. Copy `/etc/aishie` somewhere safe, apart from the database backups
    ([What to keep off the server](#what-to-keep-off-the-server)).
@@ -217,7 +219,7 @@ As root on the server:
 | `journalctl -u aishie-update` | every run, with each step's output |
 | `aishie ps` | the stack's containers |
 | `aishie logs core` | a service's log, followed (`runtime`, `web`, `caddy`, `postgres`) |
-| `aishie core …` | Core's commands with the image that runs: `migrate version`, `token issue --actor ID --label L --days 90`, `help` |
+| `aishie core …` | Core's commands with the image that runs: `migrate version`, `token issue --actor AGENT_ID --label L --days 90` (an agent's token), `help` |
 | `aishie runtime …` | the runtime's: `check --live`, `migrate version`, `help` |
 | `aishie runtime-status` | the runtime's `/status`: agents, seats, spend (it answers its own loopback only, which is what this reaches) |
 | `aishie compose …` | `docker compose` for the stack, with its settings files |
@@ -576,7 +578,9 @@ images, then, through Caddy with its local certificate authority, that
 `/healthz` is Core's, `/` is the web's `index.html` with
 `frame-ancestors 'self'`, `/v1/…` answers as Core (and
 `/v1/auth/methods` says there is no single sign-on), the first
-administrator can be made and use the API, `/runtime/api/` and no other
+administrator can be made, sign in with their email and password, and
+use the API with that session, as a bearer token and as the web's
+cookie, `/runtime/api/` and no other
 path reaches the runtime's 9090, nothing but Caddy is published beyond the
 loopback, the runtime reaches Core at `https://HOST` through Caddy's alias,
 the backups can be restored from, and a second `aishie-update` (and a
