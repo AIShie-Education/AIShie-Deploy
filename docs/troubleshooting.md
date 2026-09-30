@@ -172,6 +172,28 @@ organization grants an account read access in each package's settings
   runs with (after an edit, `aishie compose up -d core`; the page may keep
   the old answer for a minute). A 404 is a Core from before that route: the
   web image then shows no button until Core is updated.
+- **Uploads fail in the browser, and its console says CORS.** Core keeps
+  its files in a bucket, and the bucket does not let the site upload:
+  `aishie storage cors` says whether it has the rule the site needs, prints
+  it, and says where to set it; `aishie storage cors --apply --ask-keys`
+  sets it with keys that may (README.md, Where uploaded files are kept).
+  The rule names `https://HOST`: after a change of host name it needs the
+  new one.
+- **Core does not start: `the S3 bucket is not reachable`** (in
+  `aishie logs core`). Core asks the bucket for an object when it starts.
+  `aishie storage check` reaches it with the keys in `core.env` and says
+  why it refuses: keys deleted or mistyped, the wrong region, a bucket that
+  is gone. Fix `core.env`, then `aishie compose up -d core`.
+- **`aishie storage migrate` stopped.** Nothing was switched: `core.env`
+  is as it was, and if it had stopped Core it started it again. Fix what it
+  names and run it again; it copies only what is not there yet. `the two
+  sides differ` on every file, with a bucket encrypted with SSE-KMS (whose
+  ETags are not MD5s): run it with `--size-only`. `could not pull
+  rclone/rclone`: Docker Hub limits pulls for a while; run it later.
+- **`Core did not report healthy on the other side`** (from `aishie storage
+  migrate`). `core.env` was put back and Core started on it: nothing was
+  lost, and the files are on both sides. `aishie logs core` says why Core
+  would not start on the other one.
 - **`could not pull the newest postgres:18 and caddy:2`** (from
   `setup-server.sh`). Docker Hub limits how often a server may pull, and
   refused for a while (`429 Too Many Requests`). The set-up goes on with

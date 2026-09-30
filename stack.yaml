@@ -66,7 +66,9 @@ services:
       RUNTIME_AUDIENCES: https://${HOST}/runtime
     volumes:
       # The files people upload (BLOB_FS_ROOT=/data/blobs), in a directory
-      # setup-server.sh gives to Core's user.
+      # setup-server.sh gives to Core's user, when Core keeps them on this
+      # disk (BLOB_STORE=fs). With a bucket (BLOB_STORE=s3) Core writes
+      # nothing here, and the files a move to it left stay until removed.
       - ${AISHIE_DATA:-/srv/aishie}/core:/data
     ports:
       - "127.0.0.1:8080:8080"
