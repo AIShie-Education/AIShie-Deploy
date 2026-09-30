@@ -30,18 +30,21 @@
 # Ubuntu's own packages (docker.io and docker-compose-v2) when those give
 # compose 2.24 or later, as 24.04's do, and Docker's apt repository
 # otherwise. It writes /etc/aishie: the settings, and the env files with
-# generated database passwords and SIGNING_KEY. It makes the directories for
-# the runtime's agents and secrets, with the key that will wrap the secrets
-# the runtime stores (kek/v1), Core's files, aishie-update's state and the
-# backups. It installs the stack in /opt/aishie, aishie-update, aishie and
-# aishie-storage in /usr/local/bin, and the timers; opens 80 and 443 in ufw
-# when ufw is on; checks that the server can pull the three images; starts
-# PostgreSQL and Caddy; runs the first update; and says what is left to do.
+# generated database passwords, SIGNING_KEY and SECRETS_KEY. It makes the
+# directories for the runtime's agents and secrets, with the key that will
+# wrap the secrets the runtime stores (kek/v1), Core's files, aishie-update's
+# state and the backups. It installs the stack in /opt/aishie, aishie-update,
+# aishie and aishie-storage in /usr/local/bin, and the timers; opens 80 and
+# 443 in ufw when ufw is on; checks that the server can pull the three
+# images; starts PostgreSQL and Caddy; runs the first update; and says what
+# is left to do.
 #
 # Run again, it installs this copy's files over the old ones, and leaves the
 # rest as it is: the settings, the secrets and the data, and where Core
-# keeps its files (`aishie storage migrate` moves them). That is how a newer
-# aishie-update, or a change to the stack, reaches the server.
+# keeps its files (`aishie storage migrate` moves them). A core.env from
+# before SECRETS_KEY is given one, as a line at its end, and nothing else in
+# it changes. That is how a newer aishie-update, or a change to the stack,
+# reaches the server.
 #
 # tests/setup-server_test.sh sources it with AISHIE_SETUP_LIB=1, which
 # defines the functions and runs nothing, and moves the paths below;
@@ -81,6 +84,9 @@ own() { chown "$@"; }
 # secret BYTES: that many random bytes, in hex. Hex needs no escaping in SQL,
 # in a URL or in an env file.
 secret() { openssl rand -hex "$1"; }
+# secrets_key: a SECRETS_KEY, 32 random bytes in base64, as Core takes it.
+# Base64 has no $, so it needs no quotes in an env file.
+secrets_key() { openssl rand -base64 32; }
 
 # Where Core keeps uploaded files, the bucket options and the bucket's
 # check and CORS rule: bin/aishie-storage's functions (st_*), which `aishie
@@ -252,10 +258,10 @@ EOF
 }
 
 # write_secrets: postgres.env, core.env and runtime.env, together, with
-# generated passwords and SIGNING_KEY, unless they are there. They hold the
-# same passwords, so one is never written without the others. The secrets go
-# from openssl into this shell and from here into the files: they are on no
-# command line, and nothing prints them.
+# generated passwords, SIGNING_KEY and SECRETS_KEY, unless they are there.
+# They hold the same passwords, so one is never written without the others.
+# The secrets go from openssl into this shell and from here into the files:
+# they are on no command line, and nothing prints them.
 write_secrets() {
   n=0
   for f in postgres core runtime; do [ ! -e "$ETC/$f.env" ] || n=$((n + 1)); done
@@ -291,6 +297,10 @@ EOF
 DATABASE_URL=postgres://aishie_core:$core_pw@postgres:5432/aishie_core?sslmode=disable
 # It must never change: keep a copy off the server.
 SIGNING_KEY=$(secret 32)
+# Seals the client secrets of the single sign-on providers set up from the
+# site. It must never be lost, and changes only by a rotation (README.md,
+# Rotating secrets): keep a copy off the server, with SIGNING_KEY.
+SECRETS_KEY=$(secrets_key)
 EOF
   st_env_block "$(storage_store)" >> "$ETC/core.env.new"
   cat > "$ETC/runtime.env.new" <<EOF
@@ -306,12 +316,39 @@ EOF
     chmod 600 "$ETC/$f.env.new"
     mv "$ETC/$f.env.new" "$ETC/$f.env"
   done
-  echo "wrote $ETC/postgres.env, core.env and runtime.env, with generated passwords and SIGNING_KEY"
+  echo "wrote $ETC/postgres.env, core.env and runtime.env, with generated passwords, SIGNING_KEY and SECRETS_KEY"
   if [ "$(storage_store)" = s3 ]; then
     echo "Core keeps the files people upload in $(st_describe), with the keys given, which core.env holds"
   else
     echo "Core keeps the files people upload on this server's disk, in $DATA/core/blobs"
   fi
+}
+
+# add_secrets_key: SECRETS_KEY, for a core.env from before it, which has
+# none. Core seals with it the client secrets of the single sign-on
+# providers the site's administrators set up, and sets none up without it.
+# It is appended, as one line, so that the file keeps every other line, its
+# mode and its owner. A core.env that sets it already, to anything, is left
+# as it is: what a key sealed opens with nothing else. The key goes from
+# openssl into the file, and nothing prints it.
+add_secrets_key() {
+  f=$ETC/core.env
+  if grep -Eq '^[[:space:]]*(export[[:space:]]+)?SECRETS_KEY[[:space:]]*=' "$f"; then
+    if grep -q '^SECRETS_KEY=' "$f" && [ -z "$(st_setting "$f" SECRETS_KEY)" ]; then
+      echo "warning: $f says SECRETS_KEY with no value, and is left as it is: until it has one, Core sets up no single sign-on provider from the site (README.md, Single sign-on)" >&2
+    fi
+    return 0
+  fi
+  # First, so that an openssl that fails stops the run here, and never
+  # leaves the line empty.
+  key=$(secrets_key)
+  [ -n "$key" ] || die "openssl gave no SECRETS_KEY: $f is left as it is"
+  # A last line with no newline would run into the key's.
+  if [ -n "$(tail -c 1 "$f")" ]; then echo >> "$f"; fi
+  printf 'SECRETS_KEY=%s\n' "$key" >> "$f"
+  unset key
+  secrets_key_added=1
+  echo "added SECRETS_KEY to $f: it seals the client secrets of the single sign-on providers set up from the site, and must never be lost, nor change but by a rotation. Keep a copy off the server, with SIGNING_KEY (README.md, What to keep off the server)"
 }
 
 # choose_storage: where a new server's Core keeps the files people upload:
@@ -494,6 +531,8 @@ MSG
     exit 1
   fi
   write_secrets
+  secrets_key_added=
+  add_secrets_key
   make_dirs
   make_kek
   cors_left=
@@ -617,9 +656,17 @@ EOF
   n=$((n + 1))
   cat <<EOF
 $n. Keep a copy of $ETC somewhere else, encrypted, and apart from the
-   database's backups: it holds SIGNING_KEY and the runtime's key (kek/v1),
-   which no backup of the database can bring back (README.md, What to keep off
-   the server).
+   database's backups: it holds SIGNING_KEY, SECRETS_KEY and the runtime's key
+   (kek/v1), which no backup of the database can bring back (README.md, What
+   to keep off the server).
+EOF
+  if [ -n "$secrets_key_added" ]; then
+    cat <<EOF
+   A copy made before this run has no SECRETS_KEY, which this run added:
+   make one again.
+EOF
+  fi
+  cat <<EOF
 
 Updates come by themselves from now on: aishie-update --status says what runs
 and how the last check went; journalctl -u aishie-update has every run.

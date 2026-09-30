@@ -58,6 +58,11 @@ for case in before-any-deploy deployed; do
   # Inside the network, HOST is Caddy.
   [ "$(q '.services.caddy.networks.default.aliases | join(" ")')" = test.aishie.app ] || fail "Caddy's aliases: $(q '.services.caddy.networks.default.aliases')"
   [ "$(q '.services.core.environment.PUBLIC_URL')" = https://test.aishie.app ] || fail "PUBLIC_URL: $(q '.services.core.environment.PUBLIC_URL')"
+  # core.env reaches Core whole, its keys with the rest: compose passes the
+  # file, not a list of names, so a key added to it needs nothing here.
+  for n in DATABASE_URL SIGNING_KEY SECRETS_KEY; do
+    [ "$(q ".services.core.environment.$n")" = "$(sed -n "s/^$n=//p" "$work/etc/core.env")" ] || fail "Core is not given core.env's $n"
+  done
   [ "$(q '.services.runtime.environment.CORE_BASE_URL_ALLOWLIST')" = https://test.aishie.app ] || fail "the runtime's allowlist"
   [ "$(q '.services.caddy.environment.HOST')" = test.aishie.app ] || fail "Caddy's HOST"
   # The runtime reads its configuration and secrets, and writes neither.

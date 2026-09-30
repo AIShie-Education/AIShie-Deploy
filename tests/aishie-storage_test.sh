@@ -32,6 +32,8 @@ AK=AKIAFAKEACCESSKEY0001
 # A secret with a $ in it, which core.env must quote.
 # shellcheck disable=SC2016 # the $ is the secret's
 SK='fake/Secret+Key$0123456789abcdefghijklmno'
+# core.env's SECRETS_KEY, which a move keeps as it is.
+CORE_SECRETS_KEY=$(printf 'k%.0s' $(seq 43))=
 C1=0192f3c1-0000-7000-8000-00000000c001
 U1=0192f3c1-0000-7000-8000-00000000f001
 U2=0192f3c1-0000-7000-8000-00000000f002
@@ -63,6 +65,7 @@ setup() {
 # AIshieCore's settings.
 DATABASE_URL=postgres://aishie_core:pw@postgres:5432/aishie_core?sslmode=disable
 SIGNING_KEY=$(printf 's%.0s' $(seq 64))
+SECRETS_KEY=$CORE_SECRETS_KEY
 BLOB_STORE=fs
 BLOB_FS_ROOT=/data/blobs
 EOF
@@ -235,6 +238,7 @@ called "compose .* up -d --no-deps core" || fail "Core not started again"
 [ "$(setting core.env BLOB_FS_ROOT)" = /data/blobs ] || fail "BLOB_FS_ROOT=$(setting core.env BLOB_FS_ROOT)"
 grep -q '^DATABASE_URL=postgres://aishie_core:pw@' "$AISHIE_ETC/core.env" || fail "DATABASE_URL lost"
 grep -q '^SIGNING_KEY=s' "$AISHIE_ETC/core.env" || fail "SIGNING_KEY lost"
+grep -qxF "SECRETS_KEY=$CORE_SECRETS_KEY" "$AISHIE_ETC/core.env" || fail "SECRETS_KEY lost"
 [ "$(stat -c %a "$AISHIE_ETC/core.env")" = 600 ] || fail "core.env is $(stat -c %a "$AISHIE_ETC/core.env")"
 backup=$(ls "$AISHIE_ETC"/core.env.before-storage-*)
 [ "$(cat "$backup")" = "$before" ] || fail "the core.env kept is not the one before"
@@ -284,6 +288,7 @@ called "rclone copy --files-from /work/keys .* dst:aishie-files /data/blobs" || 
 # options.
 [ "$(setting core.env S3_BUCKET)" = aishie-files ] || fail "the bucket's settings were not kept"
 [ "$(setting core.env S3_SECRET_KEY)" = "'$SK'" ] || fail "the secret was not kept as it was"
+grep -qxF "SECRETS_KEY=$CORE_SECRETS_KEY" "$AISHIE_ETC/core.env" || fail "SECRETS_KEY lost on the way back"
 said "The bucket keeps its objects" || fail "said: $(cat "$FAKE/out")"
 storage migrate --to s3 --dry-run || fail "a dry run to the bucket core.env names: exit $?: $(cat "$FAKE/out")"
 said "the bucket core.env names already: the bucket aishie-files" || fail "said: $(cat "$FAKE/out")"

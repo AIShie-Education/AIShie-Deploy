@@ -108,6 +108,8 @@ said() { grep -q -- "$1" "$FAKE/out"; }
 setting() { sed -n "s/^$2=//p" "$AISHIE_ETC/$1" | tail -n 1; }
 mode() { stat -c %a "$1"; }
 sums() { (cd "$AISHIE_ETC" && find . -type f -exec sha256sum {} + | sort); }
+# is_secrets_key VALUE: 32 bytes in base64, as SECRETS_KEY is.
+is_secrets_key() { [[ $1 =~ ^[A-Za-z0-9+/]{43}=$ ]] && [ "$(printf '%s' "$1" | base64 -d | wc -c)" = 32 ]; }
 
 # The arguments: edge and stable, and their old names, staging and
 # production, until a later release.
@@ -188,6 +190,12 @@ runtime_pw=$(setting postgres.env AISHIE_RUNTIME_DB_PASSWORD)
 [ "$(setting runtime.env DATABASE_URL)" = "postgres://aishie_runtime:$runtime_pw@postgres:5432/aishie_runtime?sslmode=disable" ] ||
   fail "the runtime's DATABASE_URL does not match postgres.env"
 [[ $(setting core.env SIGNING_KEY) =~ ^[0-9a-f]{64}$ ]] || fail "SIGNING_KEY is not 32 random bytes in hex"
+# SECRETS_KEY, beside it, once: 32 random bytes in base64, as Core takes it.
+secrets_key=$(setting core.env SECRETS_KEY)
+is_secrets_key "$secrets_key" || fail "SECRETS_KEY is not 32 random bytes in base64"
+[ "$(grep -c '^SECRETS_KEY=' "$AISHIE_ETC/core.env")" = 1 ] || fail "SECRETS_KEY is there $(grep -c '^SECRETS_KEY=' "$AISHIE_ETC/core.env") times"
+said "with generated passwords, SIGNING_KEY and SECRETS_KEY" || fail "said: $(cat "$FAKE/out")"
+! said "added SECRETS_KEY" || fail "said it added SECRETS_KEY to the core.env it wrote"
 [ "$(setting core.env BLOB_FS_ROOT)" = /data/blobs ] || fail "BLOB_FS_ROOT=$(setting core.env BLOB_FS_ROOT)"
 # Nobody to ask and no options: this server's disk, as before.
 [ "$(setting core.env BLOB_STORE)" = fs ] || fail "BLOB_STORE=$(setting core.env BLOB_STORE)"
@@ -245,9 +253,10 @@ grep -q "^WEB_REF=$REG/aishie-frontend@sha256:$C$" "$AISHIE_STATE/images.env" ||
 said "Point test.aishie.app at this server" || fail "no DNS step: $(cat "$FAKE/out")"
 said "aishie admin" || fail "no step for the first administrator"
 said "install -g 65532 -m 640 tutor.yaml" || fail "no agent step"
+said "it holds SIGNING_KEY, SECRETS_KEY and the runtime's key" || fail "no step to keep a copy of the keys: $(cat "$FAKE/out")"
 ! said "docker login" || fail "asked to log in, though every pull worked"
 ! said "notice:" || fail "said a notice: $(cat "$FAKE/out")"
-for secret in "$core_pw" "$runtime_pw" "$(setting postgres.env POSTGRES_PASSWORD)" "$(setting core.env SIGNING_KEY)" "$(cat "$kek")"; do
+for secret in "$core_pw" "$runtime_pw" "$(setting postgres.env POSTGRES_PASSWORD)" "$(setting core.env SIGNING_KEY)" "$secrets_key" "$(cat "$kek")"; do
   if grep -qF -- "$secret" "$FAKE/out" "$CALLS" "$FAKE/log"; then fail "a secret is in the output, a command line or the log"; fi
 done
 
@@ -263,6 +272,7 @@ cmp -s "$root/bin/aishie" "$AISHIE_BIN/aishie" || fail "did not install aishie a
 said "aishie.env is there already: left as it is (HOST=test.aishie.app)" || fail "said: $(cat "$FAKE/out")"
 said "core.env and runtime.env are there already: left as they are" || fail "said: $(cat "$FAKE/out")"
 said "kek/v1 is there already: left as it is" || fail "said: $(cat "$FAKE/out")"
+! said "added SECRETS_KEY" || fail "added SECRETS_KEY to a core.env that has it: $(cat "$FAKE/out")"
 [ "$(grep -c 'up to date' "$FAKE/out")" = 3 ] || fail "the update did something: $(cat "$FAKE/out")"
 ! called "pg_dump" || fail "backed up, with nothing to deploy"
 # ... another name, given by mistake: said, and aishie.env left as it is.
@@ -279,6 +289,70 @@ said "warning: .*core.env keeps uploaded files with BLOB_STORE=fs, and is left a
   fail "no warning: $(cat "$FAKE/out")"
 [ "$(sums)" = "$before" ] || fail "changed $AISHIE_ETC"
 ! called "aws-sigv4" || fail "asked the bucket something"
+
+# A server set up before SECRETS_KEY, set up again: core.env is given one,
+# as one line at its end, and keeps every other line, its mode and its owner
+# (the same file, appended to); nothing else in /etc/aishie changes, the key
+# is printed nowhere, and Core is recreated with it. What fails says no
+# line of core.env: they are secrets.
+setup secrets-key-added
+setup_server test.aishie.app edge || fail "exit $?: $(cat "$FAKE/out")"
+core_env=$AISHIE_ETC/core.env
+grep -v '^SECRETS_KEY=' "$core_env" > "$FAKE/core.env.old"
+old_last=$(tail -n 1 "$FAKE/core.env.old")
+for last_newline in yes no; do
+  # In place, as the copy from before wrote it: the same file, mode and
+  # owner; and once with no newline after its last line.
+  if [ $last_newline = yes ]; then
+    cat "$FAKE/core.env.old" > "$core_env"
+  else
+    printf '%s' "$(cat "$FAKE/core.env.old")" > "$core_env"
+  fi
+  file=$(stat -c '%i %u:%g %a' "$core_env")
+  others=$(sums | grep -v ' \./core\.env$')
+  : > "$CALLS"
+  setup_server test.aishie.app edge || fail "exit $?: $(cat "$FAKE/out")"
+  said "added SECRETS_KEY to $core_env" || fail "said: $(cat "$FAKE/out")"
+  said "must never be lost" || fail "did not say to keep it: $(cat "$FAKE/out")"
+  said "A copy made before this run has no SECRETS_KEY" || fail "what is left does not say to copy $AISHIE_ETC again"
+  [ "$(grep -c '^SECRETS_KEY=' "$core_env")" = 1 ] || fail "SECRETS_KEY is there $(grep -c '^SECRETS_KEY=' "$core_env") times"
+  added=$(tail -n 1 "$core_env")
+  [ "${added%%=*}" = SECRETS_KEY ] || fail "the last line is not SECRETS_KEY's"
+  is_secrets_key "${added#SECRETS_KEY=}" || fail "the key added is not 32 random bytes in base64"
+  cmp -s <(head -n -1 "$core_env") "$FAKE/core.env.old" || fail "core.env's other lines changed (last line with a newline: $last_newline)"
+  [ "$(tail -n 2 "$core_env" | head -n 1)" = "$old_last" ] || fail "the line before the key is not the old last line"
+  [ "$(stat -c '%i %u:%g %a' "$core_env")" = "$file" ] || fail "core.env is not the same file, owner and mode: $(stat -c '%i %u:%g %a' "$core_env"), was $file"
+  [ "$(sums | grep -v ' \./core\.env$')" = "$others" ] || fail "changed another file in $AISHIE_ETC"
+  for f in "$FAKE/out" "$CALLS" "$FAKE/log"; do
+    if grep -qF -- "${added#SECRETS_KEY=}" "$f"; then fail "the key is in $(basename "$f")"; fi
+  done
+  called "up -d --no-deps core" || fail "Core was not recreated, to take the key"
+done
+# ... and again: the key kept, byte for byte, and none added.
+before=$(sums)
+setup_server test.aishie.app edge || fail "exit $?: $(cat "$FAKE/out")"
+[ "$(sums)" = "$before" ] || fail "changed $AISHIE_ETC: $(diff <(echo "$before") <(sums))"
+! said "added SECRETS_KEY" || fail "added SECRETS_KEY again: $(cat "$FAKE/out")"
+! said "A copy made before this run has no SECRETS_KEY" || fail "asked for a new copy of $AISHIE_ETC"
+
+# A core.env that sets SECRETS_KEY already, however it is written, anywhere
+# in it: left as it is, byte for byte, and no key added. One that sets it to
+# nothing is said, since Core then sets no provider up.
+case=secrets-key-kept
+own_key=$(printf 'k%.0s' $(seq 43))=
+for line in "SECRETS_KEY=$own_key" "SECRETS_KEY='$own_key'" "export SECRETS_KEY=$own_key" " SECRETS_KEY = $own_key" "SECRETS_KEY="; do
+  { head -n 5 "$FAKE/core.env.old"; echo "$line"; tail -n +6 "$FAKE/core.env.old"; } > "$core_env"
+  before=$(sums)
+  setup_server test.aishie.app edge || fail "exit $?: $(cat "$FAKE/out")"
+  [ "$(sums)" = "$before" ] || fail "changed $AISHIE_ETC, with «${line%%=*}=»"
+  ! said "added SECRETS_KEY" || fail "added a key beside «${line%%=*}=»"
+  if [ "$line" = "SECRETS_KEY=" ]; then
+    said "warning: .*core.env says SECRETS_KEY with no value, and is left as it is" || fail "no warning: $(cat "$FAKE/out")"
+  else
+    ! said "warning: .*SECRETS_KEY" || fail "warned: $(cat "$FAKE/out")"
+    if grep -qF -- "$own_key" "$FAKE/out"; then fail "the key is in the output"; fi
+  fi
+done
 
 # ufw on: 80 and 443 opened, and nothing else.
 setup ufw
