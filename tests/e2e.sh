@@ -257,6 +257,15 @@ check "the web runs as 65532, read-only, with no capability and no new privilege
 check "the web is given FRAME_ANCESTORS='self'" \
   is "$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$web" | sed -n 's/^FRAME_ANCESTORS=//p')" "'self'"
 check "the web's own health check passes" is "$(docker inspect -f '{{.State.Health.Status}}' "$web")" healthy
+# core.env reaches Core whole, with the SECRETS_KEY setup-server.sh wrote in
+# it: compared by digest, so that the key is printed nowhere, even when the
+# check fails.
+core=$(aishie ps -q core)
+check "setup-server.sh wrote a SECRETS_KEY of 32 bytes in base64" \
+  is "$(sed -n 's/^SECRETS_KEY=//p' "$ETC/core.env" | base64 -d | wc -c)" 32
+check "Core is given core.env's SECRETS_KEY" \
+  is "$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$core" | grep '^SECRETS_KEY=' | sha256sum)" \
+  "$(grep '^SECRETS_KEY=' "$ETC/core.env" | sha256sum)"
 
 # Inside the stack's network, the name is Caddy (its alias there), with the
 # certificate a browser gets: the runtime reaches Core at https://NAME

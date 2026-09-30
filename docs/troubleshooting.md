@@ -168,10 +168,34 @@ organization grants an account read access in each package's settings
   `which does not report healthy either`.
 - **The single sign-on button does not show.**
   `curl -s 127.0.0.1:8080/v1/auth/methods` says what the sign-in page is
-  told: `"sso": null` means `OIDC_ISSUER` is not set in the `core.env` Core
-  runs with (after an edit, `aishie compose up -d core`; the page may keep
-  the old answer for a minute). A 404 is a Core from before that route: the
-  web image then shows no button until Core is updated.
+  told: `"sso": null` means no provider is offered: `OIDC_ISSUER` is not
+  set in the `core.env` Core runs with (after an edit, `aishie compose up -d
+  core`), and no provider of the site's is switched on (the front end says
+  each one's status). The page may keep the old answer for a minute. A 404
+  is a Core from before that route: the web image then shows no button
+  until Core is updated.
+- **A single sign-on provider cannot be set up from the site:
+  `secrets_key_missing`.** `core.env` has no `SECRETS_KEY`, which seals the
+  providers' client secrets, or has it with no value. Run `setup-server.sh`
+  again, as in README.md, Day to day: it adds one to a `core.env` that has
+  no `SECRETS_KEY` line, and recreates Core with it. A line with no value
+  it leaves as it is, and says so: write a key there by hand
+  (`openssl rand -base64 32`), then `aishie compose up -d core`. Either way,
+  copy `/etc/aishie` off the server again.
+- **A provider of the site's says `secret_unavailable`.** Its client secret
+  was sealed with a key Core no longer holds: the old key removed before
+  `aishie core secrets rewrap` had run, a database restored from before a
+  rotation, or a `core.env` put back from a copy older than its
+  `SECRETS_KEY`. Put the key that sealed it, from a copy of `/etc/aishie`,
+  in `SECRETS_KEY_PREVIOUS`, then `aishie compose up -d core` and
+  `aishie core secrets rewrap` (README.md, Rotating secrets). If no copy
+  has it, an administrator gives the provider its client secret again from
+  the front end.
+- **Core does not start, and `aishie logs core` names `SECRETS_KEY` or
+  `SECRETS_KEY_PREVIOUS`.** A key in `core.env` is not 32 bytes in base64,
+  as `openssl rand -base64 32` makes it (one cut short when pasted, or one
+  in hex), or `SECRETS_KEY_PREVIOUS` is there without `SECRETS_KEY`. Fix
+  `core.env`, then `aishie compose up -d core`.
 - **Uploads fail in the browser, and its console says CORS.** Core keeps
   its files in a bucket, and the bucket does not let the site upload:
   `aishie storage cors` says whether it has the rule the site needs, prints

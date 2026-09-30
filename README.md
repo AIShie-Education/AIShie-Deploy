@@ -118,8 +118,8 @@ institution allows for that.
    (compose 2.24 or later is needed); where Ubuntu's packages are older, or
    Docker's own `docker-ce` is installed already, it adds Docker's apt
    repository and installs `docker-ce` and `docker-compose-plugin` from
-   there. It says which. It writes `/etc/aishie` with
-   generated database passwords, `SIGNING_KEY` and the runtime's key
+   there. It says which. It writes `/etc/aishie` with generated database
+   passwords, `SIGNING_KEY`, `SECRETS_KEY` and the runtime's key
    (`kek/v1`); installs the stack, the scripts and the timers; starts
    PostgreSQL and Caddy; checks that the server can pull the three images;
    and runs the first update, which deploys Core, the runtime and the web in
@@ -228,7 +228,7 @@ As root on the server:
 | `journalctl -u aishie-update` | every run, with each step's output |
 | `aishie ps` | the stack's containers |
 | `aishie logs core` | a service's log, followed (`runtime`, `web`, `caddy`, `postgres`) |
-| `aishie core …` | Core's commands with the image that runs: `migrate version`, `token issue --actor AGENT_ID --label L --days 90` (an agent's token), `help` |
+| `aishie core …` | Core's commands with the image that runs: `migrate version`, `token issue --actor AGENT_ID --label L --days 90` (an agent's token), `secrets rewrap` ([Rotating secrets](#rotating-secrets)), `help` |
 | `aishie runtime …` | the runtime's: `check --live`, `migrate version`, `help` |
 | `aishie runtime-status` | the runtime's `/status`: agents, seats, spend (it answers its own loopback only, which is what this reaches) |
 | `aishie compose …` | `docker compose` for the stack, with its settings files |
@@ -254,7 +254,10 @@ ones `stack.yaml` sets from `aishie.env` (`PUBLIC_URL`, `TRUSTED_PROXIES`,
 `aishie-update`, `aishie`, the units; images update themselves): as root,
 `git -C AIShie-Deploy pull`, then `sh AIShie-Deploy/setup-server.sh
 <name> <environment>` again. It installs the new files and leaves the
-settings, the secrets and the data as they are.
+settings, the secrets and the data as they are, with one exception: a
+`core.env` from before `SECRETS_KEY` is given one, as a line at its end,
+and nothing else in it changes ([Single sign-on](#single-sign-on)). It
+says so when it does: copy `/etc/aishie` off the server again then.
 
 **Changing the host name:** `HOST` in `aishie.env`, then
 `aishie compose up -d`: Core, the runtime and Caddy are recreated with the
@@ -648,10 +651,31 @@ under `courses/` in time.
 
 ## Single sign-on
 
-Core offers single sign-on exactly when `OIDC_ISSUER` is set in
-`/etc/aishie/core.env`. Register `https://HOST/v1/auth/sso/callback` (HOST
-as in `aishie.env`) with the identity provider as the redirect URI, then set
-what it gives you:
+Core signs people in through OpenID Connect identity providers of two
+kinds (Core's README, Single sign-on). Register
+`https://HOST/v1/auth/sso/callback` (HOST as in `aishie.env`) with each as
+the redirect URI: it is the same for all of them.
+
+**The site's providers** are set up, tested and switched on by root and
+the platform's administrators from the front end; Core keeps them in its
+database, and a change is in force at the next sign-in, with no restart.
+Each provider's client secret is kept sealed there (AES-256-GCM) under
+`SECRETS_KEY` in `/etc/aishie/core.env`: 32 random bytes in base64, which
+`setup-server.sh` writes on a new server, and adds to a `core.env` from
+before it when run again. Without it, Core sets up no provider
+(`secrets_key_missing`), and the operator's works as before. What it
+sealed opens with nothing else, so `SECRETS_KEY` is kept like
+`SIGNING_KEY`, which Core needs beside it: copied off the server
+([What to keep off the server](#what-to-keep-off-the-server)), never lost,
+and never changed but by a rotation, with the old key kept until
+everything is sealed again under the new one
+([Rotating secrets](#rotating-secrets)). A provider whose secret no key of
+Core's opens is not offered (`secret_unavailable`) until an administrator
+gives it its secret again.
+
+**The operator's provider** is on exactly when `OIDC_ISSUER` is set in
+`/etc/aishie/core.env`; administrators see it read-only. Set what the
+identity provider gives you:
 
 ```
 OIDC_ISSUER=https://adfs.example.edu/adfs
@@ -669,14 +693,16 @@ README, Single sign-on, what they do.
 
 Nothing about single sign-on is built into the web image, which is the same
 for every server. The sign-in page asks Core, at `GET /v1/auth/methods`,
-whether to show the button and what it says:
+which buttons to show and what each says:
 `{"password": true, "sso": null}` without single sign-on,
 `{"password": true, "sso": {"label": "PolyU NetID", "start": "/v1/auth/sso/start"}}`
-with it. The route is under `/v1`, which Caddy already sends to Core; it
-says nothing of the provider but its label. A browser may keep the answer
-for a minute, so a change reaches the sign-in page within a minute of
-recreating Core. (A Core from before that route answers 404, and the page
-then shows no button.) To see what it says:
+with it; a Core with the site's providers also lists, in `sso_providers`,
+each one a sign-in may go through now, the operator's first. The route is
+under `/v1`, which Caddy already sends to Core; it says nothing of a
+provider but its id, its label and where a sign-in through it starts. A
+browser may keep the answer for a minute, so a change reaches the sign-in
+page within a minute of taking effect. (A Core from before that route
+answers 404, and the page then shows no button.) To see what it says:
 `curl -s 127.0.0.1:8080/v1/auth/methods`.
 
 ## Frames
@@ -739,6 +765,35 @@ Framing goes two ways, and this stack allows both.
   download link Core has given out, and every single sign-on in progress,
   stops working. If it has leaked, change it anyway (`openssl rand -hex 32`
   in `core.env`, then `aishie compose up -d core`) and accept that.
+- **`SECRETS_KEY`** seals the client secrets of the site's single sign-on
+  providers, which open with nothing else: it is never simply replaced. A
+  rotation, when a copy of it may have leaked, keeps the old key beside the
+  new one until every secret is sealed again. In `core.env`, give
+  `SECRETS_KEY` a new key and the old one to `SECRETS_KEY_PREVIOUS`:
+
+  ```
+  SECRETS_KEY=<a new one: openssl rand -base64 32>
+  SECRETS_KEY_PREVIOUS=<the one SECRETS_KEY had>
+  ```
+
+  then:
+
+  ```
+  aishie compose up -d core      # Core seals with the new key, and opens with either
+  aishie core secrets rewrap     # seals every client secret again, under the new key
+  ```
+
+  `secrets rewrap` says how many it sealed again. Once it has succeeded,
+  remove the `SECRETS_KEY_PREVIOUS` line, `aishie compose up -d core`
+  again, and copy `/etc/aishie` off the server again. If it fails, naming
+  providers whose secrets open with neither key, put the key that sealed
+  them in `SECRETS_KEY_PREVIOUS` too (several keys go comma separated),
+  recreate Core and run it again, or give each its secret again from the
+  front end. The database's backups from before the rotation hold secrets
+  the old key sealed: keep that key, apart from them, for as long as they
+  are kept, since restoring one needs it back in `SECRETS_KEY_PREVIOUS`
+  and a `secrets rewrap`. A key that is not 32 bytes in base64 stops Core
+  from starting, and `aishie logs core` says which.
 - **The runtime's key, `kek/v1`** (M2) wraps the secrets the runtime's API
   stores. It is never replaced in place: every file in `kek/` is kept for
   unwrapping, so a new key is added as `kek/v2`, `KMS_KEY_ID` in
@@ -759,12 +814,17 @@ Framing goes two ways, and this stack allows both.
 The backups above sit on the same disk as the database. Copy these
 somewhere else, regularly:
 
-- `/etc/aishie/`, encrypted: `SIGNING_KEY`, the runtime's key
-  `runtime/secrets/kek/v1`, the database passwords, the agents' Core tokens
-  and their providers' keys. No backup of the database can bring back
-  `SIGNING_KEY` or the key; without the key, the secrets the runtime stores
-  cannot be read. Keep this copy apart from the database dumps: together,
-  they are every secret the runtime holds.
+- `/etc/aishie/`, encrypted: `SIGNING_KEY`, `SECRETS_KEY`, the runtime's
+  key `runtime/secrets/kek/v1`, the database passwords, the agents' Core
+  tokens and their providers' keys. No backup of the database can bring
+  back `SIGNING_KEY`, `SECRETS_KEY` or the runtime's key. Without
+  `SECRETS_KEY`, the client secrets of the site's single sign-on providers,
+  which Core's database holds sealed with it, cannot be opened; without the
+  runtime's key, the secrets the runtime stores cannot be read. Keep this
+  copy apart from the database dumps: together, they are every secret the
+  runtime holds, and every provider's client secret. Copy it again after a
+  run of `setup-server.sh` that says it added `SECRETS_KEY`, and after a
+  rotation.
 - `/var/backups/aishie/`, the databases.
 - `/srv/aishie/core/`, the files people upload, while Core keeps them on
   this disk. A bucket is kept by its provider, not by `aishie backup`:
@@ -848,7 +908,9 @@ The stack relies on each image doing the following:
 
 - **Core** (`ghcr.io/aishie-education/aishie-core`): `serve` by default; the
   commands `migrate up`, `seed`, `version` (`vX.Y.Z (commit, date)`),
-  `bootstrap`, `token issue`; distroless, user 65532; `/healthz` answers
+  `bootstrap`, `token issue`, and `secrets rewrap` for a rotation of
+  `SECRETS_KEY`, which it reads with `SECRETS_KEY_PREVIOUS` from its env
+  file; distroless, user 65532; `/healthz` answers
   JSON with `status`, `version` and `commit`; `GET /v1/auth/methods` says
   whether it offers single sign-on, and as what (a Core from before that
   route answers 404, and the sign-in page then offers none).
@@ -904,7 +966,8 @@ administrator can be made, sign in with their email and password, and
 use the API with that session, as a bearer token and as the web's
 cookie, `/runtime/api/` and no other
 path reaches the runtime's 9090, nothing but Caddy is published beyond the
-loopback, the runtime reaches Core at `https://HOST` through Caddy's alias,
+loopback, Core is given the `SECRETS_KEY` `setup-server.sh` wrote, the
+runtime reaches Core at `https://HOST` through Caddy's alias,
 the backups can be restored from, and a second `aishie-update` (and a
 `docker compose up -d`, as after a reboot) changes nothing.
 `aishie.internal`, not `localhost`: both get their certificate from Caddy's
