@@ -84,9 +84,10 @@ for pkg in aishie-core aishie-agent-runtime aishie-frontend; do
 done
 [ -z "$denied" ] || exit 1
 
-# The server, set up as a person would set it up.
-echo "# setup-server.sh $name staging"
-if ! sh "$root/setup-server.sh" "$name" staging; then
+# The server, set up as a person would set it up, with Core's files on its
+# disk: said, so that a run at a terminal is not asked.
+echo "# setup-server.sh $name staging --storage fs"
+if ! sh "$root/setup-server.sh" "$name" staging --storage fs; then
   diagnose
   die "setup-server.sh failed (above)"
 fi
