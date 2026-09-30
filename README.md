@@ -21,9 +21,9 @@ runtime's own `/healthz`, `/metrics` and `/status` are never routed.
 Updates are pulled, not pushed: `aishie-update`, on a systemd timer every
 five minutes, looks at the tag each service follows, and deploys a new image
 by a safe sequence (a backup, the migrations, the switch, the health check,
-and a rollback if it fails). Staging follows `:edge`, the tip of each
-repository's `main` once its checks pass; production follows releases,
-changed by hand. No workflow of GitHub's reaches the server.
+and a rollback if it fails). An edge server, such as test.aishie.app,
+follows `:edge`, the tip of each repository's `main` once its checks pass; a
+stable one, a school's site, follows releases, changed by hand. No workflow of GitHub's reaches the server.
 
 ## What is where
 
@@ -103,7 +103,7 @@ institution allows for that.
 3. Run the set-up as root, with the server's DNS name and its environment:
 
    ```
-   sh AIShie-Deploy/setup-server.sh test.aishie.app staging
+   sh AIShie-Deploy/setup-server.sh test.aishie.app edge
    ```
 
    When someone is at the terminal, it first asks where Core keeps the
@@ -157,7 +157,7 @@ institution allows for that.
 7. The day after, check that the nightly backup ran:
    `ls -l /var/backups/aishie/*-daily-*`.
 
-For production, the same with `production`. Its channels start empty: set
+For stable, the same with `stable`. Its channels start empty: set
 each to a release in `/etc/aishie/aishie.env`, such as
 `CORE_IMAGE=ghcr.io/aishie-education/aishie-core:1.2.3`, then run
 `aishie-update`.
@@ -262,7 +262,7 @@ new name, and Caddy gets a certificate for it.
 
 ## Rolling back
 
-Staging rolls itself back: a new version that does not report healthy is
+Edge rolls itself back: a new version that does not report healthy is
 replaced by the one before. By hand, pin a service to an image, by digest
 or by tag, and it is deployed by the same sequence (backup, `migrate up`,
 the switch, the health check):
@@ -277,20 +277,47 @@ says, until `aishie-update --unpin core`. The new schema stays, and the
 release before works with it; going back further than one release means
 restoring a backup. Never run `migrate down`: it deletes data.
 
-## Upgrading production
+## Upgrading stable
 
-Production follows releases. To upgrade, try the release on staging first
-(staging runs `:edge`, which a release's commit has been), then set it in
-production's `/etc/aishie/aishie.env`:
+Stable follows releases. To upgrade, try the release on edge first
+(edge runs `:edge`, which a release's commit has been), then set it in
+the stable server's `/etc/aishie/aishie.env`:
 
 ```
 CORE_IMAGE=ghcr.io/aishie-education/aishie-core:1.3.0
 ```
 
-and run `aishie-update` (or wait five minutes). A channel in production
-must be a release, `X.Y.Z`, or a digest: `aishie-update` refuses `:edge` or
-`:1.3` there. To go back, set the release before and run `aishie-update`,
-or `aishie-update --pin`.
+and run `aishie-update` (or wait five minutes). A channel on stable must be
+a release, `X.Y.Z`, or a digest: `aishie-update` refuses `:edge`, `:1.3`,
+`:latest` or `:stable` there, which move by themselves, so that an upgrade,
+and the migrations that come with it, is somebody's decision. To go back,
+set the release before and run `aishie-update`, or `aishie-update --pin`.
+
+## Renaming the settings
+
+Edge and stable were called staging and production. A server set up before
+the rename says `ENVIRONMENT=staging` (or `production`) in
+`/etc/aishie/aishie.env`, and goes on as it did: `aishie-update` takes the
+old names as `edge` and `stable` until a later release, which removes this,
+and says so once in its log and in `--status`. `setup-server.sh` takes
+`staging` and `production` as its argument too, with a notice, and writes
+`edge` or `stable` into a new server's `aishie.env`; one that is there it
+leaves as it is, and says what to change. To rename, as root, on each server
+that says an old name, once this copy's `aishie-update` is there
+(`setup-server.sh` run again, as in [Day to day](#day-to-day)): an older
+one knows `production` alone, and would not hold a server that says
+`stable` to releases.
+
+```
+sed -i 's/^ENVIRONMENT=staging$/ENVIRONMENT=edge/' /etc/aishie/aishie.env   # or production, stable
+aishie-update --status                                                    # test.aishie.app (edge), and no notice
+```
+
+Nothing else changes: the channels (`:edge`, or the releases), what runs
+and the data stay as they are, and nothing is restarted. This repository's
+workflow deploys nothing and has no GitHub settings to rename; Core's, the
+runtime's and the web front end's Deploy workflows do, and each of their
+READMEs says how, under the same heading.
 
 ## Backups
 
@@ -473,10 +500,10 @@ keeps secrets):
 
 ```
 read -r AISHIE_S3_ACCESS_KEY; read -rs AISHIE_S3_SECRET_KEY; export AISHIE_S3_ACCESS_KEY AISHIE_S3_SECRET_KEY
-sh AIShie-Deploy/setup-server.sh test.aishie.app staging --storage aws --s3-region ap-east-1 --s3-bucket aishie-files
-sh AIShie-Deploy/setup-server.sh test.aishie.app staging --storage r2 --r2-account-id <32 hex digits> --s3-bucket aishie-files
-sh AIShie-Deploy/setup-server.sh test.aishie.app staging --storage b2 --s3-region us-west-004 --s3-bucket aishie-files
-sh AIShie-Deploy/setup-server.sh test.aishie.app staging --storage s3 --s3-endpoint s3.example.com --s3-region nl-ams --s3-bucket aishie-files
+sh AIShie-Deploy/setup-server.sh test.aishie.app edge --storage aws --s3-region ap-east-1 --s3-bucket aishie-files
+sh AIShie-Deploy/setup-server.sh test.aishie.app edge --storage r2 --r2-account-id <32 hex digits> --s3-bucket aishie-files
+sh AIShie-Deploy/setup-server.sh test.aishie.app edge --storage b2 --s3-region us-west-004 --s3-bucket aishie-files
+sh AIShie-Deploy/setup-server.sh test.aishie.app edge --storage s3 --s3-endpoint s3.example.com --s3-region nl-ams --s3-bucket aishie-files
 ```
 
 The variables are `AISHIE_STORAGE`, `AISHIE_S3_BUCKET`, `AISHIE_S3_REGION`,
@@ -830,7 +857,8 @@ The stack relies on each image doing the following:
   `/healthz` on `HTTP_ADDR` answers `status` `ok`, `version` and `commit`;
   it starts with no agent configured.
 - **The web** (`ghcr.io/aishie-education/aishie-frontend`): tags `:edge`
-  (main's tip), `:sha-<7 hex>`, and `:X.Y.Z` and `:X.Y` from releases; the
+  (main's tip), `:sha-<7 hex>`, and `:X.Y.Z` and `:X.Y` from releases, with
+  `:latest` and `:stable` on the highest stable one; the
   labels `org.opencontainers.image.source`
   (`https://github.com/AIShie-Education/AIShie-Frontend`), `.revision` (the
   full commit) and `.version`; Caddy as a static server on :8080, plain
@@ -867,7 +895,7 @@ else with Caddy's image, and checks the routes Caddy reads from it.
 
 `.github/workflows/ci.yml` runs the same, every day as well as on each
 push, and an end to end (`tests/e2e.sh`) on a runner it then throws away:
-`setup-server.sh aishie.internal staging`, as root, with the real `:edge`
+`setup-server.sh aishie.internal edge`, as root, with the real `:edge`
 images, then, through Caddy with its local certificate authority, that
 `/healthz` is Core's, `/` is the web's `index.html` with
 `frame-ancestors 'self'`, `/v1/…` answers as Core (and

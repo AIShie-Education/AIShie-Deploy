@@ -3,11 +3,13 @@
 # brings one set up before up to date. Run as root, with this repository
 # copied to the server (README.md, A new server):
 #
-#   sh setup-server.sh test.aishie.app staging
+#   sh setup-server.sh test.aishie.app edge
 #
 # The name is the server's DNS name, where people and agents will reach it.
-# Staging follows each image's :edge; production follows releases, set by
-# hand in /etc/aishie/aishie.env.
+# Edge follows each image's :edge; stable follows releases, set by hand in
+# /etc/aishie/aishie.env. Edge and stable were called staging and
+# production: those names are taken for them, with a notice, until a later
+# release, and an aishie.env written with them is left as it is.
 #
 # It asks where Core keeps the files people upload, when someone is there to
 # answer: this server's disk, as before, or a bucket of Amazon S3,
@@ -17,7 +19,7 @@
 # AISHIE_S3_SECRET_KEY (bin/aishie-storage says each; README.md, Where
 # uploaded files are kept):
 #
-#   sh setup-server.sh test.aishie.app staging --storage aws --s3-region ap-east-1 --s3-bucket aishie-files
+#   sh setup-server.sh test.aishie.app edge --storage aws --s3-region ap-east-1 --s3-bucket aishie-files
 #
 # Without them, and with nobody to ask, it is the disk. A bucket is checked
 # with the keys before anything is written, by reading alone, and given the
@@ -93,7 +95,7 @@ unset AISHIE_STORAGE_LIB
 
 usage() {
   cat >&2 <<'EOF'
-usage: setup-server.sh HOSTNAME staging|production [--storage fs|aws|r2|b2|s3 OPTIONS], e.g. test.aishie.app staging
+usage: setup-server.sh HOSTNAME edge|stable [--storage fs|aws|r2|b2|s3 OPTIONS], e.g. test.aishie.app edge
 Where Core keeps uploaded files, on a new server (the keys in AISHIE_S3_ACCESS_KEY
 and AISHIE_S3_SECRET_KEY, or asked for):
 EOF
@@ -103,7 +105,17 @@ EOF
 # check_args HOST ENVIRONMENT
 check_args() {
   case $1 in '' | *[!A-Za-z0-9.-]* | .* | -* | *..*) usage ;; esac
-  case $2 in staging | production) ;; *) usage ;; esac
+  environment_of "$2" >/dev/null || usage
+}
+# environment_of NAME: edge or stable, for NAME or for the name it had before
+# (staging, production), taken until a later release; false for anything
+# else.
+environment_of() {
+  case $1 in
+    edge | staging) echo edge ;;
+    stable | production) echo stable ;;
+    *) return 1 ;;
+  esac
 }
 
 # version_at_least VERSION MIN: whether VERSION (2.24.6, v2.27.0, 5.1.1,
@@ -186,7 +198,9 @@ packages() {
   install_docker
 }
 
-# write_settings HOST ENVIRONMENT: aishie.env, unless it is there.
+# write_settings HOST ENVIRONMENT: aishie.env, unless it is there. One that
+# is there is left as it is, even one that names the environment by its old
+# name, which is said, and which aishie-update takes as the new one.
 write_settings() {
   f=$ETC/aishie.env
   install -d -m 700 "$ETC"
@@ -194,9 +208,15 @@ write_settings() {
     had=$(sed -n 's/^HOST=//p' "$f" | tail -n 1)
     echo "$f is there already: left as it is (HOST=$had)"
     [ "$had" = "$1" ] || echo "warning: $f says HOST=$had, not $1: edit it if $1 is meant (README.md, Changing the host name)" >&2
+    had=$(sed -n 's/^ENVIRONMENT=//p' "$f" | tail -n 1)
+    is=$(environment_of "$had") || is=$had
+    if [ "$is" != "$had" ]; then
+      echo "notice: $f says ENVIRONMENT=$had, the name $is had before: aishie-update takes it as $is until a later release. Change it to ENVIRONMENT=$is by hand (README.md, Renaming the settings)" >&2
+    fi
+    [ "$is" = "$2" ] || echo "warning: $f says ENVIRONMENT=$had, not $2: edit it if $2 is meant" >&2
     return 0
   fi
-  if [ "$2" = staging ]; then
+  if [ "$2" = edge ]; then
     channel=edge
   else
     channel=
@@ -209,9 +229,9 @@ write_settings() {
 HOST=$1
 ENVIRONMENT=$2
 EOF
-  if [ "$2" = production ]; then
+  if [ "$2" = stable ]; then
     cat >> "$f.new" <<'EOF'
-# Production follows releases: set each to one, e.g.
+# Stable follows releases: set each to one, e.g.
 # ghcr.io/aishie-education/aishie-core:1.2.3, then run aishie-update.
 EOF
   fi
@@ -440,6 +460,10 @@ main() {
   done
   [ "$n" -eq 2 ] || usage
   check_args "$name" "$environment"
+  given=$environment
+  environment=$(environment_of "$given")
+  [ "$given" = "$environment" ] ||
+    echo "notice: $given is called $environment now: setting this server up for $environment (README.md, Renaming the settings)" >&2
   [ "$(id -u)" = 0 ] || die "run this as root (sudo -i)"
   here=$(cd "$(dirname "$0")" && pwd)
   if [ ! -f "$here/stack.yaml" ] || [ ! -f "$here/bin/aishie-update" ]; then
@@ -524,8 +548,8 @@ MSG
   login=
   pull_check || login=1
   failed=
-  if [ "$environment" = production ] && ! grep -q '^CORE_IMAGE=.' "$ETC/aishie.env"; then
-    echo "not updating: production's channels are not set yet (below)"
+  if [ "$environment" = stable ] && ! grep -q '^CORE_IMAGE=.' "$ETC/aishie.env"; then
+    echo "not updating: stable's channels are not set yet (below)"
   else
     # Core, the runtime and the web, in that order, each by the safe
     # sequence. A run stops at the first service it cannot deploy (an image
@@ -562,9 +586,9 @@ $n. Give the bucket the CORS rule above: until it has it, uploads from the site
 EOF
     n=$((n + 1))
   fi
-  if [ "$environment" = production ] && ! grep -q '^CORE_IMAGE=.' "$ETC/aishie.env"; then
+  if [ "$environment" = stable ] && ! grep -q '^CORE_IMAGE=.' "$ETC/aishie.env"; then
     cat <<EOF
-$n. Set the releases production runs, CORE_IMAGE, RUNTIME_IMAGE and WEB_IMAGE, in
+$n. Set the releases stable runs, CORE_IMAGE, RUNTIME_IMAGE and WEB_IMAGE, in
    $ETC/aishie.env (e.g. $REGISTRY/aishie-core:1.2.3), then: aishie-update
 EOF
     n=$((n + 1))

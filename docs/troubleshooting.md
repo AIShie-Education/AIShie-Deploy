@@ -89,8 +89,8 @@ runtime's on 127.0.0.1:9090 the same; the web's `/version.json` on
 one line: `skipped: it failed before`. That is on purpose: a digest that
 failed is not tried every five minutes. It is left alone until either
 
-- the channel names another digest (a fix pushed to main, for staging; a
-  new release set in `aishie.env`, for production), which is deployed as
+- the channel names another digest (a fix pushed to main, for edge; a
+  new release set in `aishie.env`, for stable), which is deployed as
   usual; or
 - you run `aishie-update --retry SERVICE`, once the cause is fixed on the
   server (an env file, the agents' configuration, a migration forced back).
@@ -133,7 +133,7 @@ organization grants an account read access in each package's settings
   `journalctl -u aishie-update -u aishie-backup`, and `ps -ef | grep
   aishie`.
 - **`CORE_IMAGE refused`.** The channel in `aishie.env` is not an image of
-  its repository, or, in production, not a release (`X.Y.Z`) nor a digest.
+  its repository, or, on stable, not a release (`X.Y.Z`) nor a digest.
 - **`PostgreSQL is not up and healthy`.** `aishie logs postgres`. A full disk
   is the usual cause: `df -h /var/lib/docker /var/backups`.
 - **`the backup of the database … failed`.** Nothing was changed, and the
