@@ -161,6 +161,14 @@ rm "$FAKE/running/postgres"
 if aishie backup; then fail "passed with PostgreSQL down"; fi
 said "PostgreSQL is not running" || fail "said: $(cat "$FAKE/out")"
 
+# aishie storage is aishie-storage, beside it (tests/aishie-storage_test.sh).
+setup storage deployed
+aishie storage help || fail "exit $?: $(cat "$FAKE/out")"
+said "aishie storage migrate --to s3" || fail "said: $(cat "$FAKE/out")"
+said "aishie storage \[COMMAND\]" && fail "aishie's own usage, not aishie-storage's"
+aishie frobnicate || :
+said "aishie storage \[COMMAND\]" || fail "aishie's usage does not name storage: $(cat "$FAKE/out")"
+
 # Anything else: usage, and nothing run.
 for args in "" "core" "frobnicate" "backup now" "runtime-status x"; do
   setup usage deployed
