@@ -109,15 +109,20 @@ setting() { sed -n "s/^$2=//p" "$AISHIE_ETC/$1" | tail -n 1; }
 mode() { stat -c %a "$1"; }
 sums() { (cd "$AISHIE_ETC" && find . -type f -exec sha256sum {} + | sort); }
 
-# The arguments.
+# The arguments: edge and stable, and their old names, staging and
+# production, until a later release.
 case=args
-for good in "test.aishie.app staging" "localhost production" "aishie.localhost staging" "a-b.example.edu staging"; do
+for good in "test.aishie.app edge" "localhost stable" "aishie.localhost edge" "a-b.example.edu edge" \
+  "test.aishie.app staging" "localhost production"; do
   # shellcheck disable=SC2086 # the arguments, split
   lib check_args $good || fail "refused «$good»"
 done
-for bad in "'' staging" "a\ b staging" "-x staging" "../etc staging" "a..b staging" ".a staging" "a;id staging" \
-  "test.aishie.app" "test.aishie.app dev" "test.aishie.app Staging"; do
+for bad in "'' edge" "a\ b edge" "-x edge" "../etc edge" "a..b edge" ".a edge" "a;id edge" \
+  "test.aishie.app" "test.aishie.app dev" "test.aishie.app Edge" "test.aishie.app Staging" "test.aishie.app prod"; do
   if eval "lib check_args $bad" 2>/dev/null; then fail "took «$bad»"; fi
+done
+for pair in "edge edge" "stable stable" "staging edge" "production stable"; do
+  [ "$(lib environment_of "${pair% *}")" = "${pair#* }" ] || fail "${pair% *} is taken as «$(lib environment_of "${pair% *}")»"
 done
 
 # Versions of compose, as Docker's and Ubuntu's packages write them.
@@ -152,17 +157,17 @@ COMPOSE_VERSION=2.20.2 APT_COMPOSE=2.24.6+ds1-0ubuntu1~24.04.1 lib install_docke
 called "install -y -q docker.io docker-compose-v2" || fail "ran: $(cat "$CALLS")"
 said "installing Docker from Ubuntu's packages" || fail "said: $(cat "$FAKE/out")"
 
-# A fresh server, staging: everything, then the first update.
+# A fresh server, edge: everything, then the first update.
 setup fresh
-setup_server test.aishie.app staging || fail "exit $?: $(cat "$FAKE/out")"
+setup_server test.aishie.app edge || fail "exit $?: $(cat "$FAKE/out")"
 # Its settings, from the arguments.
 [ "$(setting aishie.env HOST)" = test.aishie.app ] || fail "HOST=$(setting aishie.env HOST)"
-[ "$(setting aishie.env ENVIRONMENT)" = staging ] || fail "ENVIRONMENT=$(setting aishie.env ENVIRONMENT)"
+[ "$(setting aishie.env ENVIRONMENT)" = edge ] || fail "ENVIRONMENT=$(setting aishie.env ENVIRONMENT)"
 [ "$(setting aishie.env CORE_IMAGE)" = "$REG/aishie-core:edge" ] || fail "CORE_IMAGE=$(setting aishie.env CORE_IMAGE)"
 [ "$(setting aishie.env RUNTIME_IMAGE)" = "$REG/aishie-agent-runtime:edge" ] || fail "RUNTIME_IMAGE=$(setting aishie.env RUNTIME_IMAGE)"
 [ "$(setting aishie.env WEB_IMAGE)" = "$REG/aishie-frontend:edge" ] || fail "WEB_IMAGE=$(setting aishie.env WEB_IMAGE)"
 [ -z "$(setting aishie.env FRAME_ANCESTORS)" ] || fail "FRAME_ANCESTORS is set: $(setting aishie.env FRAME_ANCESTORS)"
-# Every setting the example has, with the example's value (it is a staging
+# Every setting the example has, with the example's value (it is an edge
 # server named test.aishie.app too), so that compose.yaml finds each.
 while IFS='=' read -r n v; do
   [ "$(setting aishie.env "$n")" = "$v" ] || fail "$n=$(setting aishie.env "$n"), the example has $v"
@@ -241,6 +246,7 @@ said "Point test.aishie.app at this server" || fail "no DNS step: $(cat "$FAKE/o
 said "aishie admin" || fail "no step for the first administrator"
 said "install -g 65532 -m 640 tutor.yaml" || fail "no agent step"
 ! said "docker login" || fail "asked to log in, though every pull worked"
+! said "notice:" || fail "said a notice: $(cat "$FAKE/out")"
 for secret in "$core_pw" "$runtime_pw" "$(setting postgres.env POSTGRES_PASSWORD)" "$(setting core.env SIGNING_KEY)" "$(cat "$kek")"; do
   if grep -qF -- "$secret" "$FAKE/out" "$CALLS" "$FAKE/log"; then fail "a secret is in the output, a command line or the log"; fi
 done
@@ -251,7 +257,7 @@ case=again
 before=$(sums)
 echo "an old aishie" > "$AISHIE_BIN/aishie"
 : > "$CALLS"
-setup_server test.aishie.app staging || fail "exit $?: $(cat "$FAKE/out")"
+setup_server test.aishie.app edge || fail "exit $?: $(cat "$FAKE/out")"
 [ "$(sums)" = "$before" ] || fail "changed $AISHIE_ETC: $(diff <(echo "$before") <(sums))"
 cmp -s "$root/bin/aishie" "$AISHIE_BIN/aishie" || fail "did not install aishie again"
 said "aishie.env is there already: left as it is (HOST=test.aishie.app)" || fail "said: $(cat "$FAKE/out")"
@@ -260,14 +266,14 @@ said "kek/v1 is there already: left as it is" || fail "said: $(cat "$FAKE/out")"
 [ "$(grep -c 'up to date' "$FAKE/out")" = 3 ] || fail "the update did something: $(cat "$FAKE/out")"
 ! called "pg_dump" || fail "backed up, with nothing to deploy"
 # ... another name, given by mistake: said, and aishie.env left as it is.
-setup_server other.aishie.app staging || fail "exit $?: $(cat "$FAKE/out")"
+setup_server other.aishie.app edge || fail "exit $?: $(cat "$FAKE/out")"
 said "warning: .*aishie.env says HOST=test.aishie.app, not other.aishie.app" || fail "no warning: $(cat "$FAKE/out")"
 [ "$(setting aishie.env HOST)" = test.aishie.app ] || fail "HOST changed to $(setting aishie.env HOST)"
 
 # ... asked for a bucket then: said how to move the files, and core.env
 # left as it is.
 before=$(sums)
-AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server test.aishie.app staging --storage aws --s3-region ap-east-1 --s3-bucket aishie-files ||
+AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server test.aishie.app edge --storage aws --s3-region ap-east-1 --s3-bucket aishie-files ||
   fail "exit $?: $(cat "$FAKE/out")"
 said "warning: .*core.env keeps uploaded files with BLOB_STORE=fs, and is left as it is: to move them, aishie storage migrate --to s3" ||
   fail "no warning: $(cat "$FAKE/out")"
@@ -276,21 +282,21 @@ said "warning: .*core.env keeps uploaded files with BLOB_STORE=fs, and is left a
 
 # ufw on: 80 and 443 opened, and nothing else.
 setup ufw
-UFW_ACTIVE=1 setup_server test.aishie.app staging || fail "exit $?: $(cat "$FAKE/out")"
+UFW_ACTIVE=1 setup_server test.aishie.app edge || fail "exit $?: $(cat "$FAKE/out")"
 for rule in 80/tcp 443/tcp 443/udp; do called "ufw allow $rule" || fail "ufw: no $rule"; done
 [ "$(grep -c 'ufw allow' "$CALLS")" = 3 ] || fail "ufw: $(grep 'ufw allow' "$CALLS")"
 
 # Docker Hub refuses the newest postgres:18 and caddy:2 for a while: the
 # set-up goes on with the ones the server has.
 setup docker-hub-refuses
-COMPOSE_PULL_FAIL=1 setup_server test.aishie.app staging || fail "exit $?: $(cat "$FAKE/out")"
+COMPOSE_PULL_FAIL=1 setup_server test.aishie.app edge || fail "exit $?: $(cat "$FAKE/out")"
 said "could not pull the newest postgres:18 and caddy:2 (above): going on with the ones this server has" || fail "said: $(cat "$FAKE/out")"
 grep -q "^CORE_REF=" "$AISHIE_STATE/images.env" || fail "stopped before the first update"
 
 # The images cannot be pulled: how to log in, said exactly, and the run
 # fails once it has said what is left.
 setup no-login
-if PULL_FAIL=1 setup_server test.aishie.app staging; then fail "passed though nothing could be pulled"; fi
+if PULL_FAIL=1 setup_server test.aishie.app edge; then fail "passed though nothing could be pulled"; fi
 said "cannot pull $REG/aishie-core:edge" || fail "said: $(cat "$FAKE/out")"
 said "docker login ghcr.io -u <that account's GitHub user name> --password-stdin" || fail "no login help: $(cat "$FAKE/out")"
 said "read:packages" || fail "the token's scope is not said"
@@ -298,21 +304,82 @@ said "(classic)" || fail "the token's kind is not said"
 [ -e "$AISHIE_ETC/core.env" ] || fail "the settings were not written before the pull"
 ! grep -q "_REF=" "$AISHIE_STATE/images.env" || fail "deployed something: $(cat "$AISHIE_STATE/images.env")"
 
-# Production: no channel until a person sets the releases, so no update.
-setup production
-setup_server aishie.example.edu production || fail "exit $?: $(cat "$FAKE/out")"
-[ "$(setting aishie.env ENVIRONMENT)" = production ] || fail "ENVIRONMENT=$(setting aishie.env ENVIRONMENT)"
+# Stable: no channel until a person sets the releases, so no update.
+setup stable
+setup_server aishie.example.edu stable || fail "exit $?: $(cat "$FAKE/out")"
+[ "$(setting aishie.env ENVIRONMENT)" = stable ] || fail "ENVIRONMENT=$(setting aishie.env ENVIRONMENT)"
 for n in CORE_IMAGE RUNTIME_IMAGE WEB_IMAGE; do
   grep -qx "$n=" "$AISHIE_ETC/aishie.env" || fail "$n=$(setting aishie.env "$n")"
 done
 ! called "docker pull" || fail "pulled something: $(grep 'docker pull' "$CALLS")"
-said "Set the releases production runs" || fail "said: $(cat "$FAKE/out")"
+said "Set the releases stable runs" || fail "said: $(cat "$FAKE/out")"
+
+# The old names as arguments: taken as edge and stable, said, and a new
+# server's aishie.env written with the new names.
+setup old-argument-staging
+setup_server test.aishie.app staging || fail "exit $?: $(cat "$FAKE/out")"
+said "notice: staging is called edge now: setting this server up for edge" || fail "said: $(cat "$FAKE/out")"
+[ "$(setting aishie.env ENVIRONMENT)" = edge ] || fail "ENVIRONMENT=$(setting aishie.env ENVIRONMENT)"
+[ "$(setting aishie.env CORE_IMAGE)" = "$REG/aishie-core:edge" ] || fail "CORE_IMAGE=$(setting aishie.env CORE_IMAGE)"
+grep -q "^CORE_REF=$REG/aishie-core@sha256:$A$" "$AISHIE_STATE/images.env" || fail "core not deployed: $(cat "$AISHIE_STATE/images.env")"
+setup old-argument-production
+setup_server aishie.example.edu production || fail "exit $?: $(cat "$FAKE/out")"
+said "notice: production is called stable now: setting this server up for stable" || fail "said: $(cat "$FAKE/out")"
+[ "$(setting aishie.env ENVIRONMENT)" = stable ] || fail "ENVIRONMENT=$(setting aishie.env ENVIRONMENT)"
+grep -qx "CORE_IMAGE=" "$AISHIE_ETC/aishie.env" || fail "CORE_IMAGE=$(setting aishie.env CORE_IMAGE)"
+said "Set the releases stable runs" || fail "said: $(cat "$FAKE/out")"
+
+# A server set up as staging, before edge had its name, as test.aishie.app
+# was, set up again with this copy: aishie.env is left as it is, its old
+# name said and taken, and the stack updates as before.
+setup old-staging
+setup_server test.aishie.app edge || fail "exit $?: $(cat "$FAKE/out")"
+sed -i 's/^ENVIRONMENT=edge$/ENVIRONMENT=staging/' "$AISHIE_ETC/aishie.env"
+before=$(sums)
+D=$(printf 'd%.0s' $(seq 64))
+image core "$D" v0.2.1 def4567
+tag "$REG/aishie-core:edge" "$D"
+for given in edge staging; do
+  : > "$CALLS"
+  setup_server test.aishie.app "$given" || fail "set up again with $given: exit $?: $(cat "$FAKE/out")"
+  [ "$(sums)" = "$before" ] || fail "changed $AISHIE_ETC: $(diff <(echo "$before") <(sums))"
+  said "notice: .*aishie.env says ENVIRONMENT=staging, the name edge had before: aishie-update takes it as edge" ||
+    fail "no notice of the file's old name: $(cat "$FAKE/out")"
+  ! said "warning: .*ENVIRONMENT" || fail "warned: $(cat "$FAKE/out")"
+done
+said "notice: staging is called edge now" || fail "no notice of the old argument: $(cat "$FAKE/out")"
+grep -q "^CORE_REF=$REG/aishie-core@sha256:$D$" "$AISHIE_STATE/images.env" ||
+  fail "the new :edge not deployed: $(cat "$AISHIE_STATE/images.env")"
+[ "$(grep -c 'the name edge had before' "$FAKE/log")" = 1 ] || fail "log: $(cat "$FAKE/log")"
+# ... and given the other environment by mistake: said, and left as it is.
+setup_server test.aishie.app stable || fail "exit $?: $(cat "$FAKE/out")"
+said "warning: .*aishie.env says ENVIRONMENT=staging, not stable" || fail "no warning: $(cat "$FAKE/out")"
+[ "$(sums)" = "$before" ] || fail "changed $AISHIE_ETC"
+
+# A server set up as production before stable had its name, its releases
+# set: set up again, it still runs them, and aishie.env is left as it is.
+setup old-production
+tag "$REG/aishie-core:0.2.0" "$A"
+tag "$REG/aishie-agent-runtime:0.4.0" "$B"
+tag "$REG/aishie-frontend:0.3.0" "$C"
+setup_server aishie.example.edu stable || fail "exit $?: $(cat "$FAKE/out")"
+sed -i "s/^ENVIRONMENT=stable$/ENVIRONMENT=production/; s|^CORE_IMAGE=.*|CORE_IMAGE=$REG/aishie-core:0.2.0|; s|^RUNTIME_IMAGE=.*|RUNTIME_IMAGE=$REG/aishie-agent-runtime:0.4.0|; s|^WEB_IMAGE=.*|WEB_IMAGE=$REG/aishie-frontend:0.3.0|" "$AISHIE_ETC/aishie.env"
+before=$(sums)
+setup_server aishie.example.edu stable || fail "exit $?: $(cat "$FAKE/out")"
+[ "$(sums)" = "$before" ] || fail "changed $AISHIE_ETC"
+said "notice: .*aishie.env says ENVIRONMENT=production, the name stable had before" || fail "said: $(cat "$FAKE/out")"
+grep -q "^CORE_REF=$REG/aishie-core@sha256:$A$" "$AISHIE_STATE/images.env" || fail "core not deployed: $(cat "$AISHIE_STATE/images.env")"
+grep -q "^WEB_REF=$REG/aishie-frontend@sha256:$C$" "$AISHIE_STATE/images.env" || fail "the web not deployed: $(cat "$AISHIE_STATE/images.env")"
+# ... and :edge in its channel is still refused.
+sed -i "s|^CORE_IMAGE=.*|CORE_IMAGE=$REG/aishie-core:edge|" "$AISHIE_ETC/aishie.env"
+if setup_server aishie.example.edu stable; then fail "passed with :edge on a server set up as production"; fi
+grep -q "stable follows releases: $REG/aishie-core:edge is not a release" "$FAKE/log" || fail "log: $(cat "$FAKE/log")"
 
 # Some of the env files there, not all: refused, and nothing written.
 setup partial
 mkdir -p "$AISHIE_ETC"
 echo "DATABASE_URL=kept" > "$AISHIE_ETC/core.env"
-if setup_server test.aishie.app staging; then fail "passed with core.env alone"; fi
+if setup_server test.aishie.app edge; then fail "passed with core.env alone"; fi
 said "Some of .*postgres.env, core.env and runtime.env are there, but not all" || fail "said: $(cat "$FAKE/out")"
 [ ! -e "$AISHIE_ETC/postgres.env" ] || fail "wrote postgres.env"
 [ "$(cat "$AISHIE_ETC/core.env")" = "DATABASE_URL=kept" ] || fail "changed core.env"
@@ -321,13 +388,13 @@ said "Some of .*postgres.env, core.env and runtime.env are there, but not all" |
 setup volume-without-env
 mkdir -p "$FAKE/volumes"
 touch "$FAKE/volumes/aishie_postgres"
-if setup_server test.aishie.app staging; then fail "passed with a volume and no postgres.env"; fi
+if setup_server test.aishie.app edge; then fail "passed with a volume and no postgres.env"; fi
 said "volume aishie_postgres is there, but" || fail "said: $(cat "$FAKE/out")"
 [ ! -e "$AISHIE_ETC/postgres.env" ] || fail "wrote postgres.env"
 
 # A Caddyfile Caddy refuses: Caddy is not started on it.
 setup caddy-refuses
-if CADDY_FAIL=1 setup_server test.aishie.app staging; then fail "passed while caddy validate failed"; fi
+if CADDY_FAIL=1 setup_server test.aishie.app edge; then fail "passed while caddy validate failed"; fi
 said "caddy validate refused" || fail "said: $(cat "$FAKE/out")"
 ! called "up -d --no-deps caddy" || fail "started Caddy"
 
@@ -335,7 +402,7 @@ said "caddy validate refused" || fail "said: $(cat "$FAKE/out")"
 # in the environment: checked before anything is written, by reading alone,
 # then written to core.env, and given the CORS rule the site's uploads need.
 setup aws
-AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage aws --s3-region ap-east-1 --s3-bucket aishie-files test.aishie.app staging ||
+AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage aws --s3-region ap-east-1 --s3-bucket aishie-files test.aishie.app edge ||
   fail "exit $?: $(cat "$FAKE/out")"
 [ "$(setting core.env BLOB_STORE)" = s3 ] || fail "BLOB_STORE=$(setting core.env BLOB_STORE)"
 [ "$(setting core.env S3_ENDPOINT)" = s3.ap-east-1.amazonaws.com ] || fail "S3_ENDPOINT=$(setting core.env S3_ENDPOINT)"
@@ -366,18 +433,18 @@ done
 # R2 by the variables alone, but the bucket, as --name=value; B2 and
 # another service by their options.
 setup r2
-AISHIE_STORAGE=r2 AISHIE_R2_ACCOUNT_ID=$R2 AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server test.aishie.app staging --s3-bucket=files ||
+AISHIE_STORAGE=r2 AISHIE_R2_ACCOUNT_ID=$R2 AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server test.aishie.app edge --s3-bucket=files ||
   fail "exit $?: $(cat "$FAKE/out")"
 [ "$(setting core.env S3_ENDPOINT) $(setting core.env S3_REGION) $(setting core.env S3_BUCKET)" = "$R2.r2.cloudflarestorage.com auto files" ] ||
   fail "R2: $(setting core.env S3_ENDPOINT) $(setting core.env S3_REGION) $(setting core.env S3_BUCKET)"
 called "aws:amz:auto:s3 .*https://$R2.r2.cloudflarestorage.com/files/?list-type=2" || fail "R2's check: $(grep aws-sigv4 "$CALLS" | head -n 1)"
 setup b2
-AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage b2 --s3-region us-west-004 --s3-bucket files test.aishie.app staging ||
+AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage b2 --s3-region us-west-004 --s3-bucket files test.aishie.app edge ||
   fail "exit $?: $(cat "$FAKE/out")"
 [ "$(setting core.env S3_ENDPOINT) $(setting core.env S3_REGION)" = "s3.us-west-004.backblazeb2.com us-west-004" ] ||
   fail "B2: $(setting core.env S3_ENDPOINT) $(setting core.env S3_REGION)"
 setup s3
-AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage s3 --s3-endpoint https://s3.example.edu --s3-bucket files test.aishie.app staging ||
+AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage s3 --s3-endpoint https://s3.example.edu --s3-bucket files test.aishie.app edge ||
   fail "exit $?: $(cat "$FAKE/out")"
 [ "$(setting core.env S3_ENDPOINT) $(setting core.env S3_REGION) $(setting core.env S3_USE_SSL)" = "s3.example.edu us-east-1 true" ] ||
   fail "s3: $(setting core.env S3_ENDPOINT) $(setting core.env S3_REGION) $(setting core.env S3_USE_SSL)"
@@ -387,7 +454,7 @@ called "https://s3.example.edu/files/?list-type=2" || fail "not by path: $(grep 
 # secret not shown. Enter alone is this server's disk.
 setup asked
 printf '2\nap-east-1\naishie-files\n%s\n%s\n' "$AK" "$SK" > "$FAKE/answers"
-ANSWERS=$FAKE/answers setup_server test.aishie.app staging || fail "exit $?: $(cat "$FAKE/out")"
+ANSWERS=$FAKE/answers setup_server test.aishie.app edge || fail "exit $?: $(cat "$FAKE/out")"
 said "Where should Core keep the files people upload?" || fail "not asked: $(cat "$FAKE/out")"
 said "Secret access key (not shown): " || fail "the secret not asked for: $(cat "$FAKE/out")"
 [ "$(setting core.env S3_BUCKET) $(setting core.env S3_REGION)" = "aishie-files ap-east-1" ] || fail "answers: $(setting core.env S3_BUCKET) $(setting core.env S3_REGION)"
@@ -395,13 +462,13 @@ said "Secret access key (not shown): " || fail "the secret not asked for: $(cat 
 if grep -qF -- "$SK" "$FAKE/out"; then fail "the secret typed is in the output"; fi
 setup asked-disk
 echo > "$FAKE/answers"
-ANSWERS=$FAKE/answers setup_server test.aishie.app staging || fail "exit $?: $(cat "$FAKE/out")"
+ANSWERS=$FAKE/answers setup_server test.aishie.app edge || fail "exit $?: $(cat "$FAKE/out")"
 [ "$(setting core.env BLOB_STORE)" = fs ] || fail "Enter alone: BLOB_STORE=$(setting core.env BLOB_STORE)"
 
 # The keys refused: the run stops before it writes anything, and says why,
 # without the service's whole answer, which names the key.
 setup keys-refused
-if S3_LIST=403 AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage aws --s3-region ap-east-1 --s3-bucket aishie-files test.aishie.app staging; then
+if S3_LIST=403 AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage aws --s3-region ap-east-1 --s3-bucket aishie-files test.aishie.app edge; then
   fail "passed with the keys refused"
 fi
 said "setup-server.sh: the keys were refused, or may not list the bucket's objects (SignatureDoesNotMatch" || fail "said: $(cat "$FAKE/out")"
@@ -409,12 +476,12 @@ if [ -e "$AISHIE_ETC/aishie.env" ] || [ -e "$AISHIE_ETC/core.env" ]; then fail "
 ! said "$AK" || fail "printed the access key"
 # ... or nothing given that the choice needs, and nobody to ask: nothing done.
 setup missing
-if AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage aws --s3-region ap-east-1 test.aishie.app staging; then fail "passed without a bucket"; fi
+if AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage aws --s3-region ap-east-1 test.aishie.app edge; then fail "passed without a bucket"; fi
 said "aws needs the bucket's name (--s3-bucket): nothing was changed" || fail "said: $(cat "$FAKE/out")"
 if [ -s "$CALLS" ] || [ -e "$AISHIE_ETC" ]; then fail "did something"; fi
-if setup_server --storage aws --s3-region ap-east-1 --s3-bucket aishie-files test.aishie.app staging; then fail "passed without keys"; fi
+if setup_server --storage aws --s3-region ap-east-1 --s3-bucket aishie-files test.aishie.app edge; then fail "passed without keys"; fi
 said "aws needs its access key (AISHIE_S3_ACCESS_KEY)" || fail "said: $(cat "$FAKE/out")"
-if AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage s3 --s3-endpoint http://minio.example.edu --s3-bucket files test.aishie.app staging; then
+if AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage s3 --s3-endpoint http://minio.example.edu --s3-bucket files test.aishie.app edge; then
   fail "took an http:// endpoint"
 fi
 said "refuse to send it to an http:// address" || fail "said: $(cat "$FAKE/out")"
@@ -422,7 +489,7 @@ said "refuse to send it to an http:// address" || fail "said: $(cat "$FAKE/out")
 # Keys that may not set the bucket's CORS rules: the rule, where to set it,
 # and a step of what is left; the rest goes on.
 setup cors-refused
-S3_CORS_PUT=403 AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage r2 --r2-account-id "$R2" --s3-bucket files test.aishie.app staging ||
+S3_CORS_PUT=403 AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage r2 --r2-account-id "$R2" --s3-bucket files test.aishie.app edge ||
   fail "exit $?: $(cat "$FAKE/out")"
 said "these keys may not set one (HTTP 403)" || fail "said: $(cat "$FAKE/out")"
 said '"AllowedOrigins": \["https://test.aishie.app"\]' || fail "no rule: $(cat "$FAKE/out")"
@@ -433,15 +500,15 @@ grep -q "^CORE_REF=" "$AISHIE_STATE/images.env" || fail "stopped before the firs
 
 # Not root, or wrong arguments: nothing is done.
 setup not-root
-if NOT_ROOT=1000 setup_server test.aishie.app staging; then fail "ran as a user"; fi
+if NOT_ROOT=1000 setup_server test.aishie.app edge; then fail "ran as a user"; fi
 said "run this as root" || fail "said: $(cat "$FAKE/out")"
 [ ! -s "$CALLS" ] || fail "ran something: $(head -n 3 "$CALLS")"
-for args in "" "test.aishie.app" "test.aishie.app dev" "bad_name staging" "a b c" "--storage aws" \
-  "test.aishie.app staging --bogus x" "test.aishie.app staging --storage" "-x test.aishie.app staging"; do
+for args in "" "test.aishie.app" "test.aishie.app dev" "bad_name edge" "a b c" "--storage aws" \
+  "test.aishie.app edge --bogus x" "test.aishie.app edge --storage" "-x test.aishie.app edge"; do
   setup usage
   # shellcheck disable=SC2086 # the arguments, split
   if setup_server $args; then fail "took «$args»"; fi
-  said "usage: setup-server.sh HOSTNAME staging|production" || fail "said for «$args»: $(cat "$FAKE/out")"
+  said "usage: setup-server.sh HOSTNAME edge|stable" || fail "said for «$args»: $(cat "$FAKE/out")"
   if [ -s "$CALLS" ] || [ -e "$AISHIE_ETC" ]; then fail "did something for «$args»"; fi
 done
 

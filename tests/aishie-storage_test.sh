@@ -58,7 +58,7 @@ setup() {
   image core "$A" v0.2.0 abc1234
   echo "CORE_REF=$REG/aishie-core@sha256:$A" > "$FAKE/state/images.env"
   echo "$REG/aishie-core@sha256:$A" > "$FAKE/running/core"
-  printf 'HOST=test.aishie.app\nENVIRONMENT=staging\n' > "$FAKE/etc/aishie.env"
+  printf 'HOST=test.aishie.app\nENVIRONMENT=edge\n' > "$FAKE/etc/aishie.env"
   cat > "$FAKE/etc/core.env" <<EOF
 # AIshieCore's settings.
 DATABASE_URL=postgres://aishie_core:pw@postgres:5432/aishie_core?sslmode=disable

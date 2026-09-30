@@ -38,7 +38,7 @@ setup() {
   : > "$CALLS"
   cat > "$FAKE/etc/aishie.env" <<ENV
 HOST=test.aishie.app
-ENVIRONMENT=staging
+ENVIRONMENT=edge
 CORE_IMAGE=$CORE:edge
 RUNTIME_IMAGE=$RUNTIME:edge
 WEB_IMAGE=$WEB:edge
@@ -326,19 +326,77 @@ grep -q "denied" "$FAKE/log" || fail "log without Docker's error: $(cat "$FAKE/l
 [ "$(running core)" = "$CORE@sha256:$A" ] || fail "core runs $(running core)"
 [ ! -s "$FAKE/state/core.failed" ] || fail "recorded the image as failed"
 
-# Production follows releases: :edge is refused, X.Y.Z is taken.
-setup production
-sed -i 's/^ENVIRONMENT=.*/ENVIRONMENT=production/; s|^CORE_IMAGE=.*|CORE_IMAGE='"$CORE"':edge|' "$FAKE/etc/aishie.env"
+# Stable follows releases: :edge is refused, and so is :stable, which moves
+# by itself; X.Y.Z is taken.
+setup stable
+tag "$CORE:stable" "$A"
+for moving in edge stable; do
+  sed -i 's/^ENVIRONMENT=.*/ENVIRONMENT=stable/; s|^CORE_IMAGE=.*|CORE_IMAGE='"$CORE:$moving"'|' "$FAKE/etc/aishie.env"
+  if update; then fail "stable took :$moving"; fi
+  grep -q "stable follows releases: $CORE:$moving is not a release" "$FAKE/log" || fail "log: $(cat "$FAKE/log")"
+  ! called "docker pull" || fail "pulled :$moving"
+done
+tag "$CORE:0.2.0" "$A"
+tag "$RUNTIME:0.4.0" "$B"
+tag "$WEB:0.3.0" "$C"
+sed -i "s|^CORE_IMAGE=.*|CORE_IMAGE=$CORE:0.2.0|; s|^RUNTIME_IMAGE=.*|RUNTIME_IMAGE=$RUNTIME:0.4.0|; s|^WEB_IMAGE=.*|WEB_IMAGE=$WEB:0.3.0|" "$FAKE/etc/aishie.env"
+update || fail "stable refused releases: $(cat "$FAKE/out")"
+[ "$(running core)" = "$CORE@sha256:$A" ] || fail "core runs $(running core)"
+! grep -q "the name .* had before" "$FAKE/log" || fail "a note of an old name: $(cat "$FAKE/log")"
+update --status || fail "--status: exit $?"
+said "^test.aishie.app (stable)$" || fail "--status: $(cat "$FAKE/out")"
+
+# A server set up as staging, before edge had its name, as test.aishie.app
+# was: it follows :edge as it did, and aishie.env is left as it is. That the
+# old name is taken is logged once, and --status and --dry-run say it.
+setup old-staging
+sed -i 's/^ENVIRONMENT=.*/ENVIRONMENT=staging/' "$FAKE/etc/aishie.env"
+settings=$(sha256sum < "$FAKE/etc/aishie.env")
+update || fail "exit $?: $(cat "$FAKE/out")"
+[ "$(ref CORE_REF)" = "$CORE@sha256:$A" ] || fail "core: $(ref CORE_REF)"
+[ "$(ref RUNTIME_REF)" = "$RUNTIME@sha256:$B" ] || fail "runtime: $(ref RUNTIME_REF)"
+[ "$(ref WEB_REF)" = "$WEB@sha256:$C" ] || fail "web: $(ref WEB_REF)"
+[ "$(logged 'settings ENVIRONMENT=staging in .* is the name edge had before: it is taken as edge')" = 1 ] || fail "log: $(cat "$FAKE/log")"
+image core "$D" v0.2.1 def4567
+tag "$CORE:edge" "$D"
+update || fail "exit $?: $(cat "$FAKE/out")"
+[ "$(running core)" = "$CORE@sha256:$D" ] || fail "the next :edge not deployed: core runs $(running core)"
+[ "$(logged 'the name edge had before')" = 1 ] || fail "logged the old name $(logged 'the name edge had before') times, not once"
+[ "$(sha256sum < "$FAKE/etc/aishie.env")" = "$settings" ] || fail "aishie.env was changed: $(cat "$FAKE/etc/aishie.env")"
+[ ! -e "$FAKE/state/settings.last" ] || fail "settings taken for a service"
+update --status || fail "--status: exit $?"
+said "^test.aishie.app (edge)$" || fail "--status: $(cat "$FAKE/out")"
+said "Change it to ENVIRONMENT=edge by hand" || fail "--status: $(cat "$FAKE/out")"
+before=$(cat "$FAKE/log")
+update --dry-run || fail "--dry-run: exit $?"
+said "ENVIRONMENT=staging in .* is taken as edge" || fail "--dry-run: $(cat "$FAKE/out")"
+[ "$(cat "$FAKE/log")" = "$before" ] || fail "--dry-run logged: $(diff <(echo "$before") "$FAKE/log")"
+# ... renamed by hand: nothing more said.
+sed -i 's/^ENVIRONMENT=.*/ENVIRONMENT=edge/' "$FAKE/etc/aishie.env"
+update || fail "exit $?: $(cat "$FAKE/out")"
+! said "had before" || fail "said: $(cat "$FAKE/out")"
+[ ! -e "$FAKE/state/settings.noted" ] || fail "the note is kept"
+update --status || fail "--status: exit $?"
+! said "had before" || fail "--status: $(cat "$FAKE/out")"
+
+# A server set up as production before stable had its name: it still
+# follows releases alone.
+setup old-production
+sed -i 's/^ENVIRONMENT=.*/ENVIRONMENT=production/' "$FAKE/etc/aishie.env"
 if update; then fail "production took :edge"; fi
-grep -q "production follows releases" "$FAKE/log" || fail "log: $(cat "$FAKE/log")"
+grep -q "stable follows releases: $CORE:edge is not a release" "$FAKE/log" || fail "log: $(cat "$FAKE/log")"
+grep -q "ENVIRONMENT=production in .* is the name stable had before: it is taken as stable" "$FAKE/log" || fail "log: $(cat "$FAKE/log")"
 tag "$CORE:0.2.0" "$A"
 tag "$RUNTIME:0.4.0" "$B"
 tag "$WEB:0.3.0" "$C"
 sed -i "s|^CORE_IMAGE=.*|CORE_IMAGE=$CORE:0.2.0|; s|^RUNTIME_IMAGE=.*|RUNTIME_IMAGE=$RUNTIME:0.4.0|; s|^WEB_IMAGE=.*|WEB_IMAGE=$WEB:0.3.0|" "$FAKE/etc/aishie.env"
 update || fail "production refused releases: $(cat "$FAKE/out")"
 [ "$(running core)" = "$CORE@sha256:$A" ] || fail "core runs $(running core)"
+[ "$(logged 'the name stable had before')" = 1 ] || fail "logged the old name $(logged 'the name stable had before') times, not once"
+update --status || fail "--status: exit $?"
+said "^test.aishie.app (stable)$" || fail "--status: $(cat "$FAKE/out")"
 
-# No channel yet (production before its versions are set): said, not guessed.
+# No channel yet (stable before its versions are set): said, not guessed.
 setup no-channel
 sed -i 's/^CORE_IMAGE=.*/CORE_IMAGE=/' "$FAKE/etc/aishie.env"
 if update; then fail "passed with no channel"; fi

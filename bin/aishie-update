@@ -11,9 +11,11 @@
 #
 # For each service, a run pulls the tag its channel names (CORE_IMAGE,
 # RUNTIME_IMAGE and WEB_IMAGE in /etc/aishie/aishie.env) and reads the digest
-# it names now. The digest that runs already: nothing to do. A digest that
-# failed before: nothing either, said once in the log, until another digest
-# comes or --retry. Any other is deployed, step by step:
+# it names now: on an edge server most likely :edge, main's tip; on a stable
+# one (ENVIRONMENT=stable), a release, X.Y.Z, or a digest, which a person
+# sets. The digest that runs already: nothing to do. A digest that failed
+# before: nothing either, said once in the log, until another digest comes
+# or --retry. Any other is deployed, step by step:
 #
 #   core     its source label; its version; a backup of the database
 #            aishie_core; `migrate up` and `seed` with the new image; Core
@@ -41,6 +43,11 @@
 #
 # Secrets stay in the env files, which only Docker reads: this script never
 # reads them, and prints nothing of theirs.
+#
+# Edge and stable were called staging and production before: an aishie.env
+# that says ENVIRONMENT=staging or production is taken as edge or stable
+# until a later release, and said once in the log. The file is the
+# operator's, and is never rewritten here.
 #
 # The variables that move the paths below are for the tests
 # (tests/aishie-update_test.sh), and AISHIE_REGISTRY for a registry of their
@@ -155,11 +162,12 @@ arrow() { printf '%s -> %s' "$(digest_in "${1:-none}")" "$(digest_in "${2:-none}
 
 # log SERVICE MESSAGE: one line, with the time, in the log file, in the
 # journal and on standard output. Run by systemd, standard output is the
-# journal; run by hand, logger puts it there.
+# journal; run by hand, logger puts it there. SERVICE is `settings` for what
+# is said of aishie.env.
 log() {
   line="$(now) $1 $2"
   printf '%s\n' "$line" >> "$LOG_FILE"
-  printf '%s\n' "$line" > "$STATE/$1.last"
+  ! is_service "$1" || printf '%s\n' "$line" > "$STATE/$1.last"
   printf '%s\n' "$line"
   if [ -z "${INVOCATION_ID:-}" ] && command -v logger >/dev/null 2>&1; then
     logger -t aishie-update -- "$1 $2" 2>/dev/null || true
@@ -194,8 +202,9 @@ fail_run() {
 }
 
 # check_ref SERVICE REF: whether REF is an image of SERVICE's repository, by
-# tag or by digest, and nothing that is not part of such a name; in
-# production, a release (X.Y.Z) or a digest. Says why not on standard output.
+# tag or by digest, and nothing that is not part of such a name; on a stable
+# server, a release (X.Y.Z) or a digest: not :stable, :latest or :edge, which
+# move by themselves. Says why not on standard output.
 check_ref() {
   repo=$(repo_of "$1")
   case $2 in
@@ -209,9 +218,9 @@ check_ref() {
     *) echo "$2 is not an image of $repo"; return 1 ;;
   esac
   tag=${2#"$repo":}
-  if [ "$(setting "$SETTINGS" ENVIRONMENT)" = production ] &&
+  if [ "$server_env" = stable ] &&
     ! printf '%s\n' "$tag" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+'; then
-    echo "production follows releases: $2 is not a release (X.Y.Z) nor a digest"
+    echo "stable follows releases: $2 is not a release (X.Y.Z) nor a digest"
     return 1
   fi
 }
@@ -415,7 +424,7 @@ update() {
   fi
   var=$(upper "$s")_IMAGE
   channel=$(setting "$SETTINGS" "$var")
-  [ -n "$channel" ] || fail_run "$s" "no channel: set $var in $SETTINGS, e.g. $(repo_of "$s"):edge (production: a release, X.Y.Z)"
+  [ -n "$channel" ] || fail_run "$s" "no channel: set $var in $SETTINGS, e.g. $(repo_of "$s"):edge (stable: a release, X.Y.Z)"
   why=$(check_ref "$s" "$channel") || fail_run "$s" "$var refused: $why"
   new=$(resolve "$s" "$channel") ||
     fail_run "$s" "could not pull $channel: $(printf '%s' "$new" | tr '\n' ' ') (is this server logged in to ghcr.io? docs/troubleshooting.md, GHCR login expired)"
@@ -457,7 +466,8 @@ pin() {
 pinned_note() { echo "pinned by hand to $(digest_in "$2"): its channel is not followed (aishie-update --unpin $1)"; }
 
 status() {
-  echo "$(setting "$SETTINGS" HOST) ($(setting "$SETTINGS" ENVIRONMENT))"
+  echo "$(setting "$SETTINGS" HOST) ($server_env)"
+  [ -z "$old_env" ] || echo "  $(old_env_note)"
   for s in $SERVICES; do
     echo
     echo "$s"
@@ -485,6 +495,21 @@ esac
 [ -n "$MOVED" ] || [ "$(id -u)" = 0 ] || die "run this as root"
 [ -r "$SETTINGS" ] || die "$SETTINGS is missing: set the server up with setup-server.sh (README.md)"
 mkdir -p "$STATE" "$BACKUPS"
+
+# This server's environment, edge or stable. ENVIRONMENT=staging or
+# production, from a setup-server.sh of before the rename, is taken as edge or
+# stable until a later release; anything else is what it says, and only
+# stable holds the channels to releases.
+server_env=$(setting "$SETTINGS" ENVIRONMENT)
+old_env=
+case $server_env in
+  staging) old_env=staging server_env=edge ;;
+  production) old_env=production server_env=stable ;;
+esac
+old_env_note() {
+  echo "ENVIRONMENT=$old_env in $SETTINGS is the name $server_env had before: it is taken as $server_env until a later release. Change it to ENVIRONMENT=$server_env by hand (README.md, Renaming the settings)"
+}
+
 if [ "${1:-}" = --status ]; then status; exit 0; fi
 
 # One run at a time, by the timer or by hand; aishie backup takes the same
@@ -493,6 +518,11 @@ exec 9>"$LOCK_FILE"
 flock -w "$LOCK_WAIT" 9 ||
   die "another aishie-update, or aishie backup, has held the lock for $LOCK_WAIT seconds: see journalctl -u aishie-update -u aishie-backup"
 [ -e "$IMAGES" ] || set_deployed core ''
+if [ -n "$old_env" ]; then
+  if [ -n "$DRY" ]; then old_env_note; else log_once settings "$(old_env_note)"; fi
+else
+  rm -f "$STATE/settings.noted"
+fi
 
 case ${1:-} in
   --retry)
