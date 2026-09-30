@@ -1,0 +1,1161 @@
+#!/bin/sh
+# Where AIshie Core keeps the files people upload, and moving them from one
+# place to the other. As root:
+#
+#   aishie storage                     where they are kept now, and what this disk holds
+#   aishie storage check               the bucket core.env names, with its keys: read, never written to
+#   aishie storage cors [--apply] [--ask-keys]   the CORS rule the bucket needs; --apply sets it on a bucket with none
+#   aishie storage migrate --to s3 [--dry-run] [--size-only] [BUCKET OPTIONS]
+#   aishie storage migrate --to fs [--dry-run] [--size-only]
+#
+# Core keeps them on this server's disk (BLOB_STORE=fs: /data/blobs in its
+# container, /srv/aishie/core/blobs here), where every upload and download
+# goes through the server, or in a bucket of an S3 service (BLOB_STORE=s3),
+# which browsers upload to and download from directly, by the short-lived
+# URLs Core signs for them. setup-server.sh asks which, and takes the same
+# BUCKET OPTIONS as `migrate --to s3`:
+#
+#   --storage fs                                          this server's disk, the default
+#   --storage aws --s3-region REGION --s3-bucket NAME     Amazon S3
+#   --storage r2 --r2-account-id ID --s3-bucket NAME      Cloudflare R2 [--r2-jurisdiction eu|fedramp]
+#   --storage b2 --s3-region REGION --s3-bucket NAME      Backblaze B2, REGION as in its endpoint (us-west-004)
+#   --storage s3 --s3-endpoint HOST[:PORT] --s3-bucket NAME [--s3-region REGION] [--s3-path-style yes]
+#
+# or, for a run nobody answers, AISHIE_STORAGE, AISHIE_S3_BUCKET,
+# AISHIE_S3_REGION, AISHIE_S3_ENDPOINT, AISHIE_S3_PATH_STYLE,
+# AISHIE_R2_ACCOUNT_ID and AISHIE_R2_JURISDICTION. The keys come from
+# AISHIE_S3_ACCESS_KEY and AISHIE_S3_SECRET_KEY, or are typed when asked (the
+# secret is not shown). They are never on a command line and never printed:
+# curl reads them on its standard input, rclone from a file of root's that
+# is removed when this ends, and core.env (0600) keeps them for Core.
+#
+# The check reads alone: it lists at most one key of the bucket and asks for
+# an object that is not there, as Core does when it starts. It writes
+# nothing, so it cannot leave anything behind, overwrite anything, or leave
+# a version or a delete marker in a bucket that keeps them; nor does it
+# prove that the keys may write (the first upload, or migrate, does).
+#
+# `migrate` copies with rclone in its container (RCLONE_IMAGE below, pinned
+# by digest), under the keys Core reads them by: a file's path under
+# /data/blobs is its object's key, and its .meta beside it says its content
+# type, which the object is given. The copy is checked by size and by
+# checksum (MD5, against the object's ETag; --size-only for a bucket whose
+# ETags are not MD5s, such as one encrypted with SSE-KMS). It copies while
+# Core runs, then stops Core for what was uploaded meanwhile, checks, switches
+# core.env (the old one kept beside it) and starts Core, and puts core.env
+# back if Core does not come up. What it copied from stays where it was.
+# Stopped part way, it goes on from where it was when run again; --dry-run
+# says what it would copy and changes nothing. README.md, Where uploaded
+# files are kept, says more, and how to go back.
+#
+# tests/aishie-storage_test.sh sources it with AISHIE_STORAGE_LIB=1, which
+# defines the functions and runs nothing, as setup-server.sh does.
+set -eu
+umask 077
+
+ETC=${AISHIE_ETC:-/etc/aishie}
+STATE=${AISHIE_STATE:-/var/lib/aishie}
+APP=${AISHIE_APP:-/opt/aishie}
+DATA=${AISHIE_DATA:-/srv/aishie}
+LOCK_FILE=${AISHIE_LOCK_FILE:-/run/aishie-update.lock}
+# Core's user in its image, which owns its files.
+APP_UID=65532
+# rclone 1.75.1, by the digest of its index on Docker Hub (every platform).
+RCLONE_IMAGE=rclone/rclone:1.75.1@sha256:45401ad7410db1d67ffdb58e19059ad20b0d8e0285a60e38bbec55cc1019c7a5
+ST_HEALTH_TRIES=${AISHIE_HEALTH_TRIES:-30}
+# The AWS regions Core's S3 client (minio-go v7.3.0) knows the endpoint of.
+# At AWS it sends each request to the endpoint of the region it is given,
+# and to us-east-1's for one it does not know, where the bucket is not, so a
+# bucket in any other region does not work with Core yet.
+ST_AWS_REGIONS="us-east-1 us-east-2 us-west-1 us-west-2 ca-central-1 ca-west-1 mx-central-1 sa-east-1
+eu-west-1 eu-west-2 eu-west-3 eu-central-1 eu-central-2 eu-north-1 eu-south-1 eu-south-2 il-central-1
+me-central-1 me-south-1 af-south-1 ap-east-1 ap-east-2 ap-south-1 ap-south-2 ap-northeast-1 ap-northeast-2
+ap-northeast-3 ap-southeast-1 ap-southeast-2 ap-southeast-3 ap-southeast-4 ap-southeast-5 ap-southeast-6
+ap-southeast-7 us-gov-east-1 us-gov-west-1 cn-north-1 cn-northwest-1"
+# The SHA-256 of nothing: the payload hash of a request without a body.
+ST_EMPTY_SHA=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+# The object the check asks for, which is never written.
+ST_PROBE_KEY=aishie-storage-probe
+ST_NAME=${ST_NAME:-aishie storage}
+ST_TAB=$(printf '\t')
+ST_NL='
+'
+
+# The bucket: what the options, the variables or the answers gave, or what
+# core.env says.
+ST_KIND='' ST_BUCKET='' ST_REGION='' ST_ENDPOINT='' ST_PATH_STYLE='' ST_R2_ACCOUNT='' ST_R2_JURISDICTION=''
+ST_AK='' ST_SK='' ST_SSL=true ST_GIVEN=''
+ST_STORE='' ST_FS_ROOT=''
+st_tmp='' st_echo_off='' st_cors='' st_stopped='' st_root='' st_mount_mode=''
+
+st_die() { echo "$ST_NAME: $*" >&2; exit 1; }
+st_say() { printf '\n== %s\n' "$*"; }
+# st_setting FILE NAME: its last value, without the quotes of one written
+# in them.
+st_setting() {
+  sed -n "s/^$2=//p" "$1" 2>/dev/null | tr -d '\r' | tail -n 1 | sed "s/^'\(.*\)'\$/\1/; s/^\"\(.*\)\"\$/\1/"
+}
+# st_interactive: whether someone is there to answer.
+st_interactive() { [ -t 0 ]; }
+st_cleanup() {
+  if [ -n "$st_echo_off" ]; then stty echo 2>/dev/null || :; fi
+  if [ -n "$st_tmp" ]; then rm -rf "$st_tmp"; fi
+  # Core stopped for a migration that stopped short of the switch: started
+  # again as it was, on what core.env still says.
+  if [ -n "$st_stopped" ]; then
+    echo "$ST_NAME: starting Core again, as it was" >&2
+    st_compose up -d --no-deps core >&2 || :
+  fi
+}
+# st_tmpdir: a directory of root's for this run, removed when it ends: in
+# STATE when it is there, which is root's alone. It holds rclone's
+# configuration, with the keys, while a migration runs.
+st_tmpdir() {
+  [ -z "$st_tmp" ] || return 0
+  if [ -d "$STATE" ]; then st_tmp=$(mktemp -d "$STATE/storage.XXXXXX"); else st_tmp=$(mktemp -d); fi
+  trap st_cleanup EXIT
+  trap 'exit 130' INT TERM
+}
+
+# st_ask VAR PROMPT [DEFAULT]: a line from standard input.
+st_ask() {
+  printf '%s' "$2" >&2
+  st_ans=
+  IFS= read -r st_ans || [ -n "$st_ans" ] || st_die "no answer: nothing was changed"
+  [ -n "$st_ans" ] || st_ans=${3:-}
+  eval "$1=\$st_ans"
+  st_ans=
+}
+# st_ask_secret VAR PROMPT: the same, not shown as it is typed at a
+# terminal.
+st_ask_secret() {
+  printf '%s' "$2" >&2
+  st_ans=
+  if [ -t 0 ]; then
+    trap st_cleanup EXIT
+    trap 'exit 130' INT TERM
+    st_echo_off=1
+    stty -echo
+    IFS= read -r st_ans || :
+    stty echo
+    st_echo_off=
+    echo >&2
+  else
+    IFS= read -r st_ans || :
+  fi
+  eval "$1=\$st_ans"
+  st_ans=
+}
+
+# st_option NAME VALUE: a bucket option; false for any other NAME.
+st_option() {
+  case $1 in
+    --storage) ST_KIND=$2 ;;
+    --s3-bucket) ST_BUCKET=$2 ;;
+    --s3-region) ST_REGION=$2 ;;
+    --s3-endpoint) ST_ENDPOINT=$2 ;;
+    --s3-path-style) ST_PATH_STYLE=$2 ;;
+    --r2-account-id) ST_R2_ACCOUNT=$2 ;;
+    --r2-jurisdiction) ST_R2_JURISDICTION=$2 ;;
+    *) return 1 ;;
+  esac
+  ST_GIVEN=1
+}
+
+# st_from_env: what the options left unset, from the variables; then the
+# keys' variables are unset, so that no program this runs inherits them.
+st_from_env() {
+  if [ -n "${AISHIE_STORAGE:-}" ]; then ST_GIVEN=1; ST_KIND=${ST_KIND:-$AISHIE_STORAGE}; fi
+  if [ -n "${AISHIE_S3_BUCKET:-}" ]; then ST_GIVEN=1; ST_BUCKET=${ST_BUCKET:-$AISHIE_S3_BUCKET}; fi
+  if [ -n "${AISHIE_S3_REGION:-}" ]; then ST_GIVEN=1; ST_REGION=${ST_REGION:-$AISHIE_S3_REGION}; fi
+  if [ -n "${AISHIE_S3_ENDPOINT:-}" ]; then ST_GIVEN=1; ST_ENDPOINT=${ST_ENDPOINT:-$AISHIE_S3_ENDPOINT}; fi
+  if [ -n "${AISHIE_S3_PATH_STYLE:-}" ]; then ST_GIVEN=1; ST_PATH_STYLE=${ST_PATH_STYLE:-$AISHIE_S3_PATH_STYLE}; fi
+  if [ -n "${AISHIE_R2_ACCOUNT_ID:-}" ]; then ST_GIVEN=1; ST_R2_ACCOUNT=${ST_R2_ACCOUNT:-$AISHIE_R2_ACCOUNT_ID}; fi
+  if [ -n "${AISHIE_R2_JURISDICTION:-}" ]; then ST_GIVEN=1; ST_R2_JURISDICTION=${ST_R2_JURISDICTION:-$AISHIE_R2_JURISDICTION}; fi
+  ST_AK=${ST_AK:-${AISHIE_S3_ACCESS_KEY:-}}
+  ST_SK=${ST_SK:-${AISHIE_S3_SECRET_KEY:-}}
+  unset AISHIE_S3_ACCESS_KEY AISHIE_S3_SECRET_KEY
+}
+
+# st_choose: the menu, for whoever is at the terminal.
+st_choose() {
+  cat >&2 <<'EOF'
+
+Where should Core keep the files people upload?
+  1  fs   this server's disk: every upload and download goes through the server
+  2  aws  Amazon S3
+  3  r2   Cloudflare R2
+  4  b2   Backblaze B2
+  5  s3   another S3-compatible service
+With 2 to 5, browsers upload to the bucket and download from it directly.
+Pick one in a region near the people who use the site (README.md, Where
+uploaded files are kept).
+EOF
+  st_ask ST_KIND "Choose 1 to 5 [1]: " 1
+  case $ST_KIND in
+    1) ST_KIND=fs ;;
+    2) ST_KIND=aws ;;
+    3) ST_KIND=r2 ;;
+    4) ST_KIND=b2 ;;
+    5) ST_KIND=s3 ;;
+  esac
+}
+
+# st_need VAR WHERE PROMPT [DEFAULT]: VAR, asked for when it is unset and
+# someone is there; unset, with nobody to ask, it is refused, and WHERE says
+# how to give it.
+st_need() {
+  eval "st_v=\${$1}"
+  [ -z "$st_v" ] || return 0
+  if st_interactive; then
+    st_ask "$1" "$3" "${4:-}"
+  elif [ -n "${4:-}" ]; then
+    eval "$1=\$4"
+  else
+    st_die "$ST_KIND needs $2: nothing was changed"
+  fi
+}
+st_need_secret() {
+  eval "st_v=\${$1}"
+  [ -z "$st_v" ] || return 0
+  st_interactive || st_die "$ST_KIND needs $2: nothing was changed"
+  st_ask_secret "$1" "$3"
+}
+
+# st_gather: what the kind of storage needs and was not given.
+st_gather() {
+  case $ST_KIND in
+    '' | fs) return 0 ;;
+    aws)
+      st_need ST_REGION "the bucket's region (--s3-region)" "The bucket's AWS region, such as ap-east-1: "
+      st_need ST_BUCKET "the bucket's name (--s3-bucket)" "Bucket: "
+      st_need ST_AK "its access key (AISHIE_S3_ACCESS_KEY)" "Access key ID: "
+      st_need_secret ST_SK "its secret (AISHIE_S3_SECRET_KEY)" "Secret access key (not shown): "
+      ;;
+    r2)
+      st_need ST_R2_ACCOUNT "the Cloudflare account's ID (--r2-account-id)" "Cloudflare account ID: "
+      st_need ST_BUCKET "the bucket's name (--s3-bucket)" "Bucket: "
+      st_need ST_AK "an R2 API token's access key ID (AISHIE_S3_ACCESS_KEY)" "Access key ID: "
+      st_need_secret ST_SK "its secret access key (AISHIE_S3_SECRET_KEY)" "Secret access key (not shown): "
+      ;;
+    b2)
+      st_need ST_REGION "the bucket's region, as in its endpoint s3.<region>.backblazeb2.com (--s3-region)" \
+        "The bucket's region, as in its endpoint s3.<region>.backblazeb2.com, such as us-west-004: "
+      st_need ST_BUCKET "the bucket's name (--s3-bucket)" "Bucket: "
+      st_need ST_AK "an application key's keyID (AISHIE_S3_ACCESS_KEY)" "keyID: "
+      st_need_secret ST_SK "its applicationKey (AISHIE_S3_SECRET_KEY)" "applicationKey (not shown): "
+      ;;
+    s3)
+      st_need ST_ENDPOINT "the service's endpoint (--s3-endpoint)" "The service's S3 endpoint, HOST or HOST:PORT: "
+      st_need ST_REGION "" "Region [us-east-1]: " us-east-1
+      st_need ST_BUCKET "the bucket's name (--s3-bucket)" "Bucket: "
+      st_need ST_PATH_STYLE "" "Path-style addressing, https://HOST/BUCKET/KEY (yes/no) [yes]: " yes
+      st_need ST_AK "its access key (AISHIE_S3_ACCESS_KEY)" "Access key: "
+      st_need_secret ST_SK "its secret key (AISHIE_S3_SECRET_KEY)" "Secret key (not shown): "
+      ;;
+  esac
+}
+
+# st_valid_key NAME VALUE: a key that can be written to core.env, rclone's
+# configuration and curl's without being changed on the way: printable
+# ASCII, with no space, quote or backslash. The value goes to grep on a
+# pipe, never on a command line.
+st_valid_key() {
+  if [ -z "$2" ]; then st_die "$1 is empty: nothing was changed"; fi
+  case $2 in *"$ST_NL"*) st_die "$1 has more than one line: nothing was changed" ;; esac
+  if printf '%s' "$2" | LC_ALL=C grep -q -e '[^!-~]' -e "[\"'\\\\]"; then
+    st_die "$1 has a space, a quote, a backslash or a character outside ASCII, which this cannot pass on as it is: nothing was changed"
+  fi
+}
+
+# st_resolve: the options checked, and what follows from them: the endpoint,
+# the region Core signs with, and how the bucket is addressed.
+st_resolve() {
+  case ${ST_KIND:=fs} in
+    fs) return 0 ;;
+    aws | r2 | b2 | s3) ;;
+    *) st_die "--storage $ST_KIND: fs, aws, r2, b2 or s3" ;;
+  esac
+  # A bucket name as Core's S3 client takes one.
+  case $ST_BUCKET in
+    '') st_die "$ST_KIND needs the bucket's name (--s3-bucket)" ;;
+    [!a-zA-Z0-9]* | *[!a-zA-Z0-9] | *[!a-zA-Z0-9._-]* | *..*) st_die "--s3-bucket $ST_BUCKET is not a bucket's name" ;;
+  esac
+  if [ "${#ST_BUCKET}" -lt 3 ] || [ "${#ST_BUCKET}" -gt 63 ]; then st_die "--s3-bucket $ST_BUCKET is not a bucket's name: 3 to 63 characters"; fi
+  ST_SSL=true
+  case $ST_KIND in
+    aws)
+      st_regions=$(printf '%s' "$ST_AWS_REGIONS" | tr '\n' ' ')
+      case " $st_regions " in
+        *" ${ST_REGION:-none} "*) ;;
+        *) st_die "--s3-region ${ST_REGION:-(none)}: not an AWS region Core's S3 client knows, which are $st_regions" ;;
+      esac
+      case $ST_REGION in
+        cn-*) ST_ENDPOINT=s3.$ST_REGION.amazonaws.com.cn ;;
+        *) ST_ENDPOINT=s3.$ST_REGION.amazonaws.com ;;
+      esac
+      ;;
+    r2)
+      case $ST_R2_ACCOUNT in
+        *[!0-9a-f]* | '') st_die "--r2-account-id $ST_R2_ACCOUNT is not a Cloudflare account ID (32 hexadecimal digits)" ;;
+      esac
+      [ "${#ST_R2_ACCOUNT}" -eq 32 ] || st_die "--r2-account-id $ST_R2_ACCOUNT is not a Cloudflare account ID (32 hexadecimal digits)"
+      case ${ST_R2_JURISDICTION:-default} in
+        default) ST_ENDPOINT=$ST_R2_ACCOUNT.r2.cloudflarestorage.com ;;
+        eu | fedramp) ST_ENDPOINT=$ST_R2_ACCOUNT.$ST_R2_JURISDICTION.r2.cloudflarestorage.com ;;
+        *) st_die "--r2-jurisdiction $ST_R2_JURISDICTION: default, eu or fedramp" ;;
+      esac
+      # R2's one region; it takes us-east-1 for it too.
+      ST_REGION=auto
+      ;;
+    b2)
+      if [ -z "$ST_REGION" ]; then
+        case $ST_ENDPOINT in
+          s3.*.backblazeb2.com) ST_REGION=${ST_ENDPOINT#s3.} ST_REGION=${ST_REGION%.backblazeb2.com} ;;
+        esac
+      fi
+      case $ST_REGION in
+        '' | *[!a-z0-9-]*) st_die "--s3-region ${ST_REGION:-(none)}: B2's region is in the bucket's endpoint, s3.<region>.backblazeb2.com, such as us-west-004" ;;
+      esac
+      ST_ENDPOINT=s3.$ST_REGION.backblazeb2.com
+      ;;
+    s3)
+      case $ST_ENDPOINT in
+        https://*) ST_ENDPOINT=${ST_ENDPOINT#https://} ;;
+        http://*) st_die "--s3-endpoint $ST_ENDPOINT: browsers upload to the bucket from an https:// page, and refuse to send it to an http:// address" ;;
+      esac
+      ST_ENDPOINT=${ST_ENDPOINT%/}
+      case $ST_ENDPOINT in
+        '' | *[!A-Za-z0-9.:-]* | :* | *:*:*) st_die "--s3-endpoint ${ST_ENDPOINT:-(none)}: HOST or HOST:PORT, such as s3.example.com" ;;
+      esac
+      ST_REGION=${ST_REGION:-us-east-1}
+      case $ST_REGION in *[!A-Za-z0-9_-]*) st_die "--s3-region $ST_REGION is not a region's name" ;; esac
+      case ${ST_PATH_STYLE:-yes} in
+        yes | true) ST_PATH_STYLE=yes ;;
+        no | false)
+          st_die "--s3-path-style no: Core's S3 client addresses a bucket by its path, https://HOST/BUCKET/KEY, at every endpoint but AWS's, Google's and Aliyun's, and has no setting for virtual-hosted addressing yet. A service that takes only that cannot be used until it has"
+          ;;
+        *) st_die "--s3-path-style $ST_PATH_STYLE: yes or no" ;;
+      esac
+      ;;
+  esac
+  case $ST_AK in *:*) st_die "the access key has a colon in it, which this cannot pass on as it is: nothing was changed" ;; esac
+  st_valid_key "the access key" "$ST_AK"
+  st_valid_key "the secret key" "$ST_SK"
+}
+
+# st_q VALUE: VALUE for an env file of Docker Compose's: in single quotes,
+# which Compose takes as they are, unless it needs none. st_valid_key keeps
+# every quote out of a key.
+st_q() {
+  case $1 in
+    *[!A-Za-z0-9/+=._:@-]*) printf "'%s'" "$1" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# st_env_block STORE: core.env's lines for the files, STORE fs or s3. With
+# fs, the bucket's settings are written too when there is one, for a move
+# back; Core reads them only with BLOB_STORE=s3. The secret goes to standard
+# output, which is always a file of root's.
+st_env_block() {
+  echo "# Uploaded files: where Core keeps them (aishie storage; README.md, Where uploaded files are kept)."
+  echo "BLOB_STORE=$1"
+  echo "BLOB_FS_ROOT=${ST_FS_ROOT:-/data/blobs}"
+  [ -n "$ST_ENDPOINT" ] && [ "$ST_KIND" != fs ] || return 0
+  echo "S3_ENDPOINT=$ST_ENDPOINT"
+  echo "S3_BUCKET=$ST_BUCKET"
+  echo "S3_REGION=$ST_REGION"
+  echo "S3_USE_SSL=$ST_SSL"
+  echo "S3_ACCESS_KEY=$(st_q "$ST_AK")"
+  echo "S3_SECRET_KEY=$(st_q "$ST_SK")"
+}
+
+# st_load_store: which store core.env names.
+st_load_store() {
+  [ -f "$ETC/core.env" ] || st_die "$ETC/core.env is not there: setup-server.sh writes it"
+  ST_STORE=$(st_setting "$ETC/core.env" BLOB_STORE)
+  ST_STORE=${ST_STORE:-fs}
+  ST_FS_ROOT=$(st_setting "$ETC/core.env" BLOB_FS_ROOT)
+  ST_FS_ROOT=${ST_FS_ROOT:-/data/blobs}
+  case $ST_FS_ROOT in
+    /data) st_root=$DATA/core ;;
+    /data/*) st_root=$DATA/core${ST_FS_ROOT#/data} ;;
+    *) st_die "BLOB_FS_ROOT=$ST_FS_ROOT in core.env is not under /data, where stack.yaml mounts $DATA/core" ;;
+  esac
+}
+# st_has_bucket: whether core.env has a bucket's settings.
+st_has_bucket() { [ -n "$(st_setting "$ETC/core.env" S3_ENDPOINT)" ] && [ -n "$(st_setting "$ETC/core.env" S3_BUCKET)" ]; }
+# st_load_bucket: the bucket core.env names, and what kind of service it is
+# at, from its endpoint.
+st_load_bucket() {
+  f=$ETC/core.env
+  ST_ENDPOINT=$(st_setting "$f" S3_ENDPOINT)
+  ST_BUCKET=$(st_setting "$f" S3_BUCKET)
+  ST_REGION=$(st_setting "$f" S3_REGION)
+  ST_REGION=${ST_REGION:-us-east-1}
+  ST_AK=$(st_setting "$f" S3_ACCESS_KEY)
+  ST_SK=$(st_setting "$f" S3_SECRET_KEY)
+  if [ "$(st_setting "$f" S3_USE_SSL)" = false ]; then ST_SSL=false; else ST_SSL=true; fi
+  if [ -z "$ST_ENDPOINT" ] || [ -z "$ST_BUCKET" ]; then st_die "$f names no bucket (S3_ENDPOINT and S3_BUCKET)"; fi
+  case $ST_ENDPOINT in
+    *.r2.cloudflarestorage.com) ST_KIND=r2 ;;
+    s3.*.backblazeb2.com) ST_KIND=b2 ;;
+    *.amazonaws.com | *.amazonaws.com.cn) ST_KIND=aws ;;
+    *) ST_KIND=s3 ;;
+  esac
+  case $ST_AK in *:*) st_die "S3_ACCESS_KEY in $f has a colon in it, which this cannot pass on as it is" ;; esac
+  st_valid_key "S3_ACCESS_KEY in $f" "$ST_AK"
+  st_valid_key "S3_SECRET_KEY in $f" "$ST_SK"
+}
+
+# st_describe: the bucket, in words.
+st_describe() {
+  case $ST_KIND in
+    aws) echo "the bucket $ST_BUCKET of Amazon S3, in $ST_REGION ($ST_ENDPOINT)" ;;
+    r2) echo "the bucket $ST_BUCKET of Cloudflare R2 ($ST_ENDPOINT)" ;;
+    b2) echo "the bucket $ST_BUCKET of Backblaze B2, in $ST_REGION ($ST_ENDPOINT)" ;;
+    *) echo "the bucket $ST_BUCKET at $ST_ENDPOINT (region $ST_REGION)" ;;
+  esac
+}
+
+# st_virtual_host: whether Core's S3 client (minio-go) names the bucket in
+# the host rather than in the path, as the check must too: at AWS's,
+# Google's and Aliyun's endpoints, but not for a bucket with a dot in its
+# name over HTTPS, which their certificates do not cover.
+st_virtual_host() {
+  case $ST_ENDPOINT in
+    s3.amazonaws.com | s3.*.amazonaws.com | s3-*.amazonaws.com | s3.*.amazonaws.com.cn | storage.googleapis.com | *.aliyuncs.com) ;;
+    *) return 1 ;;
+  esac
+  case $ST_BUCKET in
+    *.*) [ "$ST_SSL" = false ] ;;
+    *) return 0 ;;
+  esac
+}
+st_scheme() { if [ "$ST_SSL" = false ]; then echo http; else echo https; fi; }
+st_bucket_url() {
+  if st_virtual_host; then
+    echo "$(st_scheme)://$ST_BUCKET.$ST_ENDPOINT"
+  else
+    echo "$(st_scheme)://$ST_ENDPOINT/$ST_BUCKET"
+  fi
+}
+
+# st_s3 METHOD PATH [BODY]: one request to the bucket, signed (SigV4) by
+# curl with the keys, which it reads on its standard input. Prints the HTTP
+# status, 000 for no answer; what came back is in $st_tmp/body, curl's
+# complaint in $st_tmp/curl.err. PATH's query is written as SigV4 signs it:
+# sorted, encoded, every parameter with an =.
+st_s3() {
+  st_method=$1 st_url=$(st_bucket_url)$2 st_body=${3:-}
+  set -- -sS -K - --aws-sigv4 "aws:amz:$ST_REGION:s3" --connect-timeout 10 --max-time 60 \
+    -o "$st_tmp/body" -w '%{http_code}'
+  if [ -n "$st_body" ]; then
+    # PutBucketCors wants the body's MD5 as well.
+    set -- "$@" -X "$st_method" --data-binary "@$st_body" -H 'Content-Type: application/xml' \
+      -H "Content-MD5: $(openssl dgst -md5 -binary < "$st_body" | base64)" \
+      -H "x-amz-content-sha256: $(sha256sum < "$st_body" | cut -d ' ' -f 1)"
+  elif [ "$st_method" = HEAD ]; then
+    set -- "$@" -I -H "x-amz-content-sha256: $ST_EMPTY_SHA"
+  else
+    set -- "$@" -H "x-amz-content-sha256: $ST_EMPTY_SHA"
+  fi
+  : > "$st_tmp/body"
+  printf 'user = "%s:%s"\n' "$ST_AK" "$ST_SK" | curl "$@" "$st_url" 2> "$st_tmp/curl.err" || :
+}
+
+# st_refused STATUS WHAT: why the bucket refused, from its answer's Code and
+# Message (never the whole answer, which may name the access key).
+st_refused() {
+  st_code=$(sed -n 's:.*<Code>\([^<]*\)</Code>.*:\1:p' "$st_tmp/body" | head -n 1)
+  st_msg=$(sed -n 's:.*<Message>\([^<]*\)</Message>.*:\1:p' "$st_tmp/body" | head -n 1)
+  st_where=$(sed -n 's:.*<Region>\([^<]*\)</Region>.*:\1:p' "$st_tmp/body" | head -n 1)
+  st_why=${st_code:+ ($st_code${st_msg:+: $st_msg})}
+  case $1 in
+    000) st_die "no answer from $ST_ENDPOINT: $(tail -n 1 "$st_tmp/curl.err")" ;;
+    301 | 307) st_die "the bucket $ST_BUCKET is not in $ST_REGION${st_where:+: it is in $st_where}$st_why" ;;
+    400)
+      if [ -n "$st_where" ]; then st_die "the bucket $ST_BUCKET is not in $ST_REGION: it is in $st_where$st_why"; fi
+      st_die "$ST_ENDPOINT refused the request, HTTP 400$st_why"
+      ;;
+    403) st_die "the keys were refused, or may not $2$st_why" ;;
+    404) st_die "there is no bucket $ST_BUCKET at $ST_ENDPOINT$st_why" ;;
+    *) st_die "$ST_ENDPOINT answered HTTP $1$st_why" ;;
+  esac
+}
+
+# st_check: the bucket, reached with the keys, as Core will reach it; by
+# reading alone (the header says why).
+st_check() {
+  st_tmpdir
+  st_status=$(st_s3 GET "/?list-type=2&max-keys=1&prefix=courses%2F")
+  [ "$st_status" = 200 ] || st_refused "$st_status" "list the bucket's objects"
+  st_status=$(st_s3 HEAD "/$ST_PROBE_KEY")
+  case $st_status in
+    200 | 404) ;;
+    *) st_refused "$st_status" "read its objects" ;;
+  esac
+  echo "$(st_describe) answers, and these keys may list it and read it (checked by reading alone: nothing was written)"
+}
+
+# The CORS rule the bucket needs: the site's pages upload with a PUT that
+# carries a Content-Type, which the browser asks the bucket about first, and
+# may read files with a GET. Downloads today are links, which need no rule.
+st_cors_json() {
+  cat <<EOF
+[
+  {
+    "AllowedOrigins": ["https://$1"],
+    "AllowedMethods": ["GET", "HEAD", "PUT"],
+    "AllowedHeaders": ["content-type"],
+    "MaxAgeSeconds": 3600
+  }
+]
+EOF
+}
+st_cors_xml() {
+  cat <<EOF
+<CORSConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><CORSRule><AllowedOrigin>https://$1</AllowedOrigin><AllowedMethod>GET</AllowedMethod><AllowedMethod>HEAD</AllowedMethod><AllowedMethod>PUT</AllowedMethod><AllowedHeader>content-type</AllowedHeader><MaxAgeSeconds>3600</MaxAgeSeconds></CORSRule></CORSConfiguration>
+EOF
+}
+
+# st_cors_state HOST: what the bucket's CORS rules say of https://HOST, in
+# st_cors: ok (they let it PUT, with a Content-Type), none, other (rules,
+# none of them that one), or unknown (these keys may not read them).
+st_cors_state() {
+  st_status=$(st_s3 GET "/?cors=")
+  case $st_status in
+    200)
+      if grep -q '<AllowedMethod>PUT</AllowedMethod>' "$st_tmp/body" &&
+        grep -q -F -e "<AllowedOrigin>https://$1</AllowedOrigin>" -e '<AllowedOrigin>*</AllowedOrigin>' "$st_tmp/body" &&
+        grep -q -i -F -e '<AllowedHeader>content-type</AllowedHeader>' -e '<AllowedHeader>*</AllowedHeader>' "$st_tmp/body"; then
+        st_cors=ok
+      else
+        st_cors=other
+      fi
+      ;;
+    404) st_cors=none ;;
+    *) st_cors=unknown ;;
+  esac
+}
+
+# st_cors HOST apply|show: the bucket's CORS rule for https://HOST, set by
+# the S3 API (PutBucketCors) with the keys when the bucket has none and MODE
+# is apply, else said, with how to set it. A bucket with rules of its own is
+# left alone: PutBucketCors replaces them all. True once the rule is there.
+st_cors() {
+  st_tmpdir
+  st_cors_state "$1"
+  st_put=
+  if [ "$st_cors" = none ] && [ "$2" = apply ]; then
+    st_cors_xml "$1" > "$st_tmp/cors.xml"
+    st_put=$(st_s3 PUT "/?cors=" "$st_tmp/cors.xml")
+    if [ "$st_put" = 200 ]; then
+      st_cors_state "$1"
+      if [ "$st_cors" = ok ] || [ "$st_cors" = unknown ]; then st_cors=applied; fi
+    fi
+  fi
+  case $st_cors in
+    ok)
+      echo "the bucket's CORS rules let https://$1 upload to it: left as they are"
+      return 0
+      ;;
+    applied)
+      echo "the bucket has a CORS rule now: https://$1 may upload to it and read from it"
+      return 0
+      ;;
+    none)
+      if [ -n "$st_put" ]; then
+        echo "the bucket has no CORS rule, and these keys may not set one (HTTP $st_put)."
+      else
+        echo "the bucket has no CORS rule yet."
+      fi
+      ;;
+    other) echo "the bucket has CORS rules, none of which lets https://$1 upload; setting this one here would replace them." ;;
+    unknown) echo "these keys may not read the bucket's CORS rules (HTTP $st_status): check that it has this one." ;;
+  esac
+  st_cors_help "$1"
+  return 1
+}
+st_cors_help() {
+  echo "Until it has this rule, the site's uploads to it fail in the browser:"
+  echo
+  st_cors_json "$1" | sed 's/^/    /'
+  echo
+  case $ST_KIND in
+    aws)
+      cat <<EOF
+In the AWS console: S3, Buckets, $ST_BUCKET, the Permissions tab, Cross-origin
+resource sharing (CORS), Edit: paste the rule above (adding it to any rules
+there), and Save changes.
+EOF
+      ;;
+    r2)
+      cat <<EOF
+In the Cloudflare dashboard: R2 Object Storage, $ST_BUCKET, Settings, CORS
+Policy, Add CORS policy (or Edit): paste the rule above in its JSON tab, and
+Save.
+EOF
+      ;;
+    b2)
+      cat <<EOF
+Backblaze's web console sets CORS from presets (Buckets, $ST_BUCKET, Settings,
+CORS Rules); a rule with PUT, as above, goes through the S3 API, with an
+application key that may change the bucket (writeBuckets), such as the
+master application key:
+EOF
+      ;;
+    *) echo "With the service's console, or its S3 API (PutBucketCors):" ;;
+  esac
+  cat <<EOF
+Or here, with keys that may set it, typed when asked and not kept:
+    aishie storage cors --apply --ask-keys
+EOF
+}
+
+# st_compose: the stack's, as aishie-update runs it.
+st_compose() { docker compose --project-directory "$APP" -f "$APP/compose.yaml" "$@"; }
+
+# st_rclone ARGS...: rclone in its container, with this run's directory at
+# /work (rclone.conf, the lists) and Core's files, when there are any, at
+# /data/blobs, read-only unless the files come here ($st_mount_mode).
+st_rclone() {
+  if [ -d "$st_root" ]; then
+    set -- -v "$st_root:/data/blobs$st_mount_mode" "$RCLONE_IMAGE" "$@"
+  else
+    set -- "$RCLONE_IMAGE" "$@"
+  fi
+  docker run --rm -e RCLONE_CONFIG=/work/rclone.conf -v "$st_tmp:/work" "$@" < /dev/null
+}
+# st_rclone_conf: the remote dst, the bucket, as Core reaches it.
+st_rclone_conf() {
+  {
+    echo "[dst]"
+    echo "type = s3"
+    case $ST_KIND in
+      aws) echo "provider = AWS" ;;
+      r2) echo "provider = Cloudflare" ;;
+      *) echo "provider = Other" ;;
+    esac
+    printf 'access_key_id = %s\n' "$ST_AK"
+    printf 'secret_access_key = %s\n' "$ST_SK"
+    echo "region = $ST_REGION"
+    echo "endpoint = $(st_scheme)://$ST_ENDPOINT"
+    if st_virtual_host; then echo "force_path_style = false"; else echo "force_path_style = true"; fi
+    # The bucket is there (the check said so): no attempt to make it.
+    echo "no_check_bucket = true"
+  } > "$st_tmp/rclone.conf"
+  chmod 600 "$st_tmp/rclone.conf"
+}
+
+# st_list_disk OUT: the files Core would serve from the disk, each with its
+# .meta beside it, "key size" a line, sorted; in OUT.odd the others: files
+# without a .meta (an upload or a delete that stopped half way, which Core
+# does not serve) and names that are not a key of Core's, which is always
+# in a directory (courses/<course>/<upload>).
+st_list_disk() {
+  : > "$1"
+  : > "$1.odd"
+  [ -d "$st_root" ] || return 0
+  (cd "$st_root" && find . -type f -printf '%P %s\n') | LC_ALL=C awk -v odd="$1.odd" '
+    NF != 2 || $1 !~ /^[A-Za-z0-9._-]+\/[A-Za-z0-9._\/-]+$/ { print > odd; next }
+    { size[$1] = $2 }
+    END {
+      for (k in size) {
+        if (k ~ /\.meta$/) {
+          if (!(substr(k, 1, length(k) - 5) in size)) print k > odd
+          continue
+        }
+        if ((k ".meta") in size) print k " " size[k]; else print k > odd
+      }
+    }' | LC_ALL=C sort > "$1.tmp"
+  mv "$1.tmp" "$1"
+}
+
+# st_list_bucket OUT PREFIX...: the bucket's objects under each prefix, "key
+# size" a line, sorted, but for names that are not a key of Core's (and
+# .meta, which the disk keeps beside a file).
+st_list_bucket() {
+  st_out=$1
+  shift
+  : > "$st_out.tmp"
+  for st_p in "$@"; do
+    st_rc=0
+    st_rclone lsf -R --files-only --format ps "dst:$ST_BUCKET/$st_p" > "$st_tmp/lsf" 2> "$st_tmp/lsf.err" || st_rc=$?
+    # 3: rclone's "directory not found", for a prefix nothing is under.
+    if [ "$st_rc" != 0 ] && [ "$st_rc" != 3 ]; then
+      cat "$st_tmp/lsf.err" >&2
+      st_die "rclone could not list $st_p/ in the bucket (above)"
+    fi
+    LC_ALL=C awk -F ';' -v p="$st_p/" 'NF == 2 && $1 ~ /^[A-Za-z0-9._\/-]+$/ && $1 !~ /\.meta$/ { print p $1 " " $2 }' "$st_tmp/lsf" >> "$st_out.tmp"
+  done
+  LC_ALL=C sort -u "$st_out.tmp" > "$st_out"
+  rm -f "$st_out.tmp"
+}
+
+# st_count FILE: how many lines a "key size" list has, in st_n, and their
+# bytes, in st_b.
+st_count() {
+  st_c=$(awk '{ n++; b += $2 } END { printf "%d %.0f\n", n, b }' "$1")
+  st_n=${st_c% *} st_b=${st_c#* }
+}
+# st_size BYTES: in words.
+st_size() {
+  awk -v b="$1" 'BEGIN {
+    if (b < 1024) { printf "%d bytes", b; exit }
+    split("KiB MiB GiB TiB", u, " "); i = 0
+    while (b >= 1024 && i < 4) { b /= 1024; i++ }
+    printf "%.1f %s", b, u[i]
+  }'
+}
+# st_missing FROM TO OUT: the lines of FROM whose key TO lacks, or has with
+# another size.
+st_missing() {
+  awk 'FILENAME == ARGV[1] { have[$1] = $2; next } !($1 in have) || have[$1] != $2' "$2" "$1" > "$3"
+}
+
+# st_plan: what is where, and what there is to copy ($st_tmp/todo): from
+# the disk to the bucket, or back. Says it, and keeps the source's list in
+# $st_tmp/source.
+st_plan() {
+  st_list_disk "$st_tmp/disk"
+  if [ "$st_to" = s3 ]; then
+    # Under the directories the disk has files in: courses/, and attached/
+    # after a move back from a bucket.
+    st_prefixes=$(cut -d / -f 1 "$st_tmp/disk" | LC_ALL=C sort -u | tr '\n' ' ')
+    # shellcheck disable=SC2086 # the prefixes, which are keys' first parts
+    st_list_bucket "$st_tmp/bucket" $st_prefixes
+    cp "$st_tmp/disk" "$st_tmp/source"
+    st_missing "$st_tmp/disk" "$st_tmp/bucket" "$st_tmp/todo"
+    st_missing "$st_tmp/bucket" "$st_tmp/disk" "$st_tmp/extra"
+  else
+    # Where Core's S3 store keeps them: uploads, and what they became once
+    # attached.
+    st_list_bucket "$st_tmp/bucket" courses attached/courses
+    cp "$st_tmp/bucket" "$st_tmp/source"
+    st_missing "$st_tmp/bucket" "$st_tmp/disk" "$st_tmp/todo"
+    st_missing "$st_tmp/disk" "$st_tmp/bucket" "$st_tmp/extra"
+  fi
+  st_count "$st_tmp/todo"
+  st_tn=$st_n st_tb=$st_b
+  st_count "$st_tmp/source"
+  st_en=$(wc -l < "$st_tmp/extra" | tr -d ' ')
+  st_on=$(wc -l < "$st_tmp/disk.odd" | tr -d ' ')
+  if [ "$st_to" = s3 ]; then
+    echo "on this disk: $st_n files, $(st_size "$st_b")"
+    echo "  in the bucket already, the same size: $((st_n - st_tn))"
+    echo "  to copy: $st_tn files, $(st_size "$st_tb")"
+    [ "$st_on" = 0 ] || echo "  left out: $st_on without their .meta, or not named as Core names its files, which Core does not serve, such as $(head -n 2 "$st_tmp/disk.odd" | cut -d ' ' -f 1 | tr '\n' ' ')"
+    [ "$st_en" = 0 ] || echo "in the bucket but not on this disk: $st_en objects, left as they are"
+  else
+    echo "in the bucket: $st_n objects, $(st_size "$st_b")"
+    echo "  on this disk already, the same size, with a .meta: $((st_n - st_tn))"
+    echo "  to copy: $st_tn files, $(st_size "$st_tb")"
+    [ "$st_en" = 0 ] || echo "on this disk but not in the bucket: $st_en files, left as they are (nothing points at them)"
+  fi
+}
+
+# st_copy: the files in $st_tmp/todo, to the bucket or here.
+st_copy() {
+  [ -s "$st_tmp/todo" ] || return 0
+  if [ "$st_to" = s3 ]; then st_copy_up; else st_copy_down; fi
+}
+# st_copy_up: each file is given the content type its .meta says, which
+# Core gives back on a download from the bucket; one rclone per content
+# type, with the list of its files.
+#
+# A file removed since it was listed (by Core's sweep, while Core runs) is
+# passed over, by this and by rclone, which skips a listed file that is not
+# there; the check after the last copy, with Core stopped, finds anything
+# missing.
+st_copy_up() {
+  (cd "$st_root" && while read -r st_k _; do if [ -f "$st_k.meta" ]; then echo "$st_k.meta"; fi; done) < "$st_tmp/todo" > "$st_tmp/metas"
+  [ -s "$st_tmp/metas" ] || return 0
+  (cd "$st_root" && xargs awk "$ST_AWK_TYPES" < "$st_tmp/metas") > "$st_tmp/types"
+  rm -f "$st_tmp"/group.*
+  LC_ALL=C sort -t "$ST_TAB" -k 1,1 "$st_tmp/types" | awk -F '\t' -v dir="$st_tmp" '
+    $1 != ct { if (n) close(f); n++; ct = $1; f = dir "/group." n; print n "\t" ct > (dir "/groups") }
+    { print $2 > f }'
+  while IFS="$ST_TAB" read -r st_g st_ct; do
+    echo "copying $(wc -l < "$st_tmp/group.$st_g" | tr -d ' ') files of type $st_ct"
+    st_rclone copy --files-from "/work/group.$st_g" --header-upload "Content-Type: $st_ct" \
+      ${st_size_only:+--ignore-checksum} --transfers 8 --checkers 16 \
+      --stats 30s --stats-one-line --stats-log-level NOTICE /data/blobs "dst:$ST_BUCKET" ||
+      st_die "rclone stopped (above): nothing was switched; run this again to go on from here"
+  done < "$st_tmp/groups"
+}
+# The content type in each .meta file (Core's JSON of the file's Info) it
+# is given, "type<TAB>key" a line: a JSON string, unescaped, when that gives
+# printable ASCII, which an HTTP header can carry; else
+# application/octet-stream, which is what Core serves a file of no type as.
+# shellcheck disable=SC2016 # awk's, not the shell's
+ST_AWK_TYPES='
+function hex(s,   v, k) { v = 0; for (k = 1; k <= length(s); k++) v = v * 16 + index("0123456789abcdef", substr(s, k, 1)) - 1; return v }
+function jtype(s,   i, j, n, c, out, h) {
+  i = index(s, "\"ContentType\":\"")
+  if (i == 0) return ""
+  s = substr(s, i + 15); n = length(s); out = ""
+  for (j = 1; j <= n; j++) {
+    c = substr(s, j, 1)
+    if (c == "\"") return out
+    if (c != "\\") { out = out c; continue }
+    j++; c = substr(s, j, 1)
+    if (c == "\"" || c == "\\" || c == "/") { out = out c; continue }
+    if (c != "u") return ""
+    h = tolower(substr(s, j + 1, 4)); j += 4
+    if (h !~ /^00[2-7][0-9a-f]$/ || h == "007f") return ""
+    out = out sprintf("%c", hex(substr(h, 3, 2)))
+  }
+  return ""
+}
+function emit(   t) {
+  t = jtype(text)
+  if (t == "" || t !~ /^[ -~]+$/) t = "application/octet-stream"
+  printf "%s\t%s\n", t, substr(file, 1, length(file) - 5)
+}
+FNR == 1 { if (file != "") emit(); file = FILENAME; text = "" }
+{ text = text $0 }
+END { if (file != "") emit() }'
+
+# st_copy_down: the objects, then each one's .meta, written after it as
+# Core writes them: its size, its content type as the bucket gives it, and
+# its SHA-256. Both are Core's user's, as Core makes them.
+#
+# An upload attached since it was listed is no longer where it was (Core
+# moves it under attached/), and rclone passes over it: only what arrived
+# is given a .meta, and the next listing finds it where it went.
+st_copy_down() {
+  cut -d ' ' -f 1 "$st_tmp/todo" > "$st_tmp/keys"
+  st_rclone lsjson -R --files-only --no-modtime --files-from /work/keys "dst:$ST_BUCKET" > "$st_tmp/types.json" ||
+    st_die "rclone could not read the objects' content types (above): nothing was switched; run this again"
+  st_rclone copy --files-from /work/keys ${st_size_only:+--ignore-checksum} --transfers 8 --checkers 16 \
+    --stats 30s --stats-one-line --stats-log-level NOTICE "dst:$ST_BUCKET" /data/blobs ||
+    st_die "rclone stopped (above): nothing was switched; run this again to go on from here"
+  (cd "$st_root" && while read -r st_k; do if [ -f "$st_k" ]; then echo "$st_k"; fi; done) < "$st_tmp/keys" > "$st_tmp/arrived"
+  [ -s "$st_tmp/arrived" ] || return 0
+  (cd "$st_root" && xargs sha256sum -- < "$st_tmp/arrived") > "$st_tmp/sums"
+  (cd "$st_root" && xargs stat -c '%n %s' -- < "$st_tmp/arrived") > "$st_tmp/sizes"
+  (cd "$st_root" && LC_ALL=C awk -v types="$st_tmp/types.json" -v sums="$st_tmp/sums" '
+    function jraw(s, name,   i, j, n, c) {
+      i = index(s, "\"" name "\":\"")
+      if (i == 0) return ""
+      s = substr(s, i + length(name) + 4); n = length(s)
+      for (j = 1; j <= n; j++) {
+        c = substr(s, j, 1)
+        if (c == "\\") { j++; continue }
+        if (c == "\"") return substr(s, 1, j - 1)
+      }
+      return ""
+    }
+    FILENAME == types { p = jraw($0, "Path"); if (p != "") type[p] = jraw($0, "MimeType"); next }
+    FILENAME == sums { sum[$2] = $1; next }
+    {
+      t = type[$1]
+      if (t == "") t = "application/octet-stream"
+      m = $1 ".meta"
+      printf "{\"Size\":%s,\"ContentType\":\"%s\",\"Checksum\":\"sha256:%s\"}", $2, t, sum[$1] > m
+      close(m)
+    }' "$st_tmp/types.json" "$st_tmp/sums" "$st_tmp/sizes")
+  (cd "$st_root" && awk '{ print $1; print $1 ".meta" }' "$st_tmp/arrived" | xargs chmod 640 --)
+  (cd "$st_root" && awk '{ print $1; print $1 ".meta" }' "$st_tmp/arrived" | xargs chown "$APP_UID:$APP_UID" --)
+  find "$st_root" -type d \( ! -user "$APP_UID" -o ! -perm 750 \) -exec chown "$APP_UID:$APP_UID" {} + -exec chmod 750 {} +
+}
+
+# st_hash_check LIST: the files LIST names ("key size" lines) the same on
+# both sides, by rclone check: sizes, and MD5s where both sides have them
+# (the object's ETag), or sizes alone with --size-only.
+st_hash_check() {
+  [ -s "$1" ] || return 0
+  cut -d ' ' -f 1 "$1" > "$st_tmp/check.keys"
+  if [ "$st_to" = s3 ]; then
+    set -- /data/blobs "dst:$ST_BUCKET"
+  else
+    set -- "dst:$ST_BUCKET" /data/blobs
+  fi
+  if st_rclone check --one-way ${st_size_only:+--size-only} --checkers 16 --files-from /work/check.keys "$@" > "$st_tmp/check.out" 2>&1; then
+    return 0
+  fi
+  tail -n 5 "$st_tmp/check.out" >&2
+  return 1
+}
+
+# st_verify: after the last copy, with Core stopped: every file of the
+# source on the other side, the same size, and those copied since the first
+# check the same by checksum.
+st_verify() {
+  st_list_disk "$st_tmp/disk"
+  if [ "$st_to" = s3 ]; then
+    st_prefixes=$(cut -d / -f 1 "$st_tmp/disk" | LC_ALL=C sort -u | tr '\n' ' ')
+    # shellcheck disable=SC2086 # as in st_plan
+    st_list_bucket "$st_tmp/bucket" $st_prefixes
+    st_missing "$st_tmp/disk" "$st_tmp/bucket" "$st_tmp/bad"
+    cp "$st_tmp/disk" "$st_tmp/source"
+  else
+    st_list_bucket "$st_tmp/bucket" courses attached/courses
+    st_missing "$st_tmp/bucket" "$st_tmp/disk" "$st_tmp/bad"
+    cp "$st_tmp/bucket" "$st_tmp/source"
+  fi
+  if [ -s "$st_tmp/bad" ]; then
+    echo "not there, or not the same size, on the other side: $(wc -l < "$st_tmp/bad" | tr -d ' '), such as $(head -n 3 "$st_tmp/bad" | cut -d ' ' -f 1 | tr '\n' ' ')" >&2
+    return 1
+  fi
+  st_hash_check "$st_tmp/todo2" || return 1
+  st_count "$st_tmp/source"
+  echo "all $st_n files, $(st_size "$st_b"), are on both sides, the same size$(if [ -z "$st_size_only" ]; then echo ", and the same by checksum"; fi)"
+}
+
+# st_healthy: Core's /healthz on 127.0.0.1:8080 says ok, within a minute.
+st_healthy() {
+  st_i=0
+  until curl -fsS --max-time 5 http://127.0.0.1:8080/healthz 2>/dev/null | grep -q '"status": *"ok"'; do
+    st_i=$((st_i + 1))
+    [ "$st_i" -lt "$ST_HEALTH_TRIES" ] || return 1
+    sleep 2
+  done
+}
+
+# st_migrate: `aishie storage migrate`, as the header says.
+st_migrate() {
+  st_load_store
+  case $st_to in
+    s3) [ "$ST_STORE" = fs ] || st_die "Core keeps its files in a bucket already (BLOB_STORE=$ST_STORE): nothing to move" ;;
+    fs) [ "$ST_STORE" = s3 ] || st_die "Core keeps its files on this disk already (BLOB_STORE=$ST_STORE): nothing to move" ;;
+  esac
+  if [ "$st_to" = fs ]; then
+    st_load_bucket
+  elif [ -n "$ST_GIVEN" ]; then
+    st_gather
+    st_resolve
+  elif st_has_bucket; then
+    st_load_bucket
+    echo "the bucket core.env names already: $(st_describe)"
+  elif st_interactive; then
+    st_choose
+    st_gather
+    st_resolve
+  else
+    st_die "which bucket? --storage aws, r2, b2 or s3, and its options (aishie storage help)"
+  fi
+  [ "$ST_KIND" != fs ] || st_die "--storage fs: that is where the files are"
+  host=$(st_setting "$ETC/aishie.env" HOST)
+  [ -n "$host" ] || st_die "$ETC/aishie.env names no HOST"
+
+  # One migration at a time.
+  mkdir -p "$STATE"
+  exec 8> "$STATE/storage.lock"
+  flock -n 8 || st_die "another aishie storage migrate is running"
+  st_tmpdir
+  if [ "$st_to" = s3 ]; then st_mount_mode=:ro; else st_mount_mode=; fi
+
+  st_say "Where the files are"
+  if [ "$st_to" = s3 ]; then
+    echo "now: this server's disk, $st_root ($ST_FS_ROOT in Core's container)"
+    echo "to: $(st_describe)"
+  else
+    echo "now: $(st_describe)"
+    echo "to: this server's disk, $st_root ($ST_FS_ROOT in Core's container)"
+  fi
+  st_check
+  if [ "$st_to" = s3 ]; then
+    # Browsers upload to the bucket from the site's pages once Core is on it.
+    if [ -n "$st_dry" ]; then
+      st_cors "$host" show || :
+    elif ! st_cors "$host" apply; then
+      [ "$st_cors" = unknown ] || st_die "the bucket's CORS rules do not let https://$host upload yet: set the rule above, then run this again. Nothing was copied"
+      echo "going on: the rule is for you to check (above)"
+    fi
+  fi
+  st_rclone_conf
+  docker pull -q "$RCLONE_IMAGE" > /dev/null ||
+    st_die "could not pull $RCLONE_IMAGE (above): Docker Hub may be limiting pulls; run this again later. Nothing was copied"
+
+  st_say "What there is to copy"
+  st_plan
+  if [ -n "$st_dry" ]; then
+    echo
+    echo "A dry run: nothing was copied, and Core still keeps its files where it did."
+    return 0
+  fi
+
+  st_say "Copying, while Core runs"
+  if [ "$st_to" = fs ] && [ ! -d "$st_root" ]; then
+    install -d -m 750 "$st_root"
+    chown "$APP_UID:$APP_UID" "$st_root"
+  fi
+  st_copy
+  echo "checking every file copied so far$(if [ -z "$st_size_only" ]; then echo ", by size and checksum"; else echo ", by size"; fi)"
+  st_hash_check "$st_tmp/source" || st_die "what was copied is not the same on both sides (above): nothing was switched; run this again"
+
+  # From here to Core's start on the other side: under aishie-update's lock,
+  # so that no deploy recreates Core meanwhile, with Core stopped, so that
+  # nothing is uploaded that would not be copied.
+  exec 9> "$LOCK_FILE"
+  flock -w 600 9 || st_die "aishie-update has held its lock for ten minutes: nothing was switched; run this again later"
+  st_deployed=$(st_setting "$STATE/images.env" CORE_REF)
+  st_say "What was uploaded meanwhile, with Core stopped"
+  if [ -n "$st_deployed" ]; then
+    st_stopped=1
+    st_compose stop core
+  fi
+  st_plan
+  cp "$st_tmp/todo" "$st_tmp/todo2"
+  st_copy
+  st_verify || st_die "the two sides differ (above): nothing was switched; run this again"
+
+  st_say "Core, on the other side"
+  st_backup=$ETC/core.env.before-storage-$(date -u +%Y%m%dT%H%M%SZ)
+  cp -p "$ETC/core.env" "$st_backup"
+  LC_ALL=C awk '!/^(BLOB_STORE|BLOB_FS_ROOT|S3_ENDPOINT|S3_BUCKET|S3_REGION|S3_USE_SSL|S3_ACCESS_KEY|S3_SECRET_KEY)=/ && !/^# Uploaded files: /' \
+    "$ETC/core.env" > "$ETC/core.env.new"
+  st_env_block "$st_to" >> "$ETC/core.env.new"
+  chmod 600 "$ETC/core.env.new"
+  st_stopped=
+  mv "$ETC/core.env.new" "$ETC/core.env"
+  echo "core.env: BLOB_STORE=$st_to; the one before is $st_backup"
+  if [ -n "$st_deployed" ]; then
+    if ! { st_compose up -d --no-deps core && st_healthy; }; then
+      cp -p "$st_backup" "$ETC/core.env"
+      st_compose up -d --no-deps core || :
+      st_die "Core did not report healthy on the other side (aishie logs core says why): core.env is as it was, and Core starts on it again"
+    fi
+    echo "Core reports healthy"
+  else
+    echo "Core is not deployed yet: it starts with this when aishie-update deploys it"
+  fi
+
+  echo
+  if [ "$st_to" = s3 ]; then
+    cat <<EOF
+Core keeps the files people upload in $(st_describe)
+now. Browsers upload to it and download from it directly.
+
+The files stay on this disk too, in $st_root, which nothing
+reads now. Keep them until you are sure; then, to free the space:
+    rm -r $st_root
+Back to the disk, which copies whatever is not here: aishie storage migrate --to fs
+EOF
+  else
+    cat <<EOF
+Core keeps the files people upload on this disk now, in $st_root.
+
+The bucket keeps its objects, which nothing reads now, and core.env keeps
+its settings, for a move back: aishie storage migrate --to s3
+Empty the bucket with its provider's console once you no longer want them.
+EOF
+  fi
+}
+
+# st_status: `aishie storage`.
+st_status() {
+  st_load_store
+  if [ "$ST_STORE" = s3 ]; then
+    st_load_bucket
+    echo "Core keeps the files people upload in $(st_describe)."
+  else
+    echo "Core keeps the files people upload on this server's disk (BLOB_STORE=$ST_STORE): $st_root, which is $ST_FS_ROOT in its container."
+    if st_has_bucket; then
+      st_load_bucket
+      echo "core.env keeps the settings of $(st_describe), for aishie storage migrate --to s3."
+    fi
+  fi
+  st_tmpdir
+  st_list_disk "$st_tmp/disk"
+  st_count "$st_tmp/disk"
+  echo "On this disk: $st_n files, $(st_size "$st_b")."
+}
+
+st_usage() {
+  echo "usage:" >&2
+  sed -n 's/^#   \(aishie storage.*\)/  \1/p' "$0" >&2
+  sed -n 's/^#   \(--storage .*\)/  \1/p' "$0" >&2
+  exit "${1:-2}"
+}
+
+st_main() {
+  # compose.yaml reads these from aishie.env and images.env, and the same
+  # names in this process's environment would win over both files.
+  unset HOST ENVIRONMENT CORE_IMAGE RUNTIME_IMAGE WEB_IMAGE CORE_REF RUNTIME_REF WEB_REF \
+    AISHIE_SUBNET AISHIE_CADDY_IP RUNTIME_STOP_GRACE FRAME_ANCESTORS
+  export AISHIE_ETC="$ETC" AISHIE_STATE="$STATE"
+  st_cmd=${1:-status}
+  [ $# -eq 0 ] || shift
+  case $st_cmd in help | -h | --help) st_usage 0 ;; esac
+  [ "$(id -u)" = 0 ] || st_die "run this as root (sudo -i)"
+  case $st_cmd in
+    status)
+      [ $# -eq 0 ] || st_usage
+      st_status
+      ;;
+    check)
+      [ $# -eq 0 ] || st_usage
+      st_load_store
+      st_has_bucket || st_die "core.env names no bucket: Core keeps its files on this disk"
+      st_load_bucket
+      st_check
+      ;;
+    cors)
+      st_apply=show st_ask_keys=''
+      for st_a in "$@"; do
+        case $st_a in
+          --apply) st_apply=apply ;;
+          --ask-keys) st_ask_keys=1 ;;
+          *) st_usage ;;
+        esac
+      done
+      st_load_store
+      st_has_bucket || st_die "core.env names no bucket: Core keeps its files on this disk"
+      st_load_bucket
+      if [ -n "$st_ask_keys" ]; then
+        ST_AK='' ST_SK=''
+        st_ask ST_AK "Access key that may set the bucket's CORS rules: "
+        st_ask_secret ST_SK "Its secret (not shown): "
+        st_valid_key "the access key" "$ST_AK"
+        st_valid_key "the secret key" "$ST_SK"
+      fi
+      host=$(st_setting "$ETC/aishie.env" HOST)
+      [ -n "$host" ] || st_die "$ETC/aishie.env names no HOST"
+      st_cors "$host" "$st_apply"
+      ;;
+    migrate)
+      st_to='' st_dry='' st_size_only='' st_opts=''
+      while [ $# -gt 0 ]; do
+        case $1 in
+          --to=*) st_to=${1#*=} ;;
+          --to)
+            [ $# -ge 2 ] || st_usage
+            st_to=$2
+            shift
+            ;;
+          --dry-run) st_dry=1 ;;
+          --size-only) st_size_only=1 ;;
+          --*=*)
+            st_option "${1%%=*}" "${1#*=}" || st_usage
+            st_opts=1
+            ;;
+          --*)
+            [ $# -ge 2 ] || st_usage
+            st_option "$1" "$2" || st_usage
+            st_opts=1
+            shift
+            ;;
+          *) st_usage ;;
+        esac
+        shift
+      done
+      case $st_to in s3 | fs) ;; *) st_usage ;; esac
+      if [ "$st_to" = s3 ]; then
+        st_from_env
+      else
+        # From the bucket core.env names, with its keys: the variables a
+        # set-up left in this shell are not read.
+        [ -z "$st_opts" ] || st_die "--to fs moves the files of the bucket core.env names, and takes no bucket options"
+        unset AISHIE_S3_ACCESS_KEY AISHIE_S3_SECRET_KEY
+      fi
+      st_migrate
+      ;;
+    *) st_usage ;;
+  esac
+}
+
+if [ -z "${AISHIE_STORAGE_LIB:-}" ]; then st_main "$@"; fi

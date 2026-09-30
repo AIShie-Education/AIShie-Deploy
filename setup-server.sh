@@ -9,6 +9,21 @@
 # Staging follows each image's :edge; production follows releases, set by
 # hand in /etc/aishie/aishie.env.
 #
+# It asks where Core keeps the files people upload, when someone is there to
+# answer: this server's disk, as before, or a bucket of Amazon S3,
+# Cloudflare R2, Backblaze B2 or another S3-compatible service, which
+# browsers then upload to and download from directly. Options say it for a
+# run nobody answers, with the keys in AISHIE_S3_ACCESS_KEY and
+# AISHIE_S3_SECRET_KEY (bin/aishie-storage says each; README.md, Where
+# uploaded files are kept):
+#
+#   sh setup-server.sh test.aishie.app staging --storage aws --s3-region ap-east-1 --s3-bucket aishie-files
+#
+# Without them, and with nobody to ask, it is the disk. A bucket is checked
+# with the keys before anything is written, by reading alone, and given the
+# CORS rule the site's uploads need when the keys may set it; else the rule
+# is printed, with where to set it.
+#
 # It installs Docker Engine and its compose plugin where they are missing:
 # Ubuntu's own packages (docker.io and docker-compose-v2) when those give
 # compose 2.24 or later, as 24.04's do, and Docker's apt repository
@@ -16,13 +31,14 @@
 # generated database passwords and SIGNING_KEY. It makes the directories for
 # the runtime's agents and secrets, with the key that will wrap the secrets
 # the runtime stores (kek/v1), Core's files, aishie-update's state and the
-# backups. It installs the stack in /opt/aishie, aishie-update and aishie in
-# /usr/local/bin, and the timers; opens 80 and 443 in ufw when ufw is on;
-# checks that the server can pull the three images; starts PostgreSQL and
-# Caddy; runs the first update; and says what is left to do.
+# backups. It installs the stack in /opt/aishie, aishie-update, aishie and
+# aishie-storage in /usr/local/bin, and the timers; opens 80 and 443 in ufw
+# when ufw is on; checks that the server can pull the three images; starts
+# PostgreSQL and Caddy; runs the first update; and says what is left to do.
 #
 # Run again, it installs this copy's files over the old ones, and leaves the
-# rest as it is: the settings, the secrets and the data. That is how a newer
+# rest as it is: the settings, the secrets and the data, and where Core
+# keeps its files (`aishie storage migrate` moves them). That is how a newer
 # aishie-update, or a change to the stack, reaches the server.
 #
 # tests/setup-server_test.sh sources it with AISHIE_SETUP_LIB=1, which
@@ -64,8 +80,24 @@ own() { chown "$@"; }
 # in a URL or in an env file.
 secret() { openssl rand -hex "$1"; }
 
+# Where Core keeps uploaded files, the bucket options and the bucket's
+# check and CORS rule: bin/aishie-storage's functions (st_*), which `aishie
+# storage` runs later.
+storage_lib=$(dirname "$0")/bin/aishie-storage
+[ -f "$storage_lib" ] || die "run the setup-server.sh of a whole copy of the repository: $storage_lib is missing"
+ST_NAME=setup-server.sh
+AISHIE_STORAGE_LIB=1
+# shellcheck source=bin/aishie-storage
+. "$storage_lib"
+unset AISHIE_STORAGE_LIB
+
 usage() {
-  echo "usage: setup-server.sh HOSTNAME staging|production, e.g. test.aishie.app staging" >&2
+  cat >&2 <<'EOF'
+usage: setup-server.sh HOSTNAME staging|production [--storage fs|aws|r2|b2|s3 OPTIONS], e.g. test.aishie.app staging
+Where Core keeps uploaded files, on a new server (the keys in AISHIE_S3_ACCESS_KEY
+and AISHIE_S3_SECRET_KEY, or asked for):
+EOF
+  sed -n 's/^#   \(--storage .*\)/  \1/p' "$storage_lib" >&2
   exit 2
 }
 # check_args HOST ENVIRONMENT
@@ -239,9 +271,8 @@ EOF
 DATABASE_URL=postgres://aishie_core:$core_pw@postgres:5432/aishie_core?sslmode=disable
 # It must never change: keep a copy off the server.
 SIGNING_KEY=$(secret 32)
-BLOB_STORE=fs
-BLOB_FS_ROOT=/data/blobs
 EOF
+  st_env_block "$(storage_store)" >> "$ETC/core.env.new"
   cat > "$ETC/runtime.env.new" <<EOF
 # The AIshieAgent Runtime's settings: every one is explained in
 # /opt/aishie/env/runtime.env.example. One NAME=value per line, no quotes,
@@ -256,7 +287,36 @@ EOF
     mv "$ETC/$f.env.new" "$ETC/$f.env"
   done
   echo "wrote $ETC/postgres.env, core.env and runtime.env, with generated passwords and SIGNING_KEY"
+  if [ "$(storage_store)" = s3 ]; then
+    echo "Core keeps the files people upload in $(st_describe), with the keys given, which core.env holds"
+  else
+    echo "Core keeps the files people upload on this server's disk, in $DATA/core/blobs"
+  fi
 }
+
+# choose_storage: where a new server's Core keeps the files people upload:
+# the options, else their variables, else asked when someone is there to
+# answer, else this server's disk. Asked before the long part of the run,
+# and checked once curl is installed. A server with a core.env keeps what it
+# says: said, when the options name another place, with how to move them.
+choose_storage() {
+  st_from_env
+  if [ -e "$ETC/core.env" ]; then
+    storage_new=
+    had=$(st_setting "$ETC/core.env" BLOB_STORE)
+    had=${had:-fs}
+    if [ -n "$ST_GIVEN" ] && [ "$(storage_store)" != "$had" ]; then
+      echo "warning: $ETC/core.env keeps uploaded files with BLOB_STORE=$had, and is left as it is: to move them, aishie storage migrate --to $(storage_store) (README.md, Where uploaded files are kept)" >&2
+    fi
+    return 0
+  fi
+  storage_new=1
+  if [ -z "$ST_KIND" ] && st_interactive; then st_choose; fi
+  st_gather
+  st_resolve
+}
+# storage_store: BLOB_STORE for the choice, fs or s3.
+storage_store() { if [ "${ST_KIND:-fs}" = fs ]; then echo fs; else echo s3; fi; }
 
 # make_dirs: the directories, each with its owner. The runtime (user 65532)
 # reads the agents and the secrets through their group; root writes them.
@@ -308,12 +368,12 @@ install_files() {
   install -m 644 "$here"/env/*.env.example "$APP/env/"
   install -m 644 "$here"/docs/*.md "$APP/docs/"
   install -d -m 755 "$BIN"
-  install -m 755 "$here/bin/aishie-update" "$here/bin/aishie" "$BIN/"
+  install -m 755 "$here/bin/aishie-update" "$here/bin/aishie" "$here/bin/aishie-storage" "$BIN/"
   install -d -m 755 "$UNITS"
   install -m 644 "$here"/systemd/aishie-update.service "$here"/systemd/aishie-update.timer \
     "$here"/systemd/aishie-backup.service "$here"/systemd/aishie-backup.timer "$UNITS/"
   umask 077
-  echo "installed the stack in $APP, aishie-update and aishie in $BIN, and the units in $UNITS"
+  echo "installed the stack in $APP, aishie-update, aishie and aishie-storage in $BIN, and the units in $UNITS"
 }
 
 # compose: the stack's, as aishie-update runs it.
@@ -355,17 +415,47 @@ EOF
 }
 
 main() {
-  [ $# -eq 2 ] || usage
-  name=$1 environment=$2
+  # HOSTNAME and ENVIRONMENT, and the storage options, before, between or
+  # after them, as --name value or --name=value.
+  name='' environment='' n=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --*=*) st_option "${1%%=*}" "${1#*=}" || usage ;;
+      --*)
+        [ $# -ge 2 ] || usage
+        st_option "$1" "$2" || usage
+        shift
+        ;;
+      -*) usage ;;
+      *)
+        n=$((n + 1))
+        case $n in
+          1) name=$1 ;;
+          2) environment=$1 ;;
+          *) usage ;;
+        esac
+        ;;
+    esac
+    shift
+  done
+  [ "$n" -eq 2 ] || usage
   check_args "$name" "$environment"
   [ "$(id -u)" = 0 ] || die "run this as root (sudo -i)"
   here=$(cd "$(dirname "$0")" && pwd)
   if [ ! -f "$here/stack.yaml" ] || [ ! -f "$here/bin/aishie-update" ]; then
     die "run the setup-server.sh of a whole copy of the repository: $here has no stack.yaml or bin/aishie-update"
   fi
+  choose_storage
 
   say "Packages"
   packages
+
+  if [ -n "$storage_new" ] && [ "$(storage_store)" = s3 ]; then
+    say "The bucket"
+    # Before anything is written: refused keys stop the run here, and the
+    # next run asks again.
+    st_check
+  fi
 
   say "Settings and secrets in $ETC"
   write_settings "$name" "$environment"
@@ -382,6 +472,12 @@ MSG
   write_secrets
   make_dirs
   make_kek
+  cors_left=
+  if [ -n "$storage_new" ] && [ "$(storage_store)" = s3 ]; then
+    say "The bucket's CORS rule"
+    host=$(sed -n 's/^HOST=//p' "$ETC/aishie.env" | tail -n 1)
+    st_cors "$host" apply || cors_left=1
+  fi
 
   say "The stack, the scripts and the timers"
   install_files "$here"
@@ -457,6 +553,13 @@ MSG
     echo "$n. Let this server pull the images it could not (above; a package that is not"
     echo "   published yet answers the same):"
     login_help
+    n=$((n + 1))
+  fi
+  if [ -n "$cors_left" ]; then
+    cat <<EOF
+$n. Give the bucket the CORS rule above: until it has it, uploads from the site
+   fail in the browser. aishie storage cors says whether it has it.
+EOF
     n=$((n + 1))
   fi
   if [ "$environment" = production ] && ! grep -q '^CORE_IMAGE=.' "$ETC/aishie.env"; then

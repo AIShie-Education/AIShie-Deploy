@@ -2,8 +2,10 @@
 # setup-server.sh against stand-ins. Its pure parts are sourced with
 # AISHIE_SETUP_LIB=1, in sh as the server runs them; then whole runs, as root
 # would make them, with docker, apt, ufw, systemctl and id played by
-# tests/fakes.sh and the stand-ins below. The first update is the real
-# aishie-update, against the fake registry.
+# tests/fakes.sh and the stand-ins below, and a bucket's S3 service by the
+# fake curl. The first update is the real aishie-update, against the fake
+# registry. tests/aishie-storage_test.sh has the rest of the bucket's
+# functions.
 #
 #   make test
 set -euo pipefail
@@ -56,6 +58,11 @@ EOF
 chmod +x "$work/bin"/*
 
 REG=ghcr.io/aishie-education
+AK=AKIAFAKEACCESSKEY0001
+# A secret with a $ in it, which core.env must quote.
+# shellcheck disable=SC2016 # the $ is the secret's
+SK='fake/Secret+Key$0123456789abcdefghijklmno'
+R2=0123456789abcdef0123456789abcdef
 A=$(printf 'a%.0s' $(seq 64))
 B=$(printf 'b%.0s' $(seq 64))
 C=$(printf 'c%.0s' $(seq 64))
@@ -73,7 +80,9 @@ setup() {
   export AISHIE_ETC=$FAKE/etc AISHIE_STATE=$FAKE/state AISHIE_APP=$FAKE/opt AISHIE_DATA=$FAKE/srv \
     AISHIE_BACKUPS=$FAKE/backups AISHIE_BIN=$FAKE/usr-local-bin AISHIE_UNITS=$FAKE/units \
     AISHIE_LOCK_FILE=$FAKE/lock AISHIE_LOG_FILE=$FAKE/log AISHIE_HEALTH_TRIES=3
-  unset PULL_FAIL CADDY_FAIL FLOCK_FAIL COMPOSE_PULL_FAIL APT_COMPOSE DOCKER_CE UFW_ACTIVE NOT_ROOT COMPOSE_VERSION INVOCATION_ID
+  unset PULL_FAIL CADDY_FAIL FLOCK_FAIL COMPOSE_PULL_FAIL APT_COMPOSE DOCKER_CE UFW_ACTIVE NOT_ROOT COMPOSE_VERSION INVOCATION_ID \
+    S3_LIST S3_HEAD S3_CORS_GET S3_CORS_PUT S3_DOWN AISHIE_STORAGE AISHIE_S3_BUCKET AISHIE_S3_REGION AISHIE_S3_ENDPOINT \
+    AISHIE_S3_PATH_STYLE AISHIE_R2_ACCOUNT_ID AISHIE_R2_JURISDICTION AISHIE_S3_ACCESS_KEY AISHIE_S3_SECRET_KEY
   image core "$A" v0.2.0 abc1234
   image runtime "$B" v0.4.0 bcd2345
   image web "$C" v0.3.0 cde3456
@@ -84,13 +93,15 @@ setup() {
 # lib FUNCTION ARGS...: one of setup-server.sh's functions, in sh.
 lib() { PATH="$work/bin:$PATH" AISHIE_SETUP_LIB=1 sh -c '. "$0"; "$@"' "$root/setup-server.sh" "$@"; }
 # setup_server ARGS...: a whole run, as root; chown and systemd are only
-# recorded (the tests are not root, and need not run under systemd).
+# recorded (the tests are not root, and need not run under systemd). With
+# ANSWERS, someone is there to answer, with that file's lines.
 setup_server() {
-  PATH="$work/bin:$PATH" AISHIE_SETUP_LIB=1 sh -c '
+  PATH="$work/bin:$PATH" AISHIE_SETUP_LIB=1 ASKED=${ANSWERS:+1} sh -c '
     . "$0"
     own() { echo "chown $*" >> "$CALLS"; }
     systemd() { true; }
-    main "$@"' "$root/setup-server.sh" "$@" < /dev/null > "$FAKE/out" 2>&1
+    if [ -n "$ASKED" ]; then st_interactive() { true; }; fi
+    main "$@"' "$root/setup-server.sh" "$@" < "${ANSWERS:-/dev/null}" > "$FAKE/out" 2>&1
 }
 called() { grep -q -- "$1" "$CALLS"; }
 said() { grep -q -- "$1" "$FAKE/out"; }
@@ -173,6 +184,11 @@ runtime_pw=$(setting postgres.env AISHIE_RUNTIME_DB_PASSWORD)
   fail "the runtime's DATABASE_URL does not match postgres.env"
 [[ $(setting core.env SIGNING_KEY) =~ ^[0-9a-f]{64}$ ]] || fail "SIGNING_KEY is not 32 random bytes in hex"
 [ "$(setting core.env BLOB_FS_ROOT)" = /data/blobs ] || fail "BLOB_FS_ROOT=$(setting core.env BLOB_FS_ROOT)"
+# Nobody to ask and no options: this server's disk, as before.
+[ "$(setting core.env BLOB_STORE)" = fs ] || fail "BLOB_STORE=$(setting core.env BLOB_STORE)"
+! grep -q '^S3_' "$AISHIE_ETC/core.env" || fail "S3 settings for a server on its disk: $(grep '^S3_' "$AISHIE_ETC/core.env")"
+said "Core keeps the files people upload on this server's disk" || fail "did not say where the files are kept"
+! called "aws-sigv4" || fail "asked a bucket something"
 [ "$(setting runtime.env KMS_KEY_ID)" = local:/secrets/kek/v1 ] || fail "KMS_KEY_ID=$(setting runtime.env KMS_KEY_ID)"
 # The key that will wrap the runtime's secrets: 32 random bytes, base64, in
 # the secrets directory, readable by the runtime's group alone.
@@ -194,7 +210,7 @@ for f in compose.yaml stack.yaml README.md caddy/Caddyfile postgres/initdb/10-ai
   cmp -s "$root/$f" "$AISHIE_APP/$f" || fail "$f not installed in $AISHIE_APP"
 done
 [ -x "$AISHIE_APP/postgres/initdb/10-aishie.sh" ] || fail "the init script is not executable"
-for f in aishie-update aishie; do
+for f in aishie-update aishie aishie-storage; do
   if ! cmp -s "$root/bin/$f" "$AISHIE_BIN/$f" || [ ! -x "$AISHIE_BIN/$f" ]; then fail "$f not installed in $AISHIE_BIN"; fi
 done
 for f in aishie-update.service aishie-update.timer aishie-backup.service aishie-backup.timer; do
@@ -247,6 +263,16 @@ said "kek/v1 is there already: left as it is" || fail "said: $(cat "$FAKE/out")"
 setup_server other.aishie.app staging || fail "exit $?: $(cat "$FAKE/out")"
 said "warning: .*aishie.env says HOST=test.aishie.app, not other.aishie.app" || fail "no warning: $(cat "$FAKE/out")"
 [ "$(setting aishie.env HOST)" = test.aishie.app ] || fail "HOST changed to $(setting aishie.env HOST)"
+
+# ... asked for a bucket then: said how to move the files, and core.env
+# left as it is.
+before=$(sums)
+AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server test.aishie.app staging --storage aws --s3-region ap-east-1 --s3-bucket aishie-files ||
+  fail "exit $?: $(cat "$FAKE/out")"
+said "warning: .*core.env keeps uploaded files with BLOB_STORE=fs, and is left as it is: to move them, aishie storage migrate --to s3" ||
+  fail "no warning: $(cat "$FAKE/out")"
+[ "$(sums)" = "$before" ] || fail "changed $AISHIE_ETC"
+! called "aws-sigv4" || fail "asked the bucket something"
 
 # ufw on: 80 and 443 opened, and nothing else.
 setup ufw
@@ -305,12 +331,113 @@ if CADDY_FAIL=1 setup_server test.aishie.app staging; then fail "passed while ca
 said "caddy validate refused" || fail "said: $(cat "$FAKE/out")"
 ! called "up -d --no-deps caddy" || fail "started Caddy"
 
+# A bucket of AWS's, by the options, for a run nobody answers, with the keys
+# in the environment: checked before anything is written, by reading alone,
+# then written to core.env, and given the CORS rule the site's uploads need.
+setup aws
+AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage aws --s3-region ap-east-1 --s3-bucket aishie-files test.aishie.app staging ||
+  fail "exit $?: $(cat "$FAKE/out")"
+[ "$(setting core.env BLOB_STORE)" = s3 ] || fail "BLOB_STORE=$(setting core.env BLOB_STORE)"
+[ "$(setting core.env S3_ENDPOINT)" = s3.ap-east-1.amazonaws.com ] || fail "S3_ENDPOINT=$(setting core.env S3_ENDPOINT)"
+[ "$(setting core.env S3_BUCKET)" = aishie-files ] || fail "S3_BUCKET=$(setting core.env S3_BUCKET)"
+[ "$(setting core.env S3_REGION)" = ap-east-1 ] || fail "S3_REGION=$(setting core.env S3_REGION)"
+[ "$(setting core.env S3_USE_SSL)" = true ] || fail "S3_USE_SSL=$(setting core.env S3_USE_SSL)"
+[ "$(setting core.env S3_ACCESS_KEY)" = "$AK" ] || fail "S3_ACCESS_KEY is not the key given"
+# In single quotes, for its $, which Compose would take for a variable.
+[ "$(setting core.env S3_SECRET_KEY)" = "'$SK'" ] || fail "S3_SECRET_KEY is not the secret given, quoted"
+[ "$(setting core.env BLOB_FS_ROOT)" = /data/blobs ] || fail "BLOB_FS_ROOT=$(setting core.env BLOB_FS_ROOT)"
+[[ $(setting core.env SIGNING_KEY) =~ ^[0-9a-f]{64}$ ]] || fail "no SIGNING_KEY, which Core needs with a bucket"
+[ "$(mode "$AISHIE_ETC/core.env")" = 600 ] || fail "core.env is $(mode "$AISHIE_ETC/core.env")"
+[ "$(grep -n 'aws-sigv4' "$CALLS" | head -n 1 | cut -d: -f1)" -lt "$(grep -n 'pull -q postgres caddy' "$CALLS" | head -n 1 | cut -d: -f1)" ] ||
+  fail "the bucket was not checked first"
+called "curl .*--aws-sigv4 aws:amz:ap-east-1:s3 .*https://aishie-files.s3.ap-east-1.amazonaws.com/?list-type=2&max-keys=1&prefix=courses%2F" ||
+  fail "the check: $(grep aws-sigv4 "$CALLS" | head -n 1)"
+[ "$(head -n 2 "$FAKE/s3-requests" | cut -d ' ' -f 1 | tr '\n' ' ')" = "GET HEAD " ] || fail "the check wrote: $(head -n 2 "$FAKE/s3-requests")"
+grep -qxF "user = \"$AK:$SK\"" "$FAKE/s3-keys" || fail "curl was not given the keys on its standard input"
+grep -qF '<AllowedOrigin>https://test.aishie.app</AllowedOrigin>' "$FAKE/s3-cors" || fail "no CORS rule for the site"
+said "Core keeps the files people upload in the bucket aishie-files of Amazon S3, in ap-east-1" || fail "said: $(cat "$FAKE/out")"
+said "the bucket has a CORS rule now: https://test.aishie.app may upload to it" || fail "said: $(cat "$FAKE/out")"
+! said "Give the bucket the CORS rule" || fail "asked for a CORS rule it has"
+grep -q "^CORE_REF=" "$AISHIE_STATE/images.env" || fail "stopped before the first update"
+for f in "$FAKE/out" "$CALLS" "$FAKE/log" "$FAKE/s3-requests"; do
+  if grep -qF -- "$SK" "$f"; then fail "the secret key is in $(basename "$f")"; fi
+done
+
+# R2 by the variables alone, but the bucket, as --name=value; B2 and
+# another service by their options.
+setup r2
+AISHIE_STORAGE=r2 AISHIE_R2_ACCOUNT_ID=$R2 AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server test.aishie.app staging --s3-bucket=files ||
+  fail "exit $?: $(cat "$FAKE/out")"
+[ "$(setting core.env S3_ENDPOINT) $(setting core.env S3_REGION) $(setting core.env S3_BUCKET)" = "$R2.r2.cloudflarestorage.com auto files" ] ||
+  fail "R2: $(setting core.env S3_ENDPOINT) $(setting core.env S3_REGION) $(setting core.env S3_BUCKET)"
+called "aws:amz:auto:s3 .*https://$R2.r2.cloudflarestorage.com/files/?list-type=2" || fail "R2's check: $(grep aws-sigv4 "$CALLS" | head -n 1)"
+setup b2
+AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage b2 --s3-region us-west-004 --s3-bucket files test.aishie.app staging ||
+  fail "exit $?: $(cat "$FAKE/out")"
+[ "$(setting core.env S3_ENDPOINT) $(setting core.env S3_REGION)" = "s3.us-west-004.backblazeb2.com us-west-004" ] ||
+  fail "B2: $(setting core.env S3_ENDPOINT) $(setting core.env S3_REGION)"
+setup s3
+AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage s3 --s3-endpoint https://s3.example.edu --s3-bucket files test.aishie.app staging ||
+  fail "exit $?: $(cat "$FAKE/out")"
+[ "$(setting core.env S3_ENDPOINT) $(setting core.env S3_REGION) $(setting core.env S3_USE_SSL)" = "s3.example.edu us-east-1 true" ] ||
+  fail "s3: $(setting core.env S3_ENDPOINT) $(setting core.env S3_REGION) $(setting core.env S3_USE_SSL)"
+called "https://s3.example.edu/files/?list-type=2" || fail "not by path: $(grep aws-sigv4 "$CALLS" | head -n 1)"
+
+# Asked, with someone to answer: the menu, then what the choice needs, the
+# secret not shown. Enter alone is this server's disk.
+setup asked
+printf '2\nap-east-1\naishie-files\n%s\n%s\n' "$AK" "$SK" > "$FAKE/answers"
+ANSWERS=$FAKE/answers setup_server test.aishie.app staging || fail "exit $?: $(cat "$FAKE/out")"
+said "Where should Core keep the files people upload?" || fail "not asked: $(cat "$FAKE/out")"
+said "Secret access key (not shown): " || fail "the secret not asked for: $(cat "$FAKE/out")"
+[ "$(setting core.env S3_BUCKET) $(setting core.env S3_REGION)" = "aishie-files ap-east-1" ] || fail "answers: $(setting core.env S3_BUCKET) $(setting core.env S3_REGION)"
+[ "$(setting core.env S3_SECRET_KEY)" = "'$SK'" ] || fail "S3_SECRET_KEY is not the secret typed"
+if grep -qF -- "$SK" "$FAKE/out"; then fail "the secret typed is in the output"; fi
+setup asked-disk
+echo > "$FAKE/answers"
+ANSWERS=$FAKE/answers setup_server test.aishie.app staging || fail "exit $?: $(cat "$FAKE/out")"
+[ "$(setting core.env BLOB_STORE)" = fs ] || fail "Enter alone: BLOB_STORE=$(setting core.env BLOB_STORE)"
+
+# The keys refused: the run stops before it writes anything, and says why,
+# without the service's whole answer, which names the key.
+setup keys-refused
+if S3_LIST=403 AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage aws --s3-region ap-east-1 --s3-bucket aishie-files test.aishie.app staging; then
+  fail "passed with the keys refused"
+fi
+said "setup-server.sh: the keys were refused, or may not list the bucket's objects (SignatureDoesNotMatch" || fail "said: $(cat "$FAKE/out")"
+if [ -e "$AISHIE_ETC/aishie.env" ] || [ -e "$AISHIE_ETC/core.env" ]; then fail "wrote settings"; fi
+! said "$AK" || fail "printed the access key"
+# ... or nothing given that the choice needs, and nobody to ask: nothing done.
+setup missing
+if AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage aws --s3-region ap-east-1 test.aishie.app staging; then fail "passed without a bucket"; fi
+said "aws needs the bucket's name (--s3-bucket): nothing was changed" || fail "said: $(cat "$FAKE/out")"
+if [ -s "$CALLS" ] || [ -e "$AISHIE_ETC" ]; then fail "did something"; fi
+if setup_server --storage aws --s3-region ap-east-1 --s3-bucket aishie-files test.aishie.app staging; then fail "passed without keys"; fi
+said "aws needs its access key (AISHIE_S3_ACCESS_KEY)" || fail "said: $(cat "$FAKE/out")"
+if AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage s3 --s3-endpoint http://minio.example.edu --s3-bucket files test.aishie.app staging; then
+  fail "took an http:// endpoint"
+fi
+said "refuse to send it to an http:// address" || fail "said: $(cat "$FAKE/out")"
+
+# Keys that may not set the bucket's CORS rules: the rule, where to set it,
+# and a step of what is left; the rest goes on.
+setup cors-refused
+S3_CORS_PUT=403 AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage r2 --r2-account-id "$R2" --s3-bucket files test.aishie.app staging ||
+  fail "exit $?: $(cat "$FAKE/out")"
+said "these keys may not set one (HTTP 403)" || fail "said: $(cat "$FAKE/out")"
+said '"AllowedOrigins": \["https://test.aishie.app"\]' || fail "no rule: $(cat "$FAKE/out")"
+said "R2 Object Storage, files, Settings, CORS" || fail "no R2 dashboard steps: $(cat "$FAKE/out")"
+said "Give the bucket the CORS rule above" || fail "not in what is left: $(cat "$FAKE/out")"
+[ "$(setting core.env BLOB_STORE)" = s3 ] || fail "BLOB_STORE=$(setting core.env BLOB_STORE)"
+grep -q "^CORE_REF=" "$AISHIE_STATE/images.env" || fail "stopped before the first update"
+
 # Not root, or wrong arguments: nothing is done.
 setup not-root
 if NOT_ROOT=1000 setup_server test.aishie.app staging; then fail "ran as a user"; fi
 said "run this as root" || fail "said: $(cat "$FAKE/out")"
 [ ! -s "$CALLS" ] || fail "ran something: $(head -n 3 "$CALLS")"
-for args in "" "test.aishie.app" "test.aishie.app dev" "bad_name staging" "a b c"; do
+for args in "" "test.aishie.app" "test.aishie.app dev" "bad_name staging" "a b c" "--storage aws" \
+  "test.aishie.app staging --bogus x" "test.aishie.app staging --storage" "-x test.aishie.app staging"; do
   setup usage
   # shellcheck disable=SC2086 # the arguments, split
   if setup_server $args; then fail "took «$args»"; fi

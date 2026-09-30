@@ -1,7 +1,8 @@
 # shellcheck shell=bash
-# Stand-ins for the programs aishie-update and aishie call, for the tests:
-# docker (and docker compose), curl, flock, sleep and logger. Each records
-# its command line in $CALLS, and keeps what it plays in $FAKE:
+# Stand-ins for the programs aishie-update, aishie and aishie-storage call,
+# for the tests: docker (and docker compose, and rclone's container), curl
+# (and an S3 service), flock, sleep and logger. Each records its command
+# line in $CALLS, and keeps what it plays in $FAKE:
 #
 #   registry/tags          "REF HEX" lines: the image a tag names now, by
 #                          its digest's hex; the last line for a tag wins
@@ -16,10 +17,26 @@
 #   compose-version        what `docker compose version --short` says
 #                          (else COMPOSE_VERSION, else 2.27.0)
 #   volumes/NAME           a volume Docker has
+#   on-stop                run by `docker compose stop` (a test's hook: an
+#                          upload while Core stops, say)
+#
+#   bucket/KEY             the S3 bucket's objects, which rclone's container
+#                          lists, copies and checks (tests/rclone-fake)
+#   bucket-types/KEY       the content type each object was given
+#   s3-keys                the curl configuration curl read on its standard
+#                          input, with the keys it signed with
+#   s3-requests            "METHOD URL" of each request to the bucket
+#   s3-cors                the bucket's CORS rules, as PUT
 #
 # Knobs, in the environment: PULL_FAIL, MIGRATE_FAIL, SEED_FAIL, CHECK_FAIL,
 # BACKUP_FAIL, POSTGRES_FAIL, CADDY_FAIL, COMPOSE_PULL_FAIL and FLOCK_FAIL make
-# that step fail. BOOTSTRAP_TOKEN has a one-off bootstrap print it as a Core
+# that step fail. The S3 service answers a listing with S3_LIST (200, or
+# 301, 400, 403, 404), a HEAD with S3_HEAD (404), GET ?cors= with S3_CORS_GET
+# (the rules PUT, else 404; "other" for rules of another site's; or a
+# status) and PUT ?cors= with S3_CORS_PUT (200); S3_DOWN has it not answer.
+# RCLONE_PULL_FAIL fails the pull of rclone's image, RCLONE_FAIL every rclone,
+# RCLONE_CORRUPT=KEY has a copy of KEY arrive with other bytes of the same
+# size, and RCLONE_ATTACH is below. BOOTSTRAP_TOKEN has a one-off bootstrap print it as a Core
 # from before people held no API tokens prints root's: under a heading on
 # standard error, the token alone on standard output.
 
@@ -61,7 +78,10 @@ compose() {
     "version --short") cat "$FAKE/compose-version" 2>/dev/null || echo "${COMPOSE_VERSION:-2.27.0}" ;;
     "pull -q "*) exit "${COMPOSE_PULL_FAIL:-0}" ;;
     "up -d --no-recreate --wait"*) exit "${POSTGRES_FAIL:-0}" ;;
-    "up -d --no-deps "*) service_image "$4" > "$FAKE/running/$4" ;;
+    "up -d --no-deps "*) service_image "$4" > "$FAKE/running/$4"; rm -f "$FAKE/stopped-$4" ;;
+    "stop "*)
+      touch "$FAKE/stopped-$2"
+      if [ -x "$FAKE/on-stop" ]; then "$FAKE/on-stop"; fi ;;
     "rm -s -f "*) rm -f "$FAKE/running/$4" ;;
     "run -d --no-deps "*)
       svc=$4
@@ -101,6 +121,12 @@ case $1 in
   compose) shift; compose "$@" ;;
   pull)
     ref=${*: -1}
+    case $ref in
+      rclone/rclone:*@sha256:*)
+        if [ -n "${RCLONE_PULL_FAIL:-}" ]; then echo "Error response from daemon: toomanyrequests: rate limit" >&2; exit 1; fi
+        echo "$ref"
+        exit 0 ;;
+    esac
     if [ "${PULL_FAIL:-0}" != 0 ]; then echo "Error response from daemon: denied: denied" >&2; exit 1; fi
     h=$(hex_of "$ref") || { echo "Error response from daemon: manifest unknown" >&2; exit 1; }
     printf '%s %s\n%s@sha256:%s %s\n' "$ref" "$h" "$(repo_of "$ref")" "$h" "$h" >> "$FAKE/local"
@@ -122,6 +148,8 @@ case $1 in
   version) echo 29.0.0 ;;
   volume) [ "$2" = inspect ] && [ -e "$FAKE/volumes/$3" ] || exit 1 ;;
   run)
+    # aishie-storage: rclone, in its image.
+    case "$*" in *" rclone/rclone:"*) exec "$(dirname "$0")/rclone-fake" "$@" ;; esac
     # aishie runtime-status: a wget in the runtime's network namespace.
     case "$*" in *"--entrypoint wget"*) echo '{"worker":"w","agents":[]}'; exit 0 ;; esac
     # setup-server.sh: caddy validate of the Caddyfile, in Caddy's image.
@@ -138,9 +166,69 @@ exit 0
 EOF
   cat > "$1/curl" <<'EOF'
 #!/usr/bin/env bash
-# The health checks, as the image each service runs would answer them.
+# The health checks, as the image each service runs would answer them; and
+# a request signed for S3 (--aws-sigv4), as a bucket would answer it.
 set -u
 echo "curl $*" >> "$CALLS"
+if [[ " $* " == *" --aws-sigv4 "* ]]; then
+  cat > "$FAKE/s3-keys"
+  args=("$@")
+  method=GET out=/dev/null fmt='' body=''
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    case ${args[i]} in
+      -X) method=${args[i + 1]} ;;
+      -I) method=HEAD ;;
+      -o) out=${args[i + 1]} ;;
+      -w) fmt=${args[i + 1]} ;;
+      --data-binary) body=${args[i + 1]#@} ;;
+    esac
+  done
+  url=${args[${#args[@]} - 1]}
+  echo "$method $url" >> "$FAKE/s3-requests"
+  if [ -n "${S3_DOWN:-}" ]; then
+    [[ $fmt != *http_code* ]] || printf 000
+    echo "curl: (6) Could not resolve host: ${url#https://}" >&2
+    exit 6
+  fi
+  # An error as S3 writes one, with the access key in it, as AWS's do.
+  error() {
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n<Error><Code>%s</Code><Message>%s</Message>%s<AWSAccessKeyId>%s</AWSAccessKeyId></Error>\n' \
+      "$1" "$2" "${3:-}" "$(sed -n 's/^user = "\([^:]*\):.*/\1/p' "$FAKE/s3-keys")"
+  }
+  : > "$out"
+  case "$method $url" in
+    "GET "*"?cors=")
+      code=${S3_CORS_GET:-}
+      if [ -z "$code" ] && [ -f "$FAKE/s3-cors" ]; then
+        code=200
+        cat "$FAKE/s3-cors" > "$out"
+      elif [ -z "$code" ]; then
+        code=404
+        error NoSuchCORSConfiguration "The CORS configuration does not exist" > "$out"
+      elif [ "$code" = other ]; then
+        code=200
+        echo '<CORSConfiguration><CORSRule><AllowedOrigin>https://elsewhere.example</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>' > "$out"
+      else
+        error AccessDenied "Access Denied" > "$out"
+      fi ;;
+    "PUT "*"?cors=")
+      code=${S3_CORS_PUT:-200}
+      if [ "$code" = 200 ]; then cp "$body" "$FAKE/s3-cors"; else error AccessDenied "Access Denied" > "$out"; fi ;;
+    "GET "*"?list-type=2&max-keys=1&prefix=courses%2F")
+      code=${S3_LIST:-200}
+      case $code in
+        200) echo '<ListBucketResult><KeyCount>0</KeyCount></ListBucketResult>' > "$out" ;;
+        301) error PermanentRedirect "The bucket you are attempting to access must be addressed using the specified endpoint." > "$out" ;;
+        400) error AuthorizationHeaderMalformed "The authorization header is malformed; the region 'us-east-1' is wrong; expecting 'eu-west-1'" '<Region>eu-west-1</Region>' > "$out" ;;
+        403) error SignatureDoesNotMatch "The request signature we calculated does not match the signature you provided. Check your key and signing method." > "$out" ;;
+        404) error NoSuchBucket "The specified bucket does not exist" > "$out" ;;
+      esac ;;
+    "HEAD "*) code=${S3_HEAD:-404} ;;
+    *) code=400 ;;
+  esac
+  [[ $fmt != *http_code* ]] || printf '%s' "$code"
+  exit 0
+fi
 url=${*: -1}
 case $url in
   *:8080/*) svc=core ;;
@@ -163,6 +251,109 @@ EOF
 #!/bin/sh
 echo "flock $*" >> "$CALLS"
 exit "${FLOCK_FAIL:-0}"
+EOF
+  cat > "$1/rclone-fake" <<'EOF'
+#!/usr/bin/env bash
+# rclone in its image, as aishie-storage runs it (docker run --rm -e ...
+# -v HOST:PATH[:ro]... IMAGE ARGS...), with the bucket, dst:NAME, played by
+# $FAKE/bucket: lsf, copy, lsjson and check, with the options aishie-storage
+# gives them. As rclone does, each passes over a file --files-from names
+# that the source does not have. RCLONE_ATTACH=KEY has the first copy find
+# KEY moved to attached/KEY in the bucket since it was listed, as Core moves
+# an upload it attaches.
+set -euo pipefail
+declare -A mount ro
+while [ $# -gt 0 ]; do
+  case $1 in
+    -v)
+      IFS=: read -r h c m <<< "$2"
+      mount[$c]=$h
+      ro[$c]=${m:-}
+      shift 2 ;;
+    -e) shift 2 ;;
+    rclone/rclone:*) shift; break ;;
+    *) shift ;;
+  esac
+done
+echo "rclone $*" >> "$CALLS"
+if [ -n "${RCLONE_FAIL:-}" ]; then echo "ERROR : failing, as the test asks" >&2; exit 1; fi
+[ -f "${mount[/work]}/rclone.conf" ] || { echo "no rclone.conf in /work" >&2; exit 1; }
+# here PATH: where a path in the container, or dst:BUCKET/..., is here.
+here() {
+  case $1 in
+    dst:*) p=${1#dst:}; p=${p#*/}; [ "$p" = "${1#dst:}" ] && p=''; echo "$FAKE/bucket${p:+/$p}" ;;
+    /work*) echo "${mount[/work]}${1#/work}" ;;
+    /data/blobs*) [ -n "${mount[/data/blobs]:-}" ] || { echo "/data/blobs is not mounted" >&2; exit 1; }; echo "${mount[/data/blobs]}${1#/data/blobs}" ;;
+    *) echo "a path rclone would not find: $1" >&2; exit 1 ;;
+  esac
+}
+cmd=$1
+shift
+from='' type='' size_only='' format=p pos=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    --files-from) from=$(here "$2"); shift 2 ;;
+    --header-upload) type=${2#Content-Type: }; shift 2 ;;
+    --format) format=$2; shift 2 ;;
+    --transfers | --checkers | --stats | --stats-log-level) shift 2 ;;
+    --size-only) size_only=1; shift ;;
+    -*) shift ;;
+    *) pos+=("$1"); shift ;;
+  esac
+done
+case $cmd in
+  lsf)
+    d=$(here "${pos[0]}")
+    [ -d "$d" ] || { echo "directory not found" >&2; exit 3; }
+    # Each line the fields --format names, in its order: p the path, s the
+    # size.
+    f=$(sed 's/p/%P;/g; s/s/%s;/g; s/;$//' <<< "$format")
+    (cd "$d" && find . -type f -printf "$f\n" | sort) ;;
+  copy)
+    src=$(here "${pos[0]}") dst=$(here "${pos[1]}")
+    [ "${pos[1]}" != /data/blobs ] || [ -z "${ro[/data/blobs]:-}" ] || { echo "/data/blobs is read-only" >&2; exit 1; }
+    if [ -n "${RCLONE_ATTACH:-}" ] && [ -f "$FAKE/bucket/$RCLONE_ATTACH" ]; then
+      for d in bucket bucket-types; do
+        mkdir -p "$(dirname "$FAKE/$d/attached/$RCLONE_ATTACH")"
+        mv "$FAKE/$d/$RCLONE_ATTACH" "$FAKE/$d/attached/$RCLONE_ATTACH"
+      done
+    fi
+    while read -r k; do
+      [ -f "$src/$k" ] || continue
+      mkdir -p "$(dirname "$dst/$k")"
+      cp "$src/$k" "$dst/$k"
+      if [[ ${pos[1]} == dst:* ]]; then
+        mkdir -p "$(dirname "$FAKE/bucket-types/$k")"
+        printf '%s
+' "${type:-application/octet-stream}" > "$FAKE/bucket-types/$k"
+      fi
+      if [ "$k" = "${RCLONE_CORRUPT:-}" ]; then printf X | dd of="$dst/$k" bs=1 count=1 conv=notrunc status=none; fi
+    done < "$from" ;;
+  lsjson)
+    echo "["
+    sep=''
+    while read -r k; do
+      [ -f "$FAKE/bucket/$k" ] || continue
+      t=$(cat "$FAKE/bucket-types/$k" 2>/dev/null || echo application/octet-stream)
+      printf '%s{"Path":"%s","Name":"%s","Size":%s,"MimeType":"%s","ModTime":"","IsDir":false}' \
+        "$sep" "$k" "${k##*/}" "$(stat -c %s "$FAKE/bucket/$k")" "$(printf '%s' "$t" | sed 's/[\\"]/\\&/g')"
+      sep=$',\n'
+    done < "$from"
+    printf '\n]\n' ;;
+  check)
+    src=$(here "${pos[0]}") dst=$(here "${pos[1]}")
+    n=0
+    while read -r k; do
+      if [ ! -f "$src/$k" ]; then continue
+      elif [ ! -f "$dst/$k" ]; then n=$((n + 1)); echo "ERROR : $k: file not in the destination" >&2
+      elif [ -n "$size_only" ]; then [ "$(stat -c %s "$src/$k")" = "$(stat -c %s "$dst/$k")" ] || n=$((n + 1))
+      elif ! cmp -s "$src/$k" "$dst/$k"; then n=$((n + 1)); echo "ERROR : $k: md5 differ" >&2
+      fi
+    done < "$from"
+    echo "NOTICE: $n differences found" >&2
+    [ "$n" = 0 ] ;;
+  *) echo "rclone $cmd: not played here" >&2; exit 1 ;;
+esac
 EOF
   printf '#!/bin/sh\nexit 0\n' > "$1/sleep"
   cat > "$1/logger" <<'EOF'

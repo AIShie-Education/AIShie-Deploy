@@ -12,6 +12,7 @@
 #   aishie logs SERVICE [OPTIONS]  core, runtime, web, caddy or postgres
 #   aishie ps                      the stack's containers
 #   aishie backup                  both databases, now, as the nightly backup does
+#   aishie storage [COMMAND]       where Core keeps uploaded files, and moving them (aishie storage help)
 #   aishie compose ARGS...         docker compose for the stack, e.g. aishie compose up -d core
 #
 # `aishie core ...` and `aishie runtime ...` run a one-off container of the
@@ -26,6 +27,10 @@
 # in to the site with that email and password: people hold no API tokens,
 # only agents do. The long form, with `aishie core bootstrap`, does the same
 # in three steps.
+#
+# `aishie storage` is aishie-storage, beside this: where Core keeps the files
+# people upload, this server's disk or a bucket, its check and CORS rule,
+# and `migrate`, which moves the files from one to the other.
 #
 # `aishie backup` is what aishie-backup.timer runs every night: the two
 # databases dumped to /var/backups/aishie/SERVICE-daily-N.dump, N the day of
@@ -181,6 +186,10 @@ case ${1:-} in
   backup)
     [ $# -eq 1 ] || usage
     backup
+    ;;
+  storage)
+    shift
+    exec "$(dirname "$0")/aishie-storage" "$@"
     ;;
   *) usage ;;
 esac

@@ -42,11 +42,12 @@ In this repository, and where `setup-server.sh` puts it:
 | | `/etc/aishie/runtime/agents/` | the agents' YAML, mounted read-only at `/config` |
 | | `/etc/aishie/runtime/secrets/` | their secrets, and `kek/v1`, mounted read-only at `/secrets` |
 | | `/var/lib/aishie/images.env` | what each service runs, by digest; `aishie-update` writes it |
-| | `/srv/aishie/core/` | the files people upload to Core |
+| | `/srv/aishie/core/` | the files people upload to Core, when it keeps them on this disk ([Where uploaded files are kept](#where-uploaded-files-are-kept)) |
 | | `/var/backups/aishie/` | the database backups |
 | | `/var/log/aishie-update.log` | one line per update outcome |
 | `bin/aishie-update` | `/usr/local/bin/` | the updater |
 | `bin/aishie` | `/usr/local/bin/` | one-off commands, logs, backups |
+| `bin/aishie-storage` | `/usr/local/bin/` | `aishie storage`: where Core keeps uploaded files, and moving them |
 | `systemd/` | `/etc/systemd/system/` | `aishie-update.timer` (every 5 minutes), `aishie-backup.timer` (nightly) |
 | `setup-server.sh` | | sets a server up, and updates the above on it |
 
@@ -104,6 +105,13 @@ institution allows for that.
    ```
    sh AIShie-Deploy/setup-server.sh test.aishie.app staging
    ```
+
+   When someone is at the terminal, it first asks where Core keeps the
+   files people upload: this server's disk (Enter), or a bucket of Amazon
+   S3, Cloudflare R2, Backblaze B2 or another S3-compatible service, with
+   its keys ([Where uploaded files are kept](#where-uploaded-files-are-kept)
+   says how to choose, and the options for a run nobody answers). A bucket
+   is checked with the keys before anything is written.
 
    It installs Docker Engine and the compose plugin if they are missing.
    On Ubuntu 24.04 that is Ubuntu's own `docker.io` and `docker-compose-v2`
@@ -224,6 +232,7 @@ As root on the server:
 | `aishie runtime …` | the runtime's: `check --live`, `migrate version`, `help` |
 | `aishie runtime-status` | the runtime's `/status`: agents, seats, spend (it answers its own loopback only, which is what this reaches) |
 | `aishie compose …` | `docker compose` for the stack, with its settings files |
+| `aishie storage` | where Core keeps uploaded files; `check`, `cors`, and `migrate`, which moves them ([Where uploaded files are kept](#where-uploaded-files-are-kept)) |
 
 `curl -s 127.0.0.1:8080/healthz`, `curl -s 127.0.0.1:9090/healthz` and
 `curl -s 127.0.0.1:8081/version.json` say what each runs.
@@ -388,6 +397,228 @@ The runtime's administrators (Core's root and admins, or those
 `ADMIN_ACTOR_IDS` names) read today's use of the plan per person at
 `https://HOST/runtime/api/v1/admin/school-plan/usage`.
 
+## Where uploaded files are kept
+
+Core keeps the files people upload (lecture notes, submissions, marked
+work) in one of two places, chosen when the server is set up and moved
+later with `aishie storage migrate`:
+
+- **This server's disk** (`BLOB_STORE=fs`, the default): under
+  `/srv/aishie/core/blobs`. Every upload and every download goes through
+  the server, over its bandwidth, and the disk must grow with the files.
+- **A bucket of an S3 service** (`BLOB_STORE=s3`): Core gives each browser
+  a link it signs, good for minutes, and the browser uploads to the bucket
+  and downloads from it directly. The bytes never pass through the server,
+  so uploads and downloads go as fast as the bucket's region allows, and
+  the server's disk holds none of them.
+
+### Choosing a provider
+
+| `--storage` | Service | What setup-server.sh asks for | Core's `S3_ENDPOINT` |
+| --- | --- | --- | --- |
+| `fs` | this server's disk | nothing | none |
+| `aws` | Amazon S3 | region, bucket, access key and secret | `s3.<region>.amazonaws.com` |
+| `r2` | Cloudflare R2 | account ID, bucket, an R2 API token's access key and secret | `<account>.r2.cloudflarestorage.com`, region `auto` |
+| `b2` | Backblaze B2 | region (from the bucket's endpoint, `s3.<region>.backblazeb2.com`), bucket, keyID and applicationKey | `s3.<region>.backblazeb2.com` |
+| `s3` | another S3-compatible service | endpoint (`HOST[:PORT]`, HTTPS), region (`us-east-1` unless given), bucket, path-style (yes), keys | as given |
+
+**Near the people who use it.** Browsers talk to the bucket's region
+directly, so what matters most is that it is close to them: for a school in
+Hong Kong, AWS's `ap-east-1` (Hong Kong; an AWS account turns it on before
+using it) or `ap-southeast-1` (Singapore), or an R2 bucket made with the
+location hint Asia-Pacific. B2 picks its region when the account is made:
+check that it is near your users. Core, on the server, reaches the bucket
+too, when a file is attached (a copy and a delete in the bucket) and when
+its sweep runs; signing a link needs no request. So a bucket far from the
+server makes attaching a file a little slower, and nothing else.
+
+**What it costs**, in a sentence each (each provider's pricing page has
+the numbers, for the region):
+
+- *This server's disk*: nothing beyond the server itself, but every byte
+  up and down uses its bandwidth, and a bigger disk, and its backups, cost
+  what the server's provider charges for them.
+- *Amazon S3*: storage by the gigabyte-month, each request (uploads,
+  downloads, lists), and data transferred out to the internet, which is
+  every download people make.
+- *Cloudflare R2*: storage by the gigabyte-month and each operation (writes
+  and lists, reads), and nothing for data transferred out.
+- *Backblaze B2*: storage by the gigabyte-month; downloads are free up to a
+  multiple of what is stored, and charged beyond it; its pricing page says
+  which API calls cost what.
+- *Another service*: storage, requests and data out, each in its own way.
+
+A move to a bucket costs one upload per file; a move back downloads what
+the disk lacks (everything, once its copy is removed), which AWS charges
+as data out.
+
+**Limits of Core today.** Core's S3 client (minio-go 7.3.0) addresses a
+bucket by its path (`https://HOST/BUCKET/KEY`) at every endpoint but
+AWS's, Google's and Aliyun's, and has no setting for virtual-hosted
+addressing, so a service that takes only that cannot be used yet
+(setup-server.sh refuses `--s3-path-style no`). At AWS it sends each
+request to the endpoint of the bucket's region from a table of its own,
+and a region missing from it to us-east-1's, so a bucket in a region newer
+than that table does not work with it yet: setup-server.sh takes only the
+regions it has (`ST_AWS_REGIONS` in `bin/aishie-storage`). The endpoint must be HTTPS: browsers
+upload from the site's `https://` pages, and refuse to send to `http://`.
+
+### Setting it up
+
+Asked when setup-server.sh runs at a terminal; for a run nobody answers,
+options (before or after the name and environment) or their variables,
+with the keys in the environment, where no command line, and no shell
+history, has them (in bash, root's shell; or from wherever your automation
+keeps secrets):
+
+```
+read -r AISHIE_S3_ACCESS_KEY; read -rs AISHIE_S3_SECRET_KEY; export AISHIE_S3_ACCESS_KEY AISHIE_S3_SECRET_KEY
+sh AIShie-Deploy/setup-server.sh test.aishie.app staging --storage aws --s3-region ap-east-1 --s3-bucket aishie-files
+sh AIShie-Deploy/setup-server.sh test.aishie.app staging --storage r2 --r2-account-id <32 hex digits> --s3-bucket aishie-files
+sh AIShie-Deploy/setup-server.sh test.aishie.app staging --storage b2 --s3-region us-west-004 --s3-bucket aishie-files
+sh AIShie-Deploy/setup-server.sh test.aishie.app staging --storage s3 --s3-endpoint s3.example.com --s3-region nl-ams --s3-bucket aishie-files
+```
+
+The variables are `AISHIE_STORAGE`, `AISHIE_S3_BUCKET`, `AISHIE_S3_REGION`,
+`AISHIE_S3_ENDPOINT`, `AISHIE_S3_PATH_STYLE`, `AISHIE_R2_ACCOUNT_ID` and
+`AISHIE_R2_JURISDICTION` (`eu` or `fedramp`, for an R2 bucket in one).
+With none of them, and nobody to answer, it is this server's disk, as
+before. On a server set up already, `core.env` is left as it is, and
+setup-server.sh says so when the options name another place:
+`aishie storage migrate` moves the files.
+
+The bucket is made beforehand, private (links Core signs need no public
+access), with keys that may do what Core does and no more:
+
+- *AWS*: an IAM user or role whose policy allows `s3:ListBucket` on
+  `arn:aws:s3:::BUCKET`, and `s3:GetObject`, `s3:PutObject` and
+  `s3:DeleteObject` on `arn:aws:s3:::BUCKET/*`; with `s3:GetBucketCORS` and
+  `s3:PutBucketCORS` on the bucket as well, setup-server.sh sets the CORS
+  rule itself.
+- *R2*: an R2 API token with Object Read & Write, for that bucket alone.
+  The account ID is in the bucket's S3 API address,
+  `https://<account>.r2.cloudflarestorage.com/<bucket>`.
+- *B2*: an application key for that bucket alone, with read and write
+  access. The bucket's page shows its endpoint, `s3.<region>.backblazeb2.com`.
+
+**The check.** Before it writes anything, setup-server.sh reaches the
+bucket with the keys, as Core will, by reading alone: it lists at most one
+key and asks for an object that is not there (Core does the same when it
+starts). A write-and-delete of a probe object would also prove that the
+keys may write, but it can fail half way and leave the probe behind, and
+in a bucket with versioning or object lock it leaves a version or a delete
+marker that stays; reading cannot harm anything. The first upload, or
+`aishie storage migrate`, shows that the keys may write. Refused keys, a
+wrong region or a missing bucket stop the run with the service's own
+reason (its code and message, not its whole answer, which names the key),
+and nothing is written. `aishie storage check` does it again at any time.
+
+**The keys** are never on a command line and never printed: curl reads
+them on its standard input, rclone from a file of root's that is removed
+when it ends, and `core.env` (0600, like the other env files) keeps them
+for Core, a secret with a `$` in it in single quotes.
+
+### The CORS rule
+
+The site's pages upload to the bucket with a `PUT` carrying a
+`Content-Type`, which the browser first asks the bucket about, and may
+read from it with a `GET`; the bucket must allow the site's origin:
+
+```
+[
+  {
+    "AllowedOrigins": ["https://test.aishie.app"],
+    "AllowedMethods": ["GET", "HEAD", "PUT"],
+    "AllowedHeaders": ["content-type"],
+    "MaxAgeSeconds": 3600
+  }
+]
+```
+
+setup-server.sh (and `aishie storage migrate`) sets it through the S3 API
+(`PutBucketCors`, which R2 and B2 take too) when the bucket has no CORS
+rules and the keys may set them. A bucket with rules of its own is left
+alone, since that call replaces them all. Otherwise it prints the rule for
+the site's `HOST`, and where to set it:
+
+- *AWS console*: S3, Buckets, the bucket, Permissions, Cross-origin
+  resource sharing (CORS), Edit: paste it (beside any rules there), Save
+  changes.
+- *Cloudflare dashboard*: R2 Object Storage, the bucket, Settings, CORS
+  Policy, Add CORS policy: paste it in the JSON tab, Save.
+- *Backblaze*: the web console's CORS settings are presets; this rule goes
+  through the S3 API, with a key that may change the bucket (writeBuckets),
+  such as the master application key, below.
+- *Anywhere*: `aishie storage cors --apply --ask-keys` sets it with keys
+  that may, typed when asked and not kept. `aishie storage cors` says
+  whether the bucket has it.
+
+Until it has it, uploads from the site fail in the browser (its console
+says CORS). Downloads are links, which need no rule.
+
+### Moving the files: `aishie storage migrate`
+
+```
+aishie storage migrate --to s3 --dry-run --storage aws --s3-region ap-east-1 --s3-bucket aishie-files
+aishie storage migrate --to s3 --storage aws --s3-region ap-east-1 --s3-bucket aishie-files
+```
+
+with the keys in `AISHIE_S3_ACCESS_KEY` and `AISHIE_S3_SECRET_KEY`, or
+typed when asked. The dry run checks the bucket, lists both sides and says
+how many files there are, how many are in the bucket already, and how many
+it would copy, and changes nothing. The move then:
+
+1. checks the bucket, and sets or checks its CORS rule (it stops here,
+   before copying, when the rule is missing and it cannot set it);
+2. copies every file under the key Core reads it by: a file's path under
+   `/data/blobs` is its object's key (`courses/<course>/<upload>`, and
+   `attached/courses/…` after a move back), with the content type its
+   `.meta` says; not the `.meta` files, nor a file without one (an upload
+   or a delete that stopped half way, which Core does not serve);
+3. checks every file on both sides, by size and by checksum (the MD5 of the
+   bytes against the object's ETag), while Core runs;
+4. takes aishie-update's lock, stops Core, copies what was uploaded
+   meanwhile, and checks again: a few minutes in which the site is down;
+5. writes `BLOB_STORE=s3` and the bucket's settings in `core.env`, keeping
+   the one before as `core.env.before-storage-<time>`, and starts Core,
+   which must report healthy within a minute; if it does not, `core.env` is
+   put back and Core started on it again.
+
+It copies with rclone 1.75.1 in its container (`rclone/rclone`, pinned by
+digest in `bin/aishie-storage`), which is pulled the first time; nothing
+is installed on the server. Stopped part way, or failing a check, it
+changes nothing, starts Core again if it had stopped it, and goes on from
+where it was when it is run again: it copies only what the bucket lacks.
+For a bucket whose ETags are not MD5s (one encrypted with SSE-KMS, say),
+`--size-only` checks sizes alone.
+
+The disk keeps its copy, which nothing reads once Core is on the bucket:
+remove it (`rm -r /srv/aishie/core/blobs`) when you are sure, or keep it
+until then. `aishie storage` says where the files are, and how many the
+disk holds.
+
+### Going back
+
+- *Core does not come up on the bucket*: the move puts `core.env` back by
+  itself (above), and the disk still has every file.
+- *Later*: `aishie storage migrate --to fs` (a `--dry-run` first) copies
+  from the bucket what the disk lacks, which is what was uploaded since,
+  writes each file's `.meta` as Core's disk store does (its size, its
+  content type, its SHA-256), gives them to Core's user, checks both sides
+  the same way, and switches `core.env` back to `BLOB_STORE=fs`, with the
+  same stop, check and put-back. The bucket's settings stay in `core.env`,
+  where Core reads them only with `BLOB_STORE=s3`, for a move there again,
+  which then needs no options; the bucket keeps its objects until you
+  empty it.
+- *By hand*, only if nothing was uploaded since the move: copy
+  `core.env.before-storage-<time>` over `core.env`, then
+  `aishie compose up -d core`. A file uploaded to the bucket since would be
+  missing from the disk: `migrate --to fs` is the way that loses nothing.
+
+Files deleted while Core used the bucket are still in the disk's old copy
+after a move back; nothing points at them, and Core's sweep removes those
+under `courses/` in time.
+
 ## Single sign-on
 
 Core offers single sign-on exactly when `OIDC_ISSUER` is set in
@@ -487,6 +718,12 @@ Framing goes two ways, and this stack allows both.
   `runtime.env` points at it, the runtime rewraps its secrets
   (`aishie runtime keys rewrap`, once M2 has it), and only then is `v1`
   retired.
+- **The bucket's keys** (`S3_ACCESS_KEY`, `S3_SECRET_KEY` in `core.env`):
+  make a new key with the provider, write it in `core.env` (a secret with a
+  `$` in single quotes), `aishie compose up -d core` and
+  `aishie storage check`, then delete the old key. Upload and download
+  links given out before, which the old key signed, stop working then;
+  they last minutes.
 - **The ghcr.io token:** `docker login` again with a new one
   (docs/troubleshooting.md, GHCR login expired).
 
@@ -502,7 +739,12 @@ somewhere else, regularly:
   cannot be read. Keep this copy apart from the database dumps: together,
   they are every secret the runtime holds.
 - `/var/backups/aishie/`, the databases.
-- `/srv/aishie/core/`, the files people upload.
+- `/srv/aishie/core/`, the files people upload, while Core keeps them on
+  this disk. A bucket is kept by its provider, not by `aishie backup`:
+  turn on its versioning (or replication), with a lifecycle rule that
+  removes old versions after a while, since Core deletes objects in the
+  normal course (an upload once it is attached, and uploads nothing
+  attached).
 
 ## PostgreSQL's major version
 
@@ -611,14 +853,15 @@ image whose label names another, and prunes by it.
 
 ```
 make ci        # shellcheck, actionlint, the tests, compose config, caddy validate
-make test      # tests/*_test.sh: aishie-update, aishie and setup-server.sh against stand-ins
+make test      # tests/*_test.sh: aishie-update, aishie, aishie-storage and setup-server.sh against stand-ins
 make config    # docker compose config against env/*.example; caddy validate and Caddy's routes
 make e2e       # the whole stack for real: as root, on a machine that can be thrown away
 ```
 
 `make test` runs the scripts against stand-ins for docker, curl, flock,
-apt and systemctl (`tests/fakes.sh`), which play a registry, a Docker and
-the services' health checks. `make config` needs no Docker daemon for
+apt and systemctl (`tests/fakes.sh`), which play a registry, a Docker,
+the services' health checks, an S3 service and rclone's container, whose
+bucket is a directory; nothing reaches the network. `make config` needs no Docker daemon for
 compose; it validates the Caddyfile with a `caddy` on `PATH` (or `CADDY`),
 else with Caddy's image, and checks the routes Caddy reads from it.
 
