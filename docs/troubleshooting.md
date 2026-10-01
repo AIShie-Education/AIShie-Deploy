@@ -58,14 +58,23 @@ taken before it instead (README.md, Restoring a backup).
 
 ## The new version did not report healthy
 
-The log says `not healthy within 60 seconds`, then one of three things:
+The log says `not healthy within 60 seconds`, then one of four things:
 
 - **`rolled back: sha256:… runs again`.** The version before was started
   again and reports healthy. The new digest is recorded as failed. The
   journal has the new version's last 30 log lines: that is where the reason
   is. The new schema stays (it was migrated before the switch), and the
   version before works with it: every migration leaves the release before
-  it working (Core's and the runtime's CONTRIBUTING.md, Migrations).
+  it working (Core's and the runtime's CONTRIBUTING.md, Migrations), every
+  one but Core's migration 0027, which the next case is about.
+- **`not rolled back: sha256:…'s migrations stop at 26, before Core's
+  migration 0027`.** The new Core brought migration 0027, which the Core
+  before cannot work on: started again, it would report healthy and fail
+  every authenticated call that reads an actor or a document's version.
+  So the new one goes on running, not healthy, and nothing is recorded as
+  failed. `aishie logs core` says why; once that is fixed (most often an
+  env file), `aishie compose up -d core`. To go back instead: README.md,
+  Rolling back past Core's migration 0027.
 - **`rolled back to sha256:…, which does not report healthy either`.**
   Neither version starts. What they share is the settings: most likely an
   env file (`/etc/aishie/core.env`, `runtime.env`) or, for the runtime, the
@@ -82,6 +91,23 @@ What each checks: Core's `/healthz` on 127.0.0.1:8080 must answer status
 503 while its database cannot be reached or its schema is behind); the
 runtime's on 127.0.0.1:9090 the same; the web's `/version.json` on
 127.0.0.1:8081 the commit of the image's revision label.
+
+## Core is refused: its migrations stop before 0027
+
+The log says `refused: sha256:…'s migrations stop at 26, before Core's
+migration 0027, which the schema has`. The Core named, by `--pin` or by the
+channel, is from before Core's migration 0027, and the schema has 0027: it
+would report healthy and fail every authenticated call. Nothing was
+changed, no backup was taken, and the Core that runs goes on running. A
+channel that names it is refused at every run, logged once.
+
+- To go back past 0027, migrate down first (README.md, Rolling back past
+  Core's migration 0027), then `--pin` again; a channel's Core goes ahead
+  at the next run.
+- To stay on 0027: on stable, set `CORE_IMAGE` back to the release that
+  runs; on edge, where `:edge` has gone back past 0027, pin the Core that
+  runs (`aishie-update --pin core sha256:<its digest>`, from
+  `aishie-update --status`) until `:edge` has 0027 again.
 
 ## The updater keeps skipping a failed digest
 

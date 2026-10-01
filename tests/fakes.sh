@@ -8,7 +8,12 @@
 #                          its digest's hex; the last line for a tag wins
 #   registry/img/HEX/      an image: version (what `version` prints), labels
 #                          ("name=value" lines), unhealthy (a marker: its
-#                          health check never passes)
+#                          health check never passes), migrations (a Core's
+#                          newest migration: its one-off `migrate` then ends
+#                          as Core's does, "schema version N (embedded
+#                          latest M)")
+#   schema                 Core's schema version, which `migrate up` with
+#                          such an image raises to its newest
 #   local                  "REF HEX" lines: what this Docker has pulled
 #   running/SERVICE        the image each service's container runs
 #   oneoff/ID/             a one-off container: its exit code and output
@@ -30,7 +35,8 @@
 #   s3-requests            "METHOD URL" of each request to the bucket
 #   s3-cors                the bucket's CORS rules, as PUT
 #
-# Knobs, in the environment: PULL_FAIL, MIGRATE_FAIL, SEED_FAIL, CHECK_FAIL,
+# Knobs, in the environment: PULL_FAIL, MIGRATE_FAIL, VERSION_FAIL (a
+# one-off `migrate version`), SEED_FAIL, CHECK_FAIL,
 # BACKUP_FAIL, POSTGRES_FAIL, CADDY_FAIL, COMPOSE_PULL_FAIL and FLOCK_FAIL make
 # that step fail. The S3 service answers a listing with S3_LIST (200, or
 # 301, 400, 403, 404), a HEAD with S3_HEAD (404), GET ?cors= with S3_CORS_GET
@@ -93,13 +99,26 @@ compose() {
       id=oneoff-$svc-$(date +%s%N)
       mkdir -p "$FAKE/oneoff/$id"
       code=0
+      img=$(service_image "$svc")
+      # The newest migration of an image that has a migrations file, and
+      # the schema it finds: what Core's migrate ends with.
+      knows=$(cat "$reg/img/${img##*@sha256:}/migrations" 2>/dev/null || true)
+      at=$(cat "$FAKE/schema" 2>/dev/null || echo 0)
       case "$*" in
-        "migrate up") code=${MIGRATE_FAIL:-0} ;;
+        "migrate up")
+          code=${MIGRATE_FAIL:-0}
+          if [ "$code" = 0 ] && [ -n "$knows" ] && [ "$at" -lt "$knows" ]; then at=$knows; echo "$at" > "$FAKE/schema"; fi ;;
+        "migrate version") code=${VERSION_FAIL:-0} ;;
         seed) code=${SEED_FAIL:-0} ;;
         check) code=${CHECK_FAIL:-0} ;;
       esac
       echo "$code" > "$FAKE/oneoff/$id/code"
-      echo "$svc $* with $(service_image "$svc"): exit $code" > "$FAKE/oneoff/$id/out"
+      echo "$svc $* with $img: exit $code" > "$FAKE/oneoff/$id/out"
+      if [ "$svc" = core ] && [ "${1:-}" = migrate ] && [ "$code" = 0 ] && [ -n "$knows" ]; then
+        ahead=''
+        [ "$at" -le "$knows" ] || ahead=" AHEAD — migrated by a newer release, or by a migration since taken out; left as it is"
+        echo "schema version $at (embedded latest $knows)$ahead" >> "$FAKE/oneoff/$id/out"
+      fi
       echo "$id" ;;
     "run --rm --no-deps -T "*)
       svc=$5
@@ -401,5 +420,7 @@ image() {
 # tag REF HEX: REF names that image in the registry from now on.
 tag() { mkdir -p "$FAKE/registry"; echo "$1 $2" >> "$FAKE/registry/tags"; }
 unhealthy() { touch "$FAKE/registry/img/$1/unhealthy"; }
+# migrations HEX N: that Core image's newest migration is N.
+migrations() { echo "$2" > "$FAKE/registry/img/$1/migrations"; }
 healthy_again() { rm -f "$FAKE/registry/img/$1/unhealthy"; }
 logger_lines() { if [ -f "$FAKE/journal" ]; then wc -l < "$FAKE/journal" | tr -d ' '; else echo 0; fi; }

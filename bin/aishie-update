@@ -17,7 +17,8 @@
 # before: nothing either, said once in the log, until another digest comes
 # or --retry. Any other is deployed, step by step:
 #
-#   core     its source label; its version; a backup of the database
+#   core     its source label; its version; `migrate version` with it
+#            (Core's migration 0027, below); a backup of the database
 #            aishie_core; `migrate up` and `seed` with the new image; Core
 #            recreated on it; /healthz on 127.0.0.1:8080 reporting the new
 #            version and commit.
@@ -34,7 +35,29 @@
 # its digest is recorded as failed. The one before can take over because
 # every migration leaves the release before it working (Core's and the
 # runtime's CONTRIBUTING.md, Migrations): the migrations go in before the
-# switch, and nothing ever migrates down.
+# switch, and nothing here ever migrates down.
+#
+# Every migration but one: Core's migration 0027 drops what the release
+# before it reads, and a Core whose migrations stop before 0027 does not work
+# on a schema that has it. It passes /healthz, which asks only that the
+# schema be no older than its own, and fails every authenticated call that
+# reads an actor or a document's version. So each Core image is asked
+# `migrate version` before it runs on the schema, and the line that command
+# ends with, "schema version N (embedded latest M)", is read:
+#
+#   - a Core whose migrations stop before 0027 is not deployed onto a
+#     schema that has it (a pin of the release before, or a channel that
+#     has gone back): the run stops before the backup, nothing is changed,
+#     and nothing is recorded as failed, so that it goes ahead once the
+#     schema is migrated down;
+#   - a new Core with 0027 that does not report healthy is not replaced by
+#     the one before when that one's migrations stop before 0027: it goes on
+#     running, nothing is recorded as failed, and the log says so.
+#
+# Going back past 0027 is by hand: Core stopped, `migrate down` once with the
+# image that has 0027, then the release before (README.md, Rolling back past
+# Core's migration 0027). A Core that does not say where its migrations stop
+# is deployed and rolled back as before.
 #
 # What runs is in /var/lib/aishie/images.env, repo@sha256:... per service,
 # which compose.yaml reads, and which nothing but this script writes: a
@@ -69,6 +92,9 @@ SETTINGS=$ETC/aishie.env
 IMAGES=$STATE/images.env
 KEEP_BACKUPS=10
 SERVICES="core runtime web"
+# Core's migrations that do not leave the release before them working
+# (Core's CONTRIBUTING.md, Migrations): 0027 alone.
+CORE_BREAKING_MIGRATIONS="27"
 # The tests move the state; the real thing runs as root.
 MOVED=${AISHIE_STATE:+yes}
 
@@ -310,6 +336,39 @@ oneoff() {
   [ "$code" = 0 ]
 }
 
+# core_schema IMAGE: `migrate version` in a one-off Core of IMAGE, as oneoff
+# runs it, its output shown. Sets schema_at, the schema's version, and
+# schema_knows, IMAGE's newest migration, from the line Core's migrate ends
+# with, "schema version N (embedded latest M)"; both empty when it has no
+# such line, or does not run.
+core_schema() {
+  _rc=0
+  _out=$(oneoff core "$1" migrate version) || _rc=$?
+  printf '%s\n' "$_out"
+  _at=$(printf '%s\n' "$_out" |
+    sed -n 's/^schema version \([0-9][0-9]*\) (embedded latest \([0-9][0-9]*\)).*/\1 \2/p' | tail -n 1)
+  schema_at='' schema_knows=''
+  if [ "$_rc" = 0 ] && [ -n "$_at" ]; then schema_at=${_at% *} schema_knows=${_at#* }; fi
+}
+# behind_schema: whether the schema core_schema read has one of
+# CORE_BREAKING_MIGRATIONS that the image's own migrations stop before, which
+# it then names in breaking: that Core would not work on it. False when
+# core_schema read nothing.
+behind_schema() {
+  [ -n "$schema_at" ] || return 1
+  for breaking in $CORE_BREAKING_MIGRATIONS; do
+    if [ "$schema_knows" -lt "$breaking" ] && [ "$schema_at" -ge "$breaking" ]; then
+      breaking=$(printf '%04d' "$breaking")
+      return 0
+    fi
+  done
+  return 1
+}
+# behind_note IMAGE: what behind_schema found, of IMAGE.
+behind_note() {
+  echo "$(digest_in "$1")'s migrations stop at $schema_knows, before Core's migration $breaking, which the schema has (version $schema_at): it would report healthy and fail every authenticated call that reads an actor or a document's version"
+}
+
 # PostgreSQL, started if it is not running (never recreated: that is for a
 # person to do), and healthy.
 postgres_up() { compose up -d --no-recreate --wait --wait-timeout 180 postgres; }
@@ -377,6 +436,13 @@ deploy() {
   fi
   if [ "$s" != web ]; then
     postgres_up || fail_run "$s" "PostgreSQL is not up and healthy (aishie logs postgres); nothing was changed"
+    # Before the backup, which a refusal repeated every five minutes would
+    # otherwise take each time. Not the image's fault: once the schema is
+    # migrated down, the same image goes ahead, so it is not recorded as
+    # failed.
+    if [ "$s" = core ] && core_schema "$new" && behind_schema; then
+      fail_run "$s" "$(arrow "$old" "$new"): refused: $(behind_note "$new"). ${old:+$(digest_in "$old") goes on running. }To go back past $breaking, migrate down first (README.md, Rolling back past Core's migration 0027)"
+    fi
     backup "$s" || fail_run "$s" "the backup of the database aishie_$s failed; nothing was changed (is $BACKUPS full?)"
     oneoff "$s" "$new" migrate up ||
       fail_image "$s" "$old" "$new" "migrate up failed (above); ${old:-nothing} goes on running (docs/troubleshooting.md, A migration failed)"
@@ -401,6 +467,14 @@ deploy() {
   if [ -z "$old" ]; then
     switch "$s" ''
     fail_image "$s" "$old" "$new" "$why; nothing ran before it, and nothing runs now"
+  fi
+  # The one before, asked what it makes of the schema now, before it is
+  # started on it.
+  if [ "$s" = core ] && core_schema "$old" && behind_schema; then
+    rm -f "$STATE/$s.noted"
+    checked "$s" "failed: $why; not rolled back"
+    log "$s" "$(arrow "$old" "$new"): $why; not rolled back: $(behind_note "$old"). $(digest_in "$new") goes on running: aishie logs $s says why it is not healthy; to go back, README.md, Rolling back past Core's migration 0027"
+    exit 1
   fi
   switch "$s" "$old"
   if version_of "$s" "$old" && healthy "$s" "$ver" "$commit"; then
