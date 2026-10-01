@@ -950,8 +950,9 @@ make e2e       # the whole stack for real: as root, on a machine that can be thr
 
 `make test` runs the scripts against stand-ins for docker, curl, flock,
 apt and systemctl (`tests/fakes.sh`), which play a registry, a Docker,
-the services' health checks, an S3 service and rclone's container, whose
-bucket is a directory; nothing reaches the network. `make config` needs no Docker daemon for
+the services' health checks, Core's `service issue`, an S3 service and
+rclone's container, whose bucket is a directory; nothing reaches the
+network. `make config` needs no Docker daemon for
 compose; it validates the Caddyfile with a `caddy` on `PATH` (or `CADDY`),
 else with Caddy's image, and checks the routes Caddy reads from it.
 
@@ -967,7 +968,10 @@ use the API with that session, as a bearer token and as the web's
 cookie, `/runtime/api/` and no other
 path reaches the runtime's 9090, nothing but Caddy is published beyond the
 loopback, Core is given the `SECRETS_KEY` `setup-server.sh` wrote, the
-runtime reaches Core at `https://HOST` through Caddy's alias,
+runtime reaches Core at `https://HOST` through Caddy's alias, the runtime
+is given its credential for Core (with a Core that has the
+`agent_runtime` service), printed nowhere, which Core takes, and
+`aishie runtime-credential` replaces it, Core refusing the one before,
 the backups can be restored from, and a second `aishie-update` (and a
 `docker compose up -d`, as after a reboot) changes nothing.
 `aishie.internal`, not `localhost`: both get their certificate from Caddy's
