@@ -18,7 +18,10 @@ happened:
 Whatever went wrong, the rule of a deploy holds: up to the moment the
 service is recreated, the version that ran goes on running, and the run
 stops at the step that failed. A run never starts the next service after a
-failure; the next run, five minutes later, goes on with the others.
+failure; the next run, five minutes later, goes on with the others. A
+digest that failed before, and a Core its channel names that is refused
+for Core's migration 0027 (below), are no failure of the run: each is left
+be, logged once, and the run goes on with the next service.
 
 ## A migration failed
 
@@ -55,6 +58,17 @@ though the one running keeps running.
 
 If you are not sure what the failed migration left, restore the backup
 taken before it instead (README.md, Restoring a backup).
+
+## Core's seed failed after migration 0027
+
+A seed that fails leaves the version that ran running, and records the new
+digest as failed. After a new Core's migration 0027, that is the one case
+where the version that ran goes on running on a schema it does not work
+on: 0027 is in by then. The log says `seed failed (above); sha256:… goes
+on running, but sha256:…'s migrations stop at 26, before Core's migration
+0027`. Fix what the seed says and `aishie-update --retry core`, or go back
+by hand with the image that has 0027 (README.md, Rolling back past Core's
+migration 0027).
 
 ## The new version did not report healthy
 
@@ -99,7 +113,12 @@ migration 0027, which the schema has`. The Core named, by `--pin` or by the
 channel, is from before Core's migration 0027, and the schema has 0027: it
 would report healthy and fail every authenticated call. Nothing was
 changed, no backup was taken, and the Core that runs goes on running. A
-channel that names it is refused at every run, logged once.
+channel that names it is refused at every run, logged once, and the run
+goes on with the runtime and the web, which update as ever.
+
+A schema left dirty at 27 by a failed `migrate up` of 0027 does not have
+it: a Core from before it is not refused there, and its own `migrate up`
+fails on the dirty schema ([A migration failed](#a-migration-failed)).
 
 - To go back past 0027, migrate down first (README.md, Rolling back past
   Core's migration 0027), then `--pin` again; a channel's Core goes ahead

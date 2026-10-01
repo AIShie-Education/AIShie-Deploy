@@ -261,11 +261,85 @@ rm "$FAKE/registry/img/$A/migrations"
 if update; then fail "passed while the new version was not healthy"; fi
 [ "$(running core)" = "$CORE@sha256:$A" ] || fail "core runs $(running core)"
 grep -q "rolled back: sha256:$A runs again" "$FAKE/log" || fail "log: $(cat "$FAKE/log")"
+# ... nor when `migrate version` does not end well, whatever it printed: the
+# new one is deployed, and the one before rolled back to, as ever.
+setup rollback-past-0027-version-fails
+migrations "$A" 26
+deployed
+image core "$D" v0.3.0 def4567
+migrations "$D" 27
+unhealthy "$D"
+tag "$CORE:edge" "$D"
+export VERSION_FAIL=1
+if update; then fail "passed while the new version was not healthy"; fi
+called "core migrate up" || fail "not deployed when migrate version failed"
+[ "$(running core)" = "$CORE@sha256:$A" ] || fail "core runs $(running core)"
+grep -qx "sha256:$D" "$FAKE/state/core.failed" || fail "not recorded as failed"
+grep -q "rolled back: sha256:$A runs again" "$FAKE/log" || fail "log: $(cat "$FAKE/log")"
+
+# Both Cores with 0027, the schema at 27: deployed, and rolled back when the
+# new one is not healthy, as ever.
+setup rollback-0027-over-0027
+migrations "$A" 27
+deployed
+[ "$(cat "$FAKE/schema")" = 27 ] || fail "schema $(cat "$FAKE/schema")"
+image core "$D" v0.3.1 def4567
+migrations "$D" 27
+unhealthy "$D"
+tag "$CORE:edge" "$D"
+if update; then fail "passed while the new version was not healthy"; fi
+called "core migrate up" || fail "a Core with 0027 refused on a schema at 27"
+[ "$(running core)" = "$CORE@sha256:$A" ] || fail "core runs $(running core)"
+grep -qx "sha256:$D" "$FAKE/state/core.failed" || fail "not recorded as failed"
+grep -q "rolled back: sha256:$A runs again" "$FAKE/log" || fail "log: $(cat "$FAKE/log")"
+! grep -q "refused\|not rolled back" "$FAKE/log" || fail "log: $(cat "$FAKE/log")"
+
+# A new Core with 0027 whose seed fails: the one before goes on running, on
+# 0027 by then, and the log says it does not work there.
+setup seed-past-0027
+migrations "$A" 26
+deployed
+image core "$D" v0.3.0 def4567
+migrations "$D" 27
+tag "$CORE:edge" "$D"
+export SEED_FAIL=1
+if update; then fail "passed while the seed failed"; fi
+[ "$(cat "$FAKE/schema")" = 27 ] || fail "schema $(cat "$FAKE/schema")"
+[ "$(running core)" = "$CORE@sha256:$A" ] || fail "core runs $(running core)"
+grep -qx "sha256:$D" "$FAKE/state/core.failed" || fail "not recorded as failed"
+grep -q "core sha256:$A -> sha256:$D: seed failed (above); sha256:$A goes on running, but sha256:$A's migrations stop at 26, before Core's migration 0027, which the schema has (version 27): .* Fix what the seed says and aishie-update --retry core, or go back by hand (README.md, Rolling back past Core's migration 0027)" "$FAKE/log" ||
+  fail "log: $(cat "$FAKE/log")"
+
+# A schema left dirty at 27 by a failed `migrate up` of 0027 does not have
+# 0027: a Core from before it is not refused, and its `migrate up` stops on
+# the dirty schema (docs/troubleshooting.md, A migration failed).
+setup dirty-at-0027
+migrations "$A" 26
+deployed
+image core "$D" v0.3.0 def4567
+migrations "$D" 27
+tag "$CORE:edge" "$D"
+export MIGRATE_FAIL=1
+if update; then fail "passed while migrate up failed"; fi
+[ -e "$FAKE/dirty" ] || fail "the schema is not dirty"
+unset MIGRATE_FAIL
+image core "$E" v0.2.1 e123456
+migrations "$E" 26
+tag "$CORE:edge" "$E"
+: > "$CALLS"
+if update; then fail "passed on a dirty schema"; fi
+grep -q "schema version 27 (embedded latest 26) DIRTY" "$FAKE/out" || fail "out: $(cat "$FAKE/out")"
+called "core migrate up" || fail "refused on a dirty schema"
+! grep -q "refused" "$FAKE/log" || fail "log: $(cat "$FAKE/log")"
+grep -q "core sha256:$A -> sha256:$E: migrate up failed (above); .*A migration failed" "$FAKE/log" ||
+  fail "log: $(cat "$FAKE/log")"
+[ "$(running core)" = "$CORE@sha256:$A" ] || fail "core runs $(running core)"
 
 # A Core whose migrations stop before 0027 is not deployed onto a schema that
 # has it, by --pin or by its channel (main reverted past 0027): refused
-# before the backup, nothing changed, nothing recorded as failed, said once.
-# Once the schema is migrated down, the same goes ahead.
+# before the backup, nothing changed, nothing recorded as failed. A pin stops
+# there; a channel's is said once, and the runtime and the web go on. Once
+# the schema is migrated down, the same goes ahead.
 setup pin-past-0027
 migrations "$A" 26
 tag "$CORE:0.2.0" "$A"
@@ -285,12 +359,20 @@ if update --pin core "$CORE:0.2.0"; then fail "--pin deployed a Core from before
 grep -q "core sha256:$D -> sha256:$A: refused: sha256:$A's migrations stop at 26, before Core's migration 0027, which the schema has (version 27): it would report healthy and fail every authenticated call that reads an actor or a document's version. sha256:$D goes on running. To go back past 0027, migrate down first" "$FAKE/log" ||
   fail "log: $(cat "$FAKE/log")"
 tag "$CORE:edge" "$A"
-if update; then fail "deployed a Core from before 0027 onto its schema from the channel"; fi
-if update; then fail "deployed a Core from before 0027 onto its schema from the channel"; fi
+image runtime "$F" v0.4.1 fed6543
+tag "$RUNTIME:edge" "$F"
+update || fail "exit $?: $(cat "$FAKE/out")"
+update || fail "exit $?: $(cat "$FAKE/out")"
 [ "$(running core)" = "$CORE@sha256:$D" ] || fail "core runs $(running core)"
-[ "$(logged "refused: sha256:$A's migrations stop at 26")" = 1 ] || fail "logged the refusal $(logged 'refused: sha256') times, not once"
+[ "$(running runtime)" = "$RUNTIME@sha256:$F" ] || fail "the runtime runs $(running runtime)"
+[ "$(logged "the runtime and the web go on")" = 1 ] || fail "logged the channel's refusal $(logged 'the runtime and the web go on') times, not once"
+grep -q "core sha256:$D -> sha256:$A: refused: sha256:$A's migrations stop at 26, .* migrate down first (README.md, Rolling back past Core's migration 0027); the runtime and the web go on" "$FAKE/log" ||
+  fail "log: $(cat "$FAKE/log")"
 said "(as before: not logged again)" || fail "said: $(cat "$FAKE/out")"
-! called "pg_dump" || fail "backed up for a refused Core"
+grep -q "refused sha256:$A, whose migrations stop before 0027" "$FAKE/state/core.checked" ||
+  fail "last check: $(cat "$FAKE/state/core.checked")"
+[ ! -s "$FAKE/state/core.failed" ] || fail "recorded as failed: $(cat "$FAKE/state/core.failed")"
+! called "pg_dump -U postgres -Fc aishie_core" || fail "backed up for a refused Core"
 # Migrated down by hand (README.md, Rolling back past Core's migration 0027).
 echo 26 > "$FAKE/schema"
 update --pin core "$CORE:0.2.0" || fail "exit $?: $(cat "$FAKE/out")"

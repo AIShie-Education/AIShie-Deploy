@@ -250,9 +250,9 @@ new name, and Caddy gets a certificate for it.
 ## Rolling back
 
 Edge rolls itself back: a new version that does not report healthy is
-replaced by the one before (not past Core's migration 0027, below). By hand, pin a service to an image, by digest
-or by tag, and it is deployed by the same sequence (backup, `migrate up`,
-the switch, the health check):
+replaced by the one before (not past Core's migration 0027, below). By
+hand, pin a service to an image, by digest or by tag, and it is deployed
+by the same sequence (backup, `migrate up`, the switch, the health check):
 
 ```
 aishie-update --pin core sha256:<digest>                  # the digest from the log or --status
@@ -286,10 +286,19 @@ Core image `migrate version` before it runs it on the schema, and:
   has it, whether pinned (`aishie-update --pin core` with the release
   before) or named by its channel (`CORE_IMAGE` on stable set back to the
   release before, or `:edge` once Core's `main` has gone back past 0027).
-  The run stops before the backup, the Core that runs goes on running,
-  nothing is recorded as failed, and the log says `refused: sha256:…'s
-  migrations stop at 26`, once. Once the schema is migrated down, the same
-  image goes ahead by itself.
+  It is refused before the backup: nothing is changed, the Core that runs
+  goes on running, nothing is recorded as failed, and the log says
+  `refused: sha256:…'s migrations stop at 26`. A pin stops there. A
+  channel's Core is refused at every run, logged once, and the run goes on
+  with the runtime and the web, as for a digest that failed before. Once
+  the schema is migrated down, the same image goes ahead by itself. A
+  schema left dirty at 27 by a failed `migrate up` does not have 0027:
+  that is [A migration failed](docs/troubleshooting.md#a-migration-failed).
+- **A new Core with 0027 whose seed fails** leaves the Core before it
+  running, as any failed seed does, but on a schema that by then has 0027,
+  where it does not work. The log says so, and the new digest is recorded
+  as failed. Fix what the seed says and `aishie-update --retry core`, or go
+  back by hand (below), naming the image with 0027.
 
 Going back past 0027 is by hand, as root, as Core's `docs/deploying.md`
 says for its own servers: stop Core, take the schema down one migration
@@ -312,6 +321,23 @@ but not the type and size of a purged version's file, which 0027 dropped.
 Run nothing but this one `migrate down`: each further one deletes data. On
 edge, `aishie-update --unpin core` follows `:edge` again once its cause is
 fixed, and migrates up again.
+
+After a failed seed, the Core that runs, which `aishie core` uses, is the
+one before 0027 already, and its `migrate down` cannot take 0027 out (`no
+migration found for version 27`). Name the image with 0027 for the down,
+by the digest the log gives, then start the one before again, which
+`aishie-update` left in place:
+
+```
+aishie compose stop core
+CORE_REF=ghcr.io/aishie-education/aishie-core@sha256:<the digest with 0027> \
+  docker compose --project-directory /opt/aishie -f /opt/aishie/compose.yaml \
+  run --rm --no-deps -T core migrate down --yes
+aishie compose up -d core
+```
+
+The digest with 0027 stays recorded as failed, so the runs after leave it
+be; on stable, set `CORE_IMAGE` back to the release that runs.
 
 ## Upgrading stable
 

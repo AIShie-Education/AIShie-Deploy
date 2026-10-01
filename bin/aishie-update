@@ -47,17 +47,22 @@
 #
 #   - a Core whose migrations stop before 0027 is not deployed onto a
 #     schema that has it (a pin of the release before, or a channel that
-#     has gone back): the run stops before the backup, nothing is changed,
+#     has gone back): it is refused before the backup, nothing is changed,
 #     and nothing is recorded as failed, so that it goes ahead once the
-#     schema is migrated down;
+#     schema is migrated down. A pin stops the run there; a channel's Core
+#     is logged once, as a failed digest is, and the run goes on with the
+#     runtime and the web;
 #   - a new Core with 0027 that does not report healthy is not replaced by
 #     the one before when that one's migrations stop before 0027: it goes on
-#     running, nothing is recorded as failed, and the log says so.
+#     running, nothing is recorded as failed, and the log says so;
+#   - a new Core with 0027 whose seed fails leaves the one before running on
+#     the schema 0027 is in by then, as any failed seed does, and the log
+#     says that it does not work there.
 #
 # Going back past 0027 is by hand: Core stopped, `migrate down` once with the
 # image that has 0027, then the release before (README.md, Rolling back past
-# Core's migration 0027). A Core that does not say where its migrations stop
-# is deployed and rolled back as before.
+# Core's migration 0027). A Core that does not say where its migrations stop,
+# or says its schema is dirty, is deployed and rolled back as before.
 #
 # What runs is in /var/lib/aishie/images.env, repo@sha256:... per service,
 # which compose.yaml reads, and which nothing but this script writes: a
@@ -340,13 +345,16 @@ oneoff() {
 # runs it, its output shown. Sets schema_at, the schema's version, and
 # schema_knows, IMAGE's newest migration, from the line Core's migrate ends
 # with, "schema version N (embedded latest M)"; both empty when it has no
-# such line, or does not run.
+# such line, or does not run, or the line says DIRTY: a migration failed half
+# way, N is the one that failed, not one the schema has, and `migrate up`
+# then stops on it with its own error (docs/troubleshooting.md, A migration
+# failed).
 core_schema() {
   _rc=0
   _out=$(oneoff core "$1" migrate version) || _rc=$?
   printf '%s\n' "$_out"
-  _at=$(printf '%s\n' "$_out" |
-    sed -n 's/^schema version \([0-9][0-9]*\) (embedded latest \([0-9][0-9]*\)).*/\1 \2/p' | tail -n 1)
+  _at=$(printf '%s\n' "$_out" | grep '^schema version ' | tail -n 1 |
+    sed -n '/ DIRTY/!s/^schema version \([0-9][0-9]*\) (embedded latest \([0-9][0-9]*\)).*/\1 \2/p')
   schema_at='' schema_knows=''
   if [ "$_rc" = 0 ] && [ -n "$_at" ]; then schema_at=${_at% *} schema_knows=${_at#* }; fi
 }
@@ -414,9 +422,11 @@ prune() {
   done
 }
 
-# deploy SERVICE OLD NEW: the steps above. Exits on failure.
+# deploy SERVICE OLD NEW [channel]: the steps above. Exits on failure, but
+# for a Core its channel names that is refused for Core's migration 0027:
+# that returns, so that the runtime and the web go on.
 deploy() {
-  s=$1 old=$2 new=$3
+  s=$1 old=$2 new=$3 via=${4:-}
   # The image by its digest too, the name compose runs it by. With Docker's
   # containerd image store, an image pulled by tag alone loses its only name
   # here when the tag moves on; so named, it stays, and a rollback to it, or
@@ -439,16 +449,25 @@ deploy() {
     # Before the backup, which a refusal repeated every five minutes would
     # otherwise take each time. Not the image's fault: once the schema is
     # migrated down, the same image goes ahead, so it is not recorded as
-    # failed.
+    # failed. A pin stops there; a channel's Core is left be, logged once,
+    # as a failed digest is, and the runtime and the web go on.
     if [ "$s" = core ] && core_schema "$new" && behind_schema; then
-      fail_run "$s" "$(arrow "$old" "$new"): refused: $(behind_note "$new"). ${old:+$(digest_in "$old") goes on running. }To go back past $breaking, migrate down first (README.md, Rolling back past Core's migration 0027)"
+      refused="$(arrow "$old" "$new"): refused: $(behind_note "$new"). ${old:+$(digest_in "$old") goes on running. }To go back past $breaking, migrate down first (README.md, Rolling back past Core's migration 0027)"
+      [ "$via" = channel ] || fail_run "$s" "$refused"
+      checked "$s" "refused $(digest_in "$new"), whose migrations stop before $breaking"
+      log_once "$s" "$refused; the runtime and the web go on"
+      return 0
     fi
     backup "$s" || fail_run "$s" "the backup of the database aishie_$s failed; nothing was changed (is $BACKUPS full?)"
     oneoff "$s" "$new" migrate up ||
       fail_image "$s" "$old" "$new" "migrate up failed (above); ${old:-nothing} goes on running (docs/troubleshooting.md, A migration failed)"
-    if [ "$s" = core ]; then
-      oneoff core "$new" seed ||
-        fail_image "$s" "$old" "$new" "seed failed (above); ${old:-nothing} goes on running"
+    if [ "$s" = core ] && ! oneoff core "$new" seed; then
+      # The migrations are in, and the one before goes on running on them:
+      # not working, if they brought one it stops before.
+      if [ -n "$old" ] && core_schema "$old" && behind_schema; then
+        fail_image "$s" "$old" "$new" "seed failed (above); $(digest_in "$old") goes on running, but $(behind_note "$old"). Fix what the seed says and aishie-update --retry core, or go back by hand (README.md, Rolling back past Core's migration 0027)"
+      fi
+      fail_image "$s" "$old" "$new" "seed failed (above); ${old:-nothing} goes on running"
     fi
   fi
 
@@ -520,7 +539,7 @@ update() {
     echo "$s: would deploy $new (from $channel), in place of ${old:-nothing}"
     return 0
   fi
-  deploy "$s" "$old" "$new"
+  deploy "$s" "$old" "$new" channel
 }
 
 # pin SERVICE REF: REF deployed by the same steps, and SERVICE left on it.

@@ -14,6 +14,9 @@
 #                          latest M)")
 #   schema                 Core's schema version, which `migrate up` with
 #                          such an image raises to its newest
+#   dirty                  a marker: Core's schema is dirty, as a failed
+#                          `migrate up` with such an image leaves it, at
+#                          that image's newest; `migrate up` then fails
 #   local                  "REF HEX" lines: what this Docker has pulled
 #   running/SERVICE        the image each service's container runs
 #   oneoff/ID/             a one-off container: its exit code and output
@@ -36,9 +39,9 @@
 #   s3-cors                the bucket's CORS rules, as PUT
 #
 # Knobs, in the environment: PULL_FAIL, MIGRATE_FAIL, VERSION_FAIL (a
-# one-off `migrate version`), SEED_FAIL, CHECK_FAIL,
-# BACKUP_FAIL, POSTGRES_FAIL, CADDY_FAIL, COMPOSE_PULL_FAIL and FLOCK_FAIL make
-# that step fail. The S3 service answers a listing with S3_LIST (200, or
+# one-off `migrate version`, its report printed all the same), SEED_FAIL,
+# CHECK_FAIL, BACKUP_FAIL, POSTGRES_FAIL, CADDY_FAIL, COMPOSE_PULL_FAIL and
+# FLOCK_FAIL make that step fail. The S3 service answers a listing with S3_LIST (200, or
 # 301, 400, 403, 404), a HEAD with S3_HEAD (404), GET ?cors= with S3_CORS_GET
 # (the rules PUT, else 404; "other" for rules of another site's; or a
 # status) and PUT ?cors= with S3_CORS_PUT (200); S3_DOWN has it not answer.
@@ -107,16 +110,26 @@ compose() {
       case "$*" in
         "migrate up")
           code=${MIGRATE_FAIL:-0}
-          if [ "$code" = 0 ] && [ -n "$knows" ] && [ "$at" -lt "$knows" ]; then at=$knows; echo "$at" > "$FAKE/schema"; fi ;;
+          [ ! -e "$FAKE/dirty" ] || code=1
+          if [ -n "$knows" ] && [ "$at" -lt "$knows" ] && [ ! -e "$FAKE/dirty" ]; then
+            at=$knows
+            echo "$at" > "$FAKE/schema"
+            [ "$code" = 0 ] || touch "$FAKE/dirty"
+          fi ;;
         "migrate version") code=${VERSION_FAIL:-0} ;;
         seed) code=${SEED_FAIL:-0} ;;
         check) code=${CHECK_FAIL:-0} ;;
       esac
       echo "$code" > "$FAKE/oneoff/$id/code"
       echo "$svc $* with $img: exit $code" > "$FAKE/oneoff/$id/out"
-      if [ "$svc" = core ] && [ "${1:-}" = migrate ] && [ "$code" = 0 ] && [ -n "$knows" ]; then
+      # Its report is printed by a migrate that ends well, and by a
+      # `migrate version` that does not (VERSION_FAIL), as when the one-off's
+      # end cannot be read: aishie-update must not go by it then.
+      if [ "$svc" = core ] && [ "${1:-}" = migrate ] && [ -n "$knows" ] &&
+        { [ "$code" = 0 ] || [ "$*" = "migrate version" ]; }; then
         ahead=''
         [ "$at" -le "$knows" ] || ahead=" AHEAD — migrated by a newer release, or by a migration since taken out; left as it is"
+        [ ! -e "$FAKE/dirty" ] || ahead=" DIRTY — fix the database by hand, then \`migrate force N\`, N being the last migration fully applied (0 if none)"
         echo "schema version $at (embedded latest $knows)$ahead" >> "$FAKE/oneoff/$id/out"
       fi
       echo "$id" ;;
