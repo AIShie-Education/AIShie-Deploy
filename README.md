@@ -1071,6 +1071,9 @@ the `AISHIE_` paths at the top of each script move where it writes.
 
 The scripts are POSIX sh, as the server runs them, and shellcheck-clean;
 the tests are bash. Comments say what is true and why.
+Examples, comments and tests name no real school: `school-adfs`,
+`School NetID` and `example.edu` stand for one. Core's default provider id,
+`polyu-adfs`, is named only where that default is described.
 
 ## License
 
