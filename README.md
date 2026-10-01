@@ -59,48 +59,18 @@ provider's firewall; `setup-server.sh` opens them in ufw when ufw is on). It
 keeps grades and students' work, so pick a provider and a region your
 institution allows for that.
 
-1. Give the server a copy of this repository. It is private, so the server
-   reads it with a deploy key of its own, one that can read this repository
-   and nothing else, and write nothing. As root:
+1. Give the server a copy of this repository, as root, in root's home:
 
    ```
-   ssh-keygen -t ed25519 -N '' -C "$(hostname): AIShie-Deploy read-only" -f /root/.ssh/aishie_deploy_ro
-   cat /root/.ssh/aishie_deploy_ro.pub
+   git clone https://github.com/AIShie-Education/AIShie-Deploy.git
    ```
 
-   Add the line it prints in this repository's Settings → Deploy keys → Add
-   deploy key, titled with the server's name, and leave "Allow write access"
-   unticked. Then, in root's home:
+   The repository and the three images are public: the server reads this
+   repository, and pulls the images from ghcr.io, with no key, token or
+   login of its own. `git -C AIShie-Deploy pull` takes a newer copy later
+   (Day to day).
 
-   ```
-   export GIT_SSH_COMMAND='ssh -i /root/.ssh/aishie_deploy_ro -o IdentitiesOnly=yes'
-   git clone git@github.com:AIShie-Education/AIShie-Deploy.git
-   git -C AIShie-Deploy config core.sshCommand "$GIT_SSH_COMMAND"
-   ```
-
-   The first connection asks whether to trust github.com: say yes only if
-   the fingerprint is GitHub's own, `SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU`
-   ([GitHub's SSH key fingerprints](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints)).
-   The last line has later `git pull`s use the same key.
-
-2. Log the server in to ghcr.io. The three images are private packages, and
-   the server pulls them with a personal access token (classic, not
-   fine-grained: GHCR takes no other) that has the `read:packages` scope and
-   nothing else. Make it on an account that can read the three packages and
-   nothing more, give it a long expiry, and put the date in a calendar.
-   Never paste it anywhere but here. As root, paste the token when asked,
-   then Enter and Ctrl-D:
-
-   ```
-   docker login ghcr.io -u <that account's GitHub user name> --password-stdin
-   ```
-
-   On a server with no Docker yet there is no `docker` to log in with: run
-   step 3 first, which installs it. It finishes even when it cannot pull
-   the images, and ends by saying how to log in. Log in then, and run
-   `aishie-update`, or leave it to the timer, within five minutes.
-
-3. Run the set-up as root, with the server's DNS name and its environment:
+2. Run the set-up as root, with the server's DNS name and its environment:
 
    ```
    sh AIShie-Deploy/setup-server.sh test.aishie.app edge
@@ -132,11 +102,11 @@ institution allows for that.
    If it stops, fix what it names and run it again: it never overwrites a
    setting, a secret or data.
 
-4. Point the name at the server (an A record, and AAAA if it has IPv6).
+3. Point the name at the server (an A record, and AAAA if it has IPv6).
    Caddy gets a certificate as soon as the name resolves there:
    `curl https://test.aishie.app/healthz`.
 
-5. The first administrator: the account you sign in to the site with. It
+4. The first administrator: the account you sign in to the site with. It
    asks for a name, an email and a password (twice, not shown), makes the
    account, and restarts Core, so that its background jobs start as the
    system actor it makes too:
@@ -156,10 +126,10 @@ institution allows for that.
    `aishie core bootstrap --name … --email … --password-stdin >/dev/null`
    (the `>/dev/null` for that token), then `aishie compose restart core`.
 
-6. Copy `/etc/aishie` somewhere safe, apart from the database backups
+5. Copy `/etc/aishie` somewhere safe, apart from the database backups
    ([What to keep off the server](#what-to-keep-off-the-server)).
 
-7. The day after, check that the nightly backup ran:
+6. The day after, check that the nightly backup ran:
    `ls -l /var/backups/aishie/*-daily-*`.
 
 For stable, the same with `stable`. Its channels start empty: set
@@ -911,8 +881,6 @@ Framing goes two ways, and this stack allows both.
   `aishie storage check`, then delete the old key. Upload and download
   links given out before, which the old key signed, stop working then;
   they last minutes.
-- **The ghcr.io token:** `docker login` again with a new one
-  (docs/troubleshooting.md, GHCR login expired).
 
 ## What to keep off the server
 
@@ -1091,11 +1059,8 @@ the backups can be restored from, and a second `aishie-update` (and a
 local authority, but inside a container `localhost` is the container
 itself, so the runtime's way to Core could not be checked with it.
 
-The end to end pulls the private packages with the workflow's own token,
-which works once each package has granted this repository read access
-(the package's settings, Manage Actions access, Add Repository,
-AIShie-Deploy, role Read), which an owner of the organization does once
-per package; until then the job says exactly that. To run it elsewhere
+The end to end pulls the three images as a server does, from ghcr.io, where
+they are public packages, with no login. To run it elsewhere
 against images of your own, `AISHIE_REGISTRY` names another registry, and
 the `AISHIE_` paths at the top of each script move where it writes.
 

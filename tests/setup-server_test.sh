@@ -285,7 +285,7 @@ said "names its agent_id and holds no token" || fail "the agent step does not sa
 ! said "core_token" || fail "the agent step still has a token pasted: $(cat "$FAKE/out")"
 said "it holds SIGNING_KEY, SECRETS_KEY and the runtime's key" || fail "no step to keep a copy of the keys: $(cat "$FAKE/out")"
 said "runtime's credential for Core (README.md, What to keep off the server)" || fail "the copy step does not name the credential: $(cat "$FAKE/out")"
-! said "docker login" || fail "asked to log in, though every pull worked"
+! said "docker logout" || fail "said how to pull, though every pull worked"
 ! said "notice:" || fail "said a notice: $(cat "$FAKE/out")"
 for secret in "$core_pw" "$runtime_pw" "$(setting postgres.env POSTGRES_PASSWORD)" "$(setting core.env SIGNING_KEY)" "$secrets_key" "$(cat "$kek")" "$(cat "$cred")"; do
   if grep -qF -- "$secret" "$FAKE/out" "$CALLS" "$FAKE/log"; then fail "a secret is in the output, a command line or the log"; fi
@@ -427,14 +427,16 @@ COMPOSE_PULL_FAIL=1 setup_server test.aishie.app edge || fail "exit $?: $(cat "$
 said "could not pull the newest postgres:18 and caddy:2 (above): going on with the ones this server has" || fail "said: $(cat "$FAKE/out")"
 grep -q "^CORE_REF=" "$AISHIE_STATE/images.env" || fail "stopped before the first update"
 
-# The images cannot be pulled: how to log in, said exactly, and the run
-# fails once it has said what is left.
-setup no-login
+# The images cannot be pulled: why it may be, said, with no login asked
+# for (the packages are public), and the run fails once it has said what is
+# left.
+setup no-pull
 if PULL_FAIL=1 setup_server test.aishie.app edge; then fail "passed though nothing could be pulled"; fi
 said "cannot pull $REG/aishie-core:edge" || fail "said: $(cat "$FAKE/out")"
-said "docker login ghcr.io -u <that account's GitHub user name> --password-stdin" || fail "no login help: $(cat "$FAKE/out")"
-said "read:packages" || fail "the token's scope is not said"
-said "(classic)" || fail "the token's kind is not said"
+said "public packages" || fail "no pull help: $(cat "$FAKE/out")"
+said "As root: docker logout ghcr.io" || fail "a stale login's way out is not said: $(cat "$FAKE/out")"
+said "An image cannot be pulled" || fail "the troubleshooting section is not named"
+! said "docker login" || fail "asked to log in: $(cat "$FAKE/out")"
 [ -e "$AISHIE_ETC/core.env" ] || fail "the settings were not written before the pull"
 ! grep -q "_REF=" "$AISHIE_STATE/images.env" || fail "deployed something: $(cat "$AISHIE_STATE/images.env")"
 ! called "service issue" || fail "issued a credential with no Core"

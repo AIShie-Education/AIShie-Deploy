@@ -99,32 +99,36 @@ failed is not tried every five minutes. It is left alone until either
 A service pinned by hand (`aishie-update --pin`) is not updated at all
 until `aishie-update --unpin SERVICE`; `--status` shows `pinned:`.
 
-## GHCR login expired
+## An image cannot be pulled
 
-The log says `could not pull …: … denied` or `unauthorized`, once, and every
-run after fails the same way without logging it again (the journal has
-each). Nothing is changed: what runs goes on running. The server logs in to
-ghcr.io with a personal access token (classic) with `read:packages`, kept in
-`/root/.docker/config.json`; it has expired or been revoked, or the account
-has lost access to one of the three packages.
+The log says `could not pull …`, once, and every run after fails the same
+way without logging it again (the journal has each). Nothing is changed:
+what runs goes on running. The three images are public packages on
+ghcr.io, which a server pulls with no login, so the error says which of
+these it is:
 
-1. Make a new token (GitHub → Settings → Developer settings → Personal
-   access tokens → Tokens (classic)), with the scope `read:packages` and
-   nothing else, on the account that reads the packages. Put its expiry in
-   a calendar.
-2. Log in again, pasting the token when asked, then Enter and Ctrl-D:
+- **`denied` or `unauthorized`:** the server still has a login to ghcr.io
+  from before the images were public, in `/root/.docker/config.json`, and
+  its token has expired or been revoked. Docker sends it with every pull,
+  and GHCR refuses the pull rather than ignore it. Forget it, as root:
 
-   ```
-   docker login ghcr.io -u <that account's GitHub user name> --password-stdin
-   ```
+  ```
+  docker logout ghcr.io
+  ```
 
-3. `aishie-update` runs now instead of in five minutes.
+  With no login left, the same error means a package is not public (any
+  more): an owner of the AIShie-Education organization sets it back to
+  public in the package's settings.
 
-The same `denied` comes from a package the account cannot read, or one not
-published yet: `docker pull ghcr.io/aishie-education/aishie-frontend:edge`
-by hand shows which image it is. An owner of the AIShie-Education
-organization grants an account read access in each package's settings
-(Manage access).
+- **`not found` or `manifest unknown`:** the channel in
+  `/etc/aishie/aishie.env` (`CORE_IMAGE`, `RUNTIME_IMAGE`, `WEB_IMAGE`) names
+  an image or a tag that is not published, or not yet: a release that is
+  still building, or a typo. `docker pull` of it by hand says the same.
+- **Anything else** (a timeout, `connection refused`, a TLS error): this
+  server cannot reach ghcr.io (DNS, a firewall, a proxy), or GHCR is having
+  trouble ([githubstatus.com](https://www.githubstatus.com)).
+
+Then `aishie-update` runs now instead of in five minutes.
 
 ## Other things
 

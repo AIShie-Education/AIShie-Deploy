@@ -427,7 +427,7 @@ update() {
   [ -n "$channel" ] || fail_run "$s" "no channel: set $var in $SETTINGS, e.g. $(repo_of "$s"):edge (stable: a release, X.Y.Z)"
   why=$(check_ref "$s" "$channel") || fail_run "$s" "$var refused: $why"
   new=$(resolve "$s" "$channel") ||
-    fail_run "$s" "could not pull $channel: $(printf '%s' "$new" | tr '\n' ' ') (is this server logged in to ghcr.io? docs/troubleshooting.md, GHCR login expired)"
+    fail_run "$s" "could not pull $channel: $(printf '%s' "$new" | tr '\n' ' ') (docs/troubleshooting.md, An image cannot be pulled; an expired login to ghcr.io: docker logout ghcr.io)"
   old=$(deployed "$s")
   if [ "$new" = "$old" ]; then
     [ -n "$DRY" ] || { rm -f "$STATE/$s.noted"; checked "$s" "up to date"; }
