@@ -36,15 +36,18 @@
 # state and the backups. It installs the stack in /opt/aishie, aishie-update,
 # aishie and aishie-storage in /usr/local/bin, and the timers; opens 80 and
 # 443 in ufw when ufw is on; checks that the server can pull the three
-# images; starts PostgreSQL and Caddy; runs the first update; and says what
-# is left to do.
+# images; starts PostgreSQL and Caddy; runs the first update; once Core is
+# migrated, gives the runtime its credential for Core (aishie
+# runtime-credential), which it hosts agents with; and says what is left to
+# do.
 #
 # Run again, it installs this copy's files over the old ones, and leaves the
 # rest as it is: the settings, the secrets and the data, and where Core
 # keeps its files (`aishie storage migrate` moves them). A core.env from
 # before SECRETS_KEY is given one, as a line at its end, and nothing else in
-# it changes. That is how a newer aishie-update, or a change to the stack,
-# reaches the server.
+# it changes; a runtime with no credential for Core, its file missing or
+# empty, is given one, and one that is there is left as it is. That is how
+# a newer aishie-update, or a change to the stack, reaches the server.
 #
 # tests/setup-server_test.sh sources it with AISHIE_SETUP_LIB=1, which
 # defines the functions and runs nothing, and moves the paths below;
@@ -377,9 +380,10 @@ storage_store() { if [ "${ST_KIND:-fs}" = fs ]; then echo fs; else echo s3; fi; 
 
 # make_dirs: the directories, each with its owner. The runtime (user 65532)
 # reads the agents and the secrets through their group; root writes them.
+# secrets/core holds the runtime's credential for Core (runtime_credential).
 make_dirs() {
   install -d -m 700 "$ETC" "$ETC/runtime" "$STATE" "$BACKUPS"
-  for d in "$ETC/runtime/agents" "$ETC/runtime/secrets" "$ETC/runtime/secrets/kek"; do
+  for d in "$ETC/runtime/agents" "$ETC/runtime/secrets" "$ETC/runtime/secrets/kek" "$ETC/runtime/secrets/core"; do
     if [ -d "$d" ]; then
       echo "$d is there already: left as it is"
     else
@@ -412,6 +416,36 @@ make_kek() {
   own "root:$APP_UID" "$f.new"
   mv "$f.new" "$f"
   echo "made $f, the key that will wrap the runtime's stored secrets: keep a copy off the server"
+}
+
+# runtime_credential: the runtime's credential for Core, unless it has one.
+# In Core the site's agent runtime is the site service agent_runtime, which
+# alone hosts agents: with this credential it is issued each runtime agent's
+# token, by the agent's id. A file that is there, with anything in it, is
+# left as it is, and printed nowhere either. A missing or empty one
+# is issued once Core runs, and so is migrated: `aishie runtime-credential`
+# has Core issue it with --replace, which revokes any other the service
+# holds (the one this file had, say), puts Core's standard output straight
+# into the file, printing it nowhere, and recreates the runtime to take it.
+# Sets credential_left when the runtime has none at the end, for what is
+# left; a Core from before migration 0025 has no such service, and is not
+# a failure of this run.
+runtime_credential() {
+  say "The runtime's credential for Core"
+  f=$ETC/runtime/secrets/core/agent_runtime
+  if [ -f "$f" ] && grep -q '[^[:space:]]' "$f"; then
+    echo "$f is there already: left as it is"
+    return 0
+  fi
+  if ! grep -q '^CORE_REF=.' "$STATE/images.env" 2>/dev/null; then
+    echo "Core is not deployed yet: the runtime is given its credential for Core once it is (below)"
+    credential_left=1
+    return 0
+  fi
+  if ! "$BIN/aishie" runtime-credential; then
+    echo "warning: the runtime was not given its credential for Core (above), which a runtime that hosts agents by their ids needs: a Core from before migration 0025 has no agent_runtime service to issue it (below)" >&2
+    credential_left=1
+  fi
 }
 
 # install_files HERE: this copy's stack, scripts and units, over the old ones.
@@ -587,8 +621,10 @@ MSG
   login=
   pull_check || login=1
   failed=
+  credential_left=
   if [ "$environment" = stable ] && ! grep -q '^CORE_IMAGE=.' "$ETC/aishie.env"; then
     echo "not updating: stable's channels are not set yet (below)"
+    runtime_credential
   else
     # Core, the runtime and the web, in that order, each by the safe
     # sequence. A run stops at the first service it cannot deploy (an image
@@ -596,6 +632,9 @@ MSG
     # there once the cause is gone.
     say "The first update (aishie-update)"
     "$BIN/aishie-update" || { failed=1; echo "aishie-update stopped (above): docs/troubleshooting.md" >&2; }
+    # Core is migrated now, if it is deployed at all: the agent_runtime
+    # service is there to issue the credential to.
+    runtime_credential
     # A change to stack.yaml reaches a service when it is recreated: now,
     # with the image it runs, for any whose configuration changed. Under
     # aishie-update's lock, so as not to cross a run of the timer's.
@@ -632,6 +671,15 @@ $n. Set the releases stable runs, CORE_IMAGE, RUNTIME_IMAGE and WEB_IMAGE, in
 EOF
     n=$((n + 1))
   fi
+  if [ -n "$credential_left" ]; then
+    cat <<EOF
+$n. The runtime's credential for Core, which it hosts agents with, once Core
+   runs (aishie-update --status) a release with the agent_runtime service,
+   migration 0025 (README.md, The runtime's credential for Core):
+     aishie runtime-credential
+EOF
+    n=$((n + 1))
+  fi
   cat <<EOF
 $n. Point $host at this server in DNS (A, and AAAA if it has IPv6). Caddy gets
    its certificate once the name resolves here:
@@ -646,19 +694,20 @@ $n. The first administrator, once Core runs (aishie-update --status): it asks
 EOF
   n=$((n + 1))
   cat <<EOF
-$n. Agents (README.md, Adding an agent): each one's YAML in
-   $ETC/runtime/agents, and each secret it refers to as a file in
-   $ETC/runtime/secrets, readable by group $APP_UID:
+$n. Agents (README.md, Hosting agents): each is hosted one way for good, chosen
+   when it is made. A runtime agent's owner has this server's runtime host it
+   from the site, and the runtime is issued its token by its id: nobody pastes
+   one. An operator's own runtime agent is a YAML in $ETC/runtime/agents,
+   readable by group $APP_UID, that names its agent_id and holds no token:
      install -g $APP_UID -m 640 tutor.yaml $ETC/runtime/agents/
-     install -D -g $APP_UID -m 640 /dev/stdin $ETC/runtime/secrets/agents/tutor/core_token    (paste, Enter, Ctrl-D)
      aishie runtime check --live && aishie compose kill -s HUP runtime
 EOF
   n=$((n + 1))
   cat <<EOF
 $n. Keep a copy of $ETC somewhere else, encrypted, and apart from the
    database's backups: it holds SIGNING_KEY, SECRETS_KEY and the runtime's key
-   (kek/v1), which no backup of the database can bring back (README.md, What
-   to keep off the server).
+   (kek/v1), which no backup of the database can bring back, and the
+   runtime's credential for Core (README.md, What to keep off the server).
 EOF
   if [ -n "$secrets_key_added" ]; then
     cat <<EOF

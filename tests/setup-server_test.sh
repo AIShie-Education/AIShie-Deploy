@@ -21,7 +21,8 @@ make_fakes "$work/bin"
 # docker-compose-v2 version Ubuntu offers, none by default; installing it
 # makes that the compose `docker compose version` says), dpkg-query
 # (DOCKER_CE: docker-ce is installed), cloud-init, systemctl, ufw
-# (UFW_ACTIVE) and id (NOT_ROOT).
+# (UFW_ACTIVE), id (NOT_ROOT), and chown, which is only recorded, for the
+# aishie the run installs and runs: the tests are not root.
 cat > "$work/bin/apt-get" <<'EOF'
 #!/bin/sh
 echo "apt-get $*" >> "$CALLS"
@@ -55,6 +56,10 @@ cat > "$work/bin/id" <<'EOF'
 #!/bin/sh
 if [ "${1:-}" = -u ]; then echo "${NOT_ROOT:-0}"; else exec /usr/bin/id "$@"; fi
 EOF
+cat > "$work/bin/chown" <<'EOF'
+#!/bin/sh
+echo "chown $*" >> "$CALLS"
+EOF
 chmod +x "$work/bin"/*
 
 REG=ghcr.io/aishie-education
@@ -80,7 +85,7 @@ setup() {
   export AISHIE_ETC=$FAKE/etc AISHIE_STATE=$FAKE/state AISHIE_APP=$FAKE/opt AISHIE_DATA=$FAKE/srv \
     AISHIE_BACKUPS=$FAKE/backups AISHIE_BIN=$FAKE/usr-local-bin AISHIE_UNITS=$FAKE/units \
     AISHIE_LOCK_FILE=$FAKE/lock AISHIE_LOG_FILE=$FAKE/log AISHIE_HEALTH_TRIES=3
-  unset PULL_FAIL CADDY_FAIL FLOCK_FAIL COMPOSE_PULL_FAIL APT_COMPOSE DOCKER_CE UFW_ACTIVE NOT_ROOT COMPOSE_VERSION INVOCATION_ID \
+  unset PULL_FAIL CADDY_FAIL FLOCK_FAIL COMPOSE_PULL_FAIL ISSUE_FAIL SERVICE_TOKEN APT_COMPOSE DOCKER_CE UFW_ACTIVE NOT_ROOT COMPOSE_VERSION INVOCATION_ID \
     S3_LIST S3_HEAD S3_CORS_GET S3_CORS_PUT S3_DOWN AISHIE_STORAGE AISHIE_S3_BUCKET AISHIE_S3_REGION AISHIE_S3_ENDPOINT \
     AISHIE_S3_PATH_STYLE AISHIE_R2_ACCOUNT_ID AISHIE_R2_JURISDICTION AISHIE_S3_ACCESS_KEY AISHIE_S3_SECRET_KEY
   image core "$A" v0.2.0 abc1234
@@ -213,7 +218,7 @@ called "chown root:65532 $kek.new" || fail "kek/v1 not given to the runtime's gr
 for d in "$AISHIE_ETC" "$AISHIE_ETC/runtime" "$AISHIE_STATE" "$AISHIE_BACKUPS"; do
   [ "$(mode "$d")" = 700 ] || fail "$d is $(mode "$d")"
 done
-for d in agents secrets secrets/kek; do
+for d in agents secrets secrets/kek secrets/core; do
   [ "$(mode "$AISHIE_ETC/runtime/$d")" = 750 ] || fail "runtime/$d is $(mode "$AISHIE_ETC/runtime/$d")"
   called "chown root:65532 $AISHIE_ETC/runtime/$d$" || fail "runtime/$d not given to the runtime's group"
 done
@@ -246,19 +251,46 @@ done
 grep -q "^CORE_REF=$REG/aishie-core@sha256:$A$" "$AISHIE_STATE/images.env" || fail "core not deployed: $(cat "$AISHIE_STATE/images.env")"
 grep -q "^RUNTIME_REF=$REG/aishie-agent-runtime@sha256:$B$" "$AISHIE_STATE/images.env" || fail "the runtime not deployed"
 grep -q "^WEB_REF=$REG/aishie-frontend@sha256:$C$" "$AISHIE_STATE/images.env" || fail "the web not deployed"
-[ "$(grep -c 'flock -w 600 9' "$CALLS")" = 2 ] || fail "the recreate did not take aishie-update's lock"
+# aishie-update's, aishie runtime-credential's (below), and this one's.
+[ "$(grep -c 'flock -w 600 9' "$CALLS")" = 3 ] || fail "the recreate did not take aishie-update's lock"
 [ "$(grep -n 'flock -w 600 9' "$CALLS" | tail -n 1 | cut -d: -f1)" -lt "$(grep -n 'up -d --no-deps web' "$CALLS" | tail -n 1 | cut -d: -f1)" ] ||
   fail "the web was recreated outside the lock"
+# The runtime's credential for Core: issued once Core was migrated, by Core's
+# `service issue` in the image Core runs, with --replace; its standard output
+# put in the file whole, under another name until it was, root's alone, then
+# the runtime's user's, still 0600, in a directory of the runtime's group;
+# and the runtime recreated after, to take it.
+cred=$AISHIE_ETC/runtime/secrets/core/agent_runtime
+line() { grep -n -- "$1" "$CALLS" | head -n 1 | cut -d: -f1; }
+[ "$(grep -c 'service issue' "$CALLS")" = 1 ] || fail "issued $(grep -c 'service issue' "$CALLS") credentials"
+called "^docker compose --project-directory $AISHIE_APP -f $AISHIE_APP/compose.yaml run --rm --no-deps -T core service issue agent_runtime --label runtime --replace$" ||
+  fail "not issued by Core's service issue, with --replace: $(grep 'service issue' "$CALLS")"
+[ "$(line 'run -d --no-deps core migrate up')" -lt "$(line 'service issue')" ] || fail "issued before Core was migrated"
+[ -s "$cred" ] || fail "no credential in $cred"
+[ "$(cat "$cred")" = "$(tail -n 1 "$FAKE/issued")" ] || fail "the file is not what Core printed"
+[ "$(wc -l < "$cred")" = 1 ] || fail "the file is not Core's one line"
+[ "$(mode "$cred")" = 600 ] || fail "the credential is $(mode "$cred")"
+called "chown 65532:65532 $cred.new$" || fail "the credential not given to the runtime's user: $(grep chown "$CALLS")"
+! ls "$cred".* >/dev/null 2>&1 || fail "left $(ls "$cred".*)"
+[ "$(line 'service issue')" -lt "$(line 'up -d --no-deps --force-recreate runtime')" ] || fail "the runtime was not recreated after the issue"
+said "aishie: kept in $cred, which the runtime reads as secret://core/agent_runtime" || fail "said: $(cat "$FAKE/out")"
+said "credential 0192f3c1-.* for the site service agent_runtime, 0 other(s) revoked$" || fail "Core's description not shown: $(cat "$FAKE/out")"
+! said "shown once" || fail "said the credential is shown"
+! said "runtime's credential for Core, which it hosts agents with" || fail "said the credential is left to do"
 # What is left, said; and no secret anywhere in what it printed.
 said "Point test.aishie.app at this server" || fail "no DNS step: $(cat "$FAKE/out")"
 said "aishie admin" || fail "no step for the first administrator"
 said "install -g 65532 -m 640 tutor.yaml" || fail "no agent step"
+said "names its agent_id and holds no token" || fail "the agent step does not say agents name their agent_id: $(cat "$FAKE/out")"
+! said "core_token" || fail "the agent step still has a token pasted: $(cat "$FAKE/out")"
 said "it holds SIGNING_KEY, SECRETS_KEY and the runtime's key" || fail "no step to keep a copy of the keys: $(cat "$FAKE/out")"
+said "runtime's credential for Core (README.md, What to keep off the server)" || fail "the copy step does not name the credential: $(cat "$FAKE/out")"
 ! said "docker login" || fail "asked to log in, though every pull worked"
 ! said "notice:" || fail "said a notice: $(cat "$FAKE/out")"
-for secret in "$core_pw" "$runtime_pw" "$(setting postgres.env POSTGRES_PASSWORD)" "$(setting core.env SIGNING_KEY)" "$secrets_key" "$(cat "$kek")"; do
+for secret in "$core_pw" "$runtime_pw" "$(setting postgres.env POSTGRES_PASSWORD)" "$(setting core.env SIGNING_KEY)" "$secrets_key" "$(cat "$kek")" "$(cat "$cred")"; do
   if grep -qF -- "$secret" "$FAKE/out" "$CALLS" "$FAKE/log"; then fail "a secret is in the output, a command line or the log"; fi
 done
+if grep -qrF -- "$(cat "$cred")" "$FAKE/journal" "$AISHIE_STATE" 2>/dev/null; then fail "the credential is in the journal or the state"; fi
 
 # Run again: this copy's files over the old ones, and the settings, the
 # secrets and the key as they were.
@@ -275,6 +307,34 @@ said "kek/v1 is there already: left as it is" || fail "said: $(cat "$FAKE/out")"
 ! said "added SECRETS_KEY" || fail "added SECRETS_KEY to a core.env that has it: $(cat "$FAKE/out")"
 [ "$(grep -c 'up to date' "$FAKE/out")" = 3 ] || fail "the update did something: $(cat "$FAKE/out")"
 ! called "pg_dump" || fail "backed up, with nothing to deploy"
+# ... the runtime's credential among them, byte for byte (above): no issue,
+# and the runtime not recreated for it.
+said "core/agent_runtime is there already: left as it is" || fail "said: $(cat "$FAKE/out")"
+! called "service issue" || fail "issued a credential beside the one there: $(grep 'service issue' "$CALLS")"
+! called "force-recreate" || fail "recreated the runtime: $(grep force-recreate "$CALLS")"
+[ "$(wc -l < "$FAKE/issued")" = 1 ] || fail "Core issued $(wc -l < "$FAKE/issued") credentials in all"
+
+# The credential's file lost, or emptied: issued once again, with --replace,
+# which revokes the one lost, into the file, and the runtime recreated with
+# it; nothing else in $AISHIE_ETC changes, and nothing prints it.
+case=credential-lost
+for how in removed emptied; do
+  old=$(cat "$cred")
+  if [ $how = removed ]; then rm "$cred"; else : > "$cred"; fi
+  others=$(sums | grep -v ' \./runtime/secrets/core/agent_runtime$')
+  : > "$CALLS"
+  setup_server test.aishie.app edge || fail "$how: exit $?: $(cat "$FAKE/out")"
+  [ "$(grep -c 'service issue' "$CALLS")" = 1 ] || fail "$how: issued $(grep -c 'service issue' "$CALLS") credentials"
+  called "run --rm --no-deps -T core service issue agent_runtime --label runtime --replace$" || fail "$how: not with --replace: $(grep 'service issue' "$CALLS")"
+  [ "$(cat "$cred")" = "$(tail -n 1 "$FAKE/issued")" ] || fail "$how: the file is not what Core printed"
+  [ "$(cat "$cred")" != "$old" ] || fail "$how: the credential is the old one"
+  [ "$(mode "$cred")" = 600 ] || fail "$how: the credential is $(mode "$cred")"
+  said "other(s) revoked$" || fail "$how: Core's description not shown: $(cat "$FAKE/out")"
+  called "up -d --no-deps --force-recreate runtime" || fail "$how: the runtime was not recreated"
+  [ "$(sums | grep -v ' \./runtime/secrets/core/agent_runtime$')" = "$others" ] || fail "$how: changed another file in $AISHIE_ETC"
+  if grep -qF -- "$(cat "$cred")" "$FAKE/out" "$CALLS" "$FAKE/log"; then fail "$how: the credential is in the output, a command line or the log"; fi
+done
+case=again
 # ... another name, given by mistake: said, and aishie.env left as it is.
 setup_server other.aishie.app edge || fail "exit $?: $(cat "$FAKE/out")"
 said "warning: .*aishie.env says HOST=test.aishie.app, not other.aishie.app" || fail "no warning: $(cat "$FAKE/out")"
@@ -377,6 +437,28 @@ said "read:packages" || fail "the token's scope is not said"
 said "(classic)" || fail "the token's kind is not said"
 [ -e "$AISHIE_ETC/core.env" ] || fail "the settings were not written before the pull"
 ! grep -q "_REF=" "$AISHIE_STATE/images.env" || fail "deployed something: $(cat "$AISHIE_STATE/images.env")"
+! called "service issue" || fail "issued a credential with no Core"
+said "^     aishie runtime-credential$" || fail "what is left does not give the runtime its credential: $(cat "$FAKE/out")"
+
+# A Core from before migration 0025, which has no agent_runtime service:
+# Core's refusal shown, nothing kept, and the rest of the run as it was, but
+# for a step of what is left.
+setup issue-refused
+ISSUE_FAIL=1 setup_server test.aishie.app edge || fail "failed for a Core that cannot issue the credential: $(cat "$FAKE/out")"
+called "service issue agent_runtime --label runtime --replace" || fail "did not ask Core: $(cat "$CALLS")"
+said "no site service \"agent_runtime\"" || fail "Core's refusal not shown: $(cat "$FAKE/out")"
+said "warning: the runtime was not given its credential for Core" || fail "said: $(cat "$FAKE/out")"
+said "^     aishie runtime-credential$" || fail "not in what is left: $(cat "$FAKE/out")"
+if [ -e "$AISHIE_ETC/runtime/secrets/core/agent_runtime" ] || ls "$AISHIE_ETC/runtime/secrets/core/agent_runtime".* >/dev/null 2>&1; then
+  fail "left a file: $(ls "$AISHIE_ETC/runtime/secrets/core")"
+fi
+! called "force-recreate" || fail "recreated the runtime for nothing"
+grep -q "^WEB_REF=" "$AISHIE_STATE/images.env" || fail "stopped before the web"
+# ... and once Core has it, the run after issues it.
+: > "$CALLS"
+setup_server test.aishie.app edge || fail "exit $?: $(cat "$FAKE/out")"
+[ -s "$AISHIE_ETC/runtime/secrets/core/agent_runtime" ] || fail "not issued once Core could"
+! said "aishie runtime-credential$" || fail "still left to do: $(cat "$FAKE/out")"
 
 # Stable: no channel until a person sets the releases, so no update.
 setup stable
@@ -387,6 +469,13 @@ for n in CORE_IMAGE RUNTIME_IMAGE WEB_IMAGE; do
 done
 ! called "docker pull" || fail "pulled something: $(grep 'docker pull' "$CALLS")"
 said "Set the releases stable runs" || fail "said: $(cat "$FAKE/out")"
+# ... nor Core to issue the runtime its credential: what is left says how,
+# once it runs.
+! called "service issue" || fail "issued a credential with no Core"
+said "Core is not deployed yet: the runtime is given its credential for Core once it is" || fail "said: $(cat "$FAKE/out")"
+said "The runtime's credential for Core, which it hosts agents with" || fail "not in what is left: $(cat "$FAKE/out")"
+said "^     aishie runtime-credential$" || fail "what is left does not say how: $(cat "$FAKE/out")"
+[ ! -e "$AISHIE_ETC/runtime/secrets/core/agent_runtime" ] || fail "wrote a credential"
 
 # The old names as arguments: taken as edge and stable, said, and a new
 # server's aishie.env written with the new names.
@@ -438,9 +527,12 @@ tag "$REG/aishie-agent-runtime:0.4.0" "$B"
 tag "$REG/aishie-frontend:0.3.0" "$C"
 setup_server aishie.example.edu stable || fail "exit $?: $(cat "$FAKE/out")"
 sed -i "s/^ENVIRONMENT=stable$/ENVIRONMENT=production/; s|^CORE_IMAGE=.*|CORE_IMAGE=$REG/aishie-core:0.2.0|; s|^RUNTIME_IMAGE=.*|RUNTIME_IMAGE=$REG/aishie-agent-runtime:0.4.0|; s|^WEB_IMAGE=.*|WEB_IMAGE=$REG/aishie-frontend:0.3.0|" "$AISHIE_ETC/aishie.env"
+# Nothing had deployed Core, so the runtime has no credential for Core yet:
+# the one file this run writes.
 before=$(sums)
 setup_server aishie.example.edu stable || fail "exit $?: $(cat "$FAKE/out")"
-[ "$(sums)" = "$before" ] || fail "changed $AISHIE_ETC"
+[ "$(sums | grep -v ' \./runtime/secrets/core/agent_runtime$')" = "$before" ] || fail "changed $AISHIE_ETC"
+[ -s "$AISHIE_ETC/runtime/secrets/core/agent_runtime" ] || fail "the runtime was not given its credential once Core ran"
 said "notice: .*aishie.env says ENVIRONMENT=production, the name stable had before" || fail "said: $(cat "$FAKE/out")"
 grep -q "^CORE_REF=$REG/aishie-core@sha256:$A$" "$AISHIE_STATE/images.env" || fail "core not deployed: $(cat "$AISHIE_STATE/images.env")"
 grep -q "^WEB_REF=$REG/aishie-frontend@sha256:$C$" "$AISHIE_STATE/images.env" || fail "the web not deployed: $(cat "$AISHIE_STATE/images.env")"
