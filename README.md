@@ -750,21 +750,26 @@ identity provider gives you:
 OIDC_ISSUER=https://adfs.example.edu/adfs
 OIDC_CLIENT_ID=<the client's id>
 OIDC_CLIENT_SECRET=<its secret, in single quotes if it has a $ in it>
-OIDC_DISPLAY_NAME=PolyU NetID
+OIDC_PROVIDER_NAME=school-adfs
+OIDC_DISPLAY_NAME=School NetID
 ```
 
-and `aishie compose up -d core`. `OIDC_DISPLAY_NAME` is the provider's name
-on the sign-in page's button: at most 64 printable characters, or Core
-refuses to start (`aishie logs core` says why); unset, the page uses words
-of its own. `env/core.env.example` has the rest
-(`OIDC_PROVIDER_NAME`, `OIDC_SUBJECT_CLAIM`, `OIDC_SCOPES`), and Core's
-README, Single sign-on, what they do.
+and `aishie compose up -d core`. `OIDC_PROVIDER_NAME` is the provider's
+id, which every account linked to it is recorded under: give it one of your
+own before anyone is linked, and never change it after, or nobody linked
+can sign in. A server that has had single sign-on without it is on Core's
+default, `polyu-adfs`, and keeps it: leave it unset there.
+`OIDC_DISPLAY_NAME` is the provider's name on the sign-in page's button: at
+most 64 printable characters, or Core refuses to start (`aishie logs core`
+says why); unset, the page uses words of its own. `env/core.env.example`
+has the rest (`OIDC_SUBJECT_CLAIM`, `OIDC_SCOPES`), and Core's README,
+Single sign-on, what they do.
 
 Nothing about single sign-on is built into the web image, which is the same
 for every server. The sign-in page asks Core, at `GET /v1/auth/methods`,
 which buttons to show and what each says:
 `{"password": true, "sso": null}` without single sign-on,
-`{"password": true, "sso": {"label": "PolyU NetID", "start": "/v1/auth/sso/start"}}`
+`{"password": true, "sso": {"label": "School NetID", "start": "/v1/auth/sso/start"}}`
 with it; a Core with the site's providers also lists, in `sso_providers`,
 each one a sign-in may go through now, the operator's first. The route is
 under `/v1`, which Caddy already sends to Core; it says nothing of a
