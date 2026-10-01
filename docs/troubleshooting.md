@@ -143,6 +143,29 @@ organization grants an account read access in each package's settings
   the running version; the journal has what the new one said. Fix the YAML
   (it must pass both), `aishie compose kill -s HUP runtime`, then
   `aishie-update --retry runtime`.
+- **`the runtime was not given its credential for Core`** (from
+  `setup-server.sh`), or `Core issued no credential` (from
+  `aishie runtime-credential`). Core is not deployed yet, or runs a release
+  from before migration 0025, which has no `agent_runtime` service: Core
+  says `no site service "agent_runtime"`, or does not know `service` at
+  all. Nothing was written, and nothing revoked. Once
+  `aishie-update --status` shows Core on a release that has it:
+  `aishie runtime-credential` (README.md, The runtime's credential for
+  Core).
+- **The runtime hosts nothing, and its log says Core refused its
+  credential (401).** The credential in
+  `/etc/aishie/runtime/secrets/core/agent_runtime` was revoked: by an
+  administrator in the site, or a copy of `/etc/aishie` from before the
+  last rotation was put back. `aishie runtime-credential` has Core issue
+  another and recreates the runtime with it. Never edit or empty the file
+  by hand: a run of `setup-server.sh` issues a new one into an empty file,
+  but leaves anything else as it is.
+- **An owner's own tool (Claude Desktop, say) stopped working with an
+  agent's token after Core was updated.** Core's migration 0025 made the
+  agent a runtime agent, hosted here alone, and revoked its other tokens.
+  Nothing on the server brings them back: the owner makes an mcp agent for
+  that tool, and issues it a token in the site (README.md, Core's migration
+  0025).
 - **Caddy has no certificate.** `aishie logs caddy`. The DNS name must
   resolve to this server, and 80 and 443 must be open to the internet (the
   provider's firewall; ufw does not matter for Docker's published ports).
