@@ -740,7 +740,13 @@ and never changed but by a rotation, with the old key kept until
 everything is sealed again under the new one
 ([Rotating secrets](#rotating-secrets)). A provider whose secret no key of
 Core's opens is not offered (`secret_unavailable`) until an administrator
-gives it its secret again.
+gives it its secret again. Core reaches the site's providers at public
+addresses only: a provider on the school's own network (an ADFS whose name
+resolves to a `10.` address), or a server that reaches the internet through
+a proxy, needs `SSO_ALLOW_PRIVATE_ISSUERS=true` in `/etc/aishie/core.env`
+and `aishie compose up -d core`; until then `sso.test` says why, and a
+sign-in through it fails (`sso_provider_unavailable`, `aishie logs core`
+says why). Core's README, Single sign-on, has the addresses it refuses.
 
 **The operator's provider** is on exactly when `OIDC_ISSUER` is set in
 `/etc/aishie/core.env`; administrators see it read-only. Set what the
