@@ -24,7 +24,9 @@
 # Without them, and with nobody to ask, it is the disk. A bucket is checked
 # with the keys before anything is written, by reading alone, and given the
 # CORS rule the site's uploads need when the keys may set it; else the rule
-# is printed, with where to set it.
+# is printed, with where to set it. A bucket that needs a Core from its main
+# since 1 October 2026 (--s3-path-style no, or an AWS region newer than the
+# table of Core's S3 client) is said to need one.
 #
 # It installs Docker Engine and its compose plugin where they are missing:
 # Ubuntu's own packages (docker.io and docker-compose-v2) when those give
@@ -548,6 +550,7 @@ main() {
     # Before anything is written: refused keys stop the run here, and the
     # next run asks again.
     st_check
+    st_core_reads_lookup
   fi
 
   say "Settings and secrets in $ETC"

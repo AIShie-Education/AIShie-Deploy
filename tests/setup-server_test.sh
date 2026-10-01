@@ -576,8 +576,10 @@ AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage aws --s
 [ "$(setting core.env S3_ENDPOINT)" = s3.ap-east-1.amazonaws.com ] || fail "S3_ENDPOINT=$(setting core.env S3_ENDPOINT)"
 [ "$(setting core.env S3_BUCKET)" = aishie-files ] || fail "S3_BUCKET=$(setting core.env S3_BUCKET)"
 [ "$(setting core.env S3_REGION)" = ap-east-1 ] || fail "S3_REGION=$(setting core.env S3_REGION)"
+[ "$(setting core.env S3_BUCKET_LOOKUP)" = auto ] || fail "S3_BUCKET_LOOKUP=$(setting core.env S3_BUCKET_LOOKUP)"
 [ "$(setting core.env S3_USE_SSL)" = true ] || fail "S3_USE_SSL=$(setting core.env S3_USE_SSL)"
 [ "$(setting core.env S3_ACCESS_KEY)" = "$AK" ] || fail "S3_ACCESS_KEY is not the key given"
+! said "needs a Core whose help names S3_BUCKET_LOOKUP" || fail "said a Core from after S3_BUCKET_LOOKUP is needed: $(cat "$FAKE/out")"
 # In single quotes, for its $, which Compose would take for a variable.
 [ "$(setting core.env S3_SECRET_KEY)" = "'$SK'" ] || fail "S3_SECRET_KEY is not the secret given, quoted"
 [ "$(setting core.env BLOB_FS_ROOT)" = /data/blobs ] || fail "BLOB_FS_ROOT=$(setting core.env BLOB_FS_ROOT)"
@@ -616,7 +618,37 @@ AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage s3 --s3
   fail "exit $?: $(cat "$FAKE/out")"
 [ "$(setting core.env S3_ENDPOINT) $(setting core.env S3_REGION) $(setting core.env S3_USE_SSL)" = "s3.example.edu us-east-1 true" ] ||
   fail "s3: $(setting core.env S3_ENDPOINT) $(setting core.env S3_REGION) $(setting core.env S3_USE_SSL)"
+[ "$(setting core.env S3_BUCKET_LOOKUP)" = auto ] || fail "S3_BUCKET_LOOKUP=$(setting core.env S3_BUCKET_LOOKUP)"
 called "https://s3.example.edu/files/?list-type=2" || fail "not by path: $(grep aws-sigv4 "$CALLS" | head -n 1)"
+# A service that takes only virtual-hosted requests, and an AWS region
+# newer than the table of Core's S3 client: each said to need a Core that
+# reads S3_BUCKET_LOOKUP, which the first update deploys.
+setup s3-dns
+AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage s3 --s3-endpoint s3.example.edu --s3-bucket files --s3-path-style no test.aishie.app edge ||
+  fail "exit $?: $(cat "$FAKE/out")"
+[ "$(setting core.env S3_ENDPOINT) $(setting core.env S3_BUCKET_LOOKUP)" = "s3.example.edu dns" ] ||
+  fail "s3, virtual-hosted: $(setting core.env S3_ENDPOINT) $(setting core.env S3_BUCKET_LOOKUP)"
+called "https://files.s3.example.edu/?list-type=2" || fail "not in the host name: $(grep aws-sigv4 "$CALLS" | head -n 1)"
+said "--s3-path-style no needs a Core whose help names S3_BUCKET_LOOKUP (any from its main since 1 October 2026): the first Core this server deploys must be one" ||
+  fail "said: $(cat "$FAKE/out")"
+grep -q "^CORE_REF=" "$AISHIE_STATE/images.env" || fail "stopped before the first update"
+setup aws-new-region
+AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage aws --s3-region ap-southeast-9 --s3-bucket aishie-files test.aishie.app edge ||
+  fail "exit $?: $(cat "$FAKE/out")"
+[ "$(setting core.env S3_ENDPOINT) $(setting core.env S3_REGION)" = "s3.ap-southeast-9.amazonaws.com ap-southeast-9" ] ||
+  fail "aws: $(setting core.env S3_ENDPOINT) $(setting core.env S3_REGION)"
+said "the region ap-southeast-9, newer than the table of Core's S3 client, needs a Core" || fail "said: $(cat "$FAKE/out")"
+# ... asked, with someone to answer: Enter leaves it to Core's S3 client.
+setup s3-asked
+printf '5\ns3.example.edu\n\nfiles\nno\n%s\n%s\n' "$AK" "$SK" > "$FAKE/answers"
+ANSWERS=$FAKE/answers setup_server test.aishie.app edge || fail "exit $?: $(cat "$FAKE/out")"
+said "Bucket in the path, https://HOST/BUCKET/KEY (yes), or in the host name, https://BUCKET.HOST/KEY (no)" || fail "not asked: $(cat "$FAKE/out")"
+[ "$(setting core.env S3_REGION) $(setting core.env S3_BUCKET_LOOKUP)" = "us-east-1 dns" ] ||
+  fail "answers: $(setting core.env S3_REGION) $(setting core.env S3_BUCKET_LOOKUP)"
+setup s3-asked-enter
+printf '5\ns3.example.edu\n\nfiles\n\n%s\n%s\n' "$AK" "$SK" > "$FAKE/answers"
+ANSWERS=$FAKE/answers setup_server test.aishie.app edge || fail "exit $?: $(cat "$FAKE/out")"
+[ "$(setting core.env S3_BUCKET_LOOKUP)" = auto ] || fail "Enter: S3_BUCKET_LOOKUP=$(setting core.env S3_BUCKET_LOOKUP)"
 
 # Asked, with someone to answer: the menu, then what the choice needs, the
 # secret not shown. Enter alone is this server's disk.
@@ -653,6 +685,11 @@ if AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage s3 -
   fail "took an http:// endpoint"
 fi
 said "refuse to send it to an http:// address" || fail "said: $(cat "$FAKE/out")"
+if AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage aws --s3-region mars-north-1 --s3-bucket files test.aishie.app edge; then
+  fail "took the region mars-north-1"
+fi
+said "not an AWS region's name" || fail "said: $(cat "$FAKE/out")"
+if [ -s "$CALLS" ] || [ -e "$AISHIE_ETC" ]; then fail "did something for mars-north-1"; fi
 
 # Keys that may not set the bucket's CORS rules: the rule, where to set it,
 # and a step of what is left; the rest goes on.

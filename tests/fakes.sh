@@ -29,6 +29,8 @@
 #                          input, with the keys it signed with
 #   s3-requests            "METHOD URL" of each request to the bucket
 #   s3-cors                the bucket's CORS rules, as PUT
+#   rclone.conf            the configuration rclone's container was last
+#                          given
 #
 # Knobs, in the environment: PULL_FAIL, MIGRATE_FAIL, SEED_FAIL, CHECK_FAIL,
 # BACKUP_FAIL, POSTGRES_FAIL, CADDY_FAIL, COMPOSE_PULL_FAIL and FLOCK_FAIL make
@@ -43,6 +45,8 @@
 # standard error, the token alone on standard output. A one-off `service
 # issue` prints a new aissvc_ credential as Core does, or SERVICE_TOKEN;
 # ISSUE_FAIL fails it, as a Core from before the agent_runtime service does.
+# A one-off `help` names S3_BUCKET_LOOKUP, but with OLD_CORE_HELP, as a Core
+# from before it.
 
 # make_fakes DIR: the stand-ins, in DIR, to put first on PATH.
 make_fakes() {
@@ -120,6 +124,14 @@ compose() {
         echo "$tok" >> "$FAKE/issued"
         echo "credential 0192f3c1-0000-7000-8000-00000000000$revoked ($prefix) for the site service $3, $revoked other(s) revoked, shown once:" >&2
         echo "$tok"
+        exit 0
+      fi
+      if [ "$svc ${1:-}" = "core help" ]; then
+        # Core's help: a Core from before S3_BUCKET_LOOKUP (OLD_CORE_HELP)
+        # names it nowhere.
+        echo "aishie-core — AIshie Core, $(service_image core)"
+        echo "  S3_REGION         default us-east-1; the region requests are signed for"
+        [ -n "${OLD_CORE_HELP:-}" ] || echo "  S3_BUCKET_LOOKUP  auto (default), path or dns; how a request names the bucket"
         exit 0
       fi
       echo "$svc $* with $(service_image "$svc")"
@@ -299,6 +311,8 @@ done
 echo "rclone $*" >> "$CALLS"
 if [ -n "${RCLONE_FAIL:-}" ]; then echo "ERROR : failing, as the test asks" >&2; exit 1; fi
 [ -f "${mount[/work]}/rclone.conf" ] || { echo "no rclone.conf in /work" >&2; exit 1; }
+# The last one, for the tests to read once this run's directory is gone.
+cp "${mount[/work]}/rclone.conf" "$FAKE/rclone.conf"
 # here PATH: where a path in the container, or dst:BUCKET/..., is here.
 here() {
   case $1 in
