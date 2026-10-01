@@ -12,6 +12,8 @@
 #   local                  "REF HEX" lines: what this Docker has pulled
 #   running/SERVICE        the image each service's container runs
 #   oneoff/ID/             a one-off container: its exit code and output
+#   issued                 each credential Core's `service issue` printed,
+#                          one per line
 #   journal                what logger was given
 #
 #   compose-version        what `docker compose version --short` says
@@ -38,7 +40,9 @@
 # RCLONE_CORRUPT=KEY has a copy of KEY arrive with other bytes of the same
 # size, and RCLONE_ATTACH is below. BOOTSTRAP_TOKEN has a one-off bootstrap print it as a Core
 # from before people held no API tokens prints root's: under a heading on
-# standard error, the token alone on standard output.
+# standard error, the token alone on standard output. A one-off `service
+# issue` prints a new aissvc_ credential as Core does, or SERVICE_TOKEN;
+# ISSUE_FAIL fails it, as a Core from before the agent_runtime service does.
 
 # make_fakes DIR: the stand-ins, in DIR, to put first on PATH.
 make_fakes() {
@@ -78,7 +82,7 @@ compose() {
     "version --short") cat "$FAKE/compose-version" 2>/dev/null || echo "${COMPOSE_VERSION:-2.27.0}" ;;
     "pull -q "*) exit "${COMPOSE_PULL_FAIL:-0}" ;;
     "up -d --no-recreate --wait"*) exit "${POSTGRES_FAIL:-0}" ;;
-    "up -d --no-deps "*) service_image "$4" > "$FAKE/running/$4"; rm -f "$FAKE/stopped-$4" ;;
+    "up -d --no-deps "*) s=${*: -1}; service_image "$s" > "$FAKE/running/$s"; rm -f "$FAKE/stopped-$s" ;;
     "stop "*)
       touch "$FAKE/stopped-$2"
       if [ -x "$FAKE/on-stop" ]; then "$FAKE/on-stop"; fi ;;
@@ -101,6 +105,23 @@ compose() {
       svc=$5
       shift 5
       cat > "$FAKE/stdin"
+      if [ "$svc ${1:-} ${2:-}" = "core service issue" ]; then
+        # Core's `service issue SCOPE --label L [--replace]`: the
+        # credential alone on standard output, what it is on standard
+        # error.
+        if [ -n "${ISSUE_FAIL:-}" ]; then
+          echo "aishie-core: service issue: no site service \"$3\": agent_runtime or document_text" >&2
+          exit 1
+        fi
+        prefix=$(tr -dc 'a-z2-7' < /dev/urandom | head -c 12)
+        tok=${SERVICE_TOKEN:-aissvc_${prefix}_$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n')}
+        revoked=0
+        if [[ " $* " == *" --replace "* ]] && [ -f "$FAKE/issued" ]; then revoked=$(wc -l < "$FAKE/issued"); fi
+        echo "$tok" >> "$FAKE/issued"
+        echo "credential 0192f3c1-0000-7000-8000-00000000000$revoked ($prefix) for the site service $3, $revoked other(s) revoked, shown once:" >&2
+        echo "$tok"
+        exit 0
+      fi
       echo "$svc $* with $(service_image "$svc")"
       if [ "$1" = bootstrap ] && [ -n "${BOOTSTRAP_TOKEN:-}" ]; then
         printf 'root actor   0192f3c1-0000-7000-8000-000000000001\nsystem actor 0192f3c1-0000-7000-8000-000000000002\n\nAPI token for root, shown once:\n' >&2
