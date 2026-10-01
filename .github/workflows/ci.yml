@@ -73,16 +73,9 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-      packages: read # the three images, which are private
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # As root, as the server does it: setup-server.sh and aishie-update
-      # run as root and read root's Docker login. The packages are private:
-      # this works once an owner of the organization has let this
-      # repository read each of them, and tests/e2e.sh says so when a pull
-      # is refused.
-      - name: Log in to GHCR
-        env:
-          TOKEN: ${{ github.token }}
-        run: printf '%s\n' "$TOKEN" | sudo docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      # As root, as the server does it, with no login: the three packages
+      # are public, as servers pull them, and tests/e2e.sh says what to do
+      # if one is refused.
       - run: sudo --preserve-env=GITHUB_ACTIONS tests/e2e.sh

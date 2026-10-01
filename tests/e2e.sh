@@ -15,10 +15,10 @@
 # reaches it on 127.0.0.1 (curl --resolve), as a browser would reach the
 # server's public address.
 #
-# The images are the channels' :edge from ghcr.io, which the machine must be
-# logged in to (docker login ghcr.io). AISHIE_REGISTRY and the AISHIE_ paths
-# move things as they do for setup-server.sh, for a run against a registry
-# of one's own.
+# The images are the channels' :edge from ghcr.io, public packages, pulled
+# with no login, as a server pulls them. AISHIE_REGISTRY and the AISHIE_
+# paths move things as they do for setup-server.sh, for a run against a
+# registry of one's own (logged in to beforehand, if it needs it).
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -64,8 +64,8 @@ diagnose() {
 
 [ "$(id -u)" = 0 ] || die "run it as root (sudo tests/e2e.sh), on a machine that can be thrown away: it sets it up as a server"
 
-# The images, first: a private package this repository's workflows cannot
-# read is the one failure that needs a person, once, so it is said plainly.
+# The images, first: a package that is not public (any more) is the one
+# failure that needs a person, once, so it is said plainly.
 echo "# the images of $REGISTRY"
 denied=
 for pkg in aishie-core aishie-agent-runtime aishie-frontend; do
@@ -77,9 +77,9 @@ for pkg in aishie-core aishie-agent-runtime aishie-frontend; do
   cat "$work/pull.err" >&2
   denied=1
   if in_actions && [ "${REGISTRY%%/*}" = ghcr.io ]; then
-    echo "::error::Could not pull $img. The package is private, and this repository's workflows can read it only once an owner of the AIShie-Education organization (or an admin of the package) grants it, once: https://github.com/orgs/AIShie-Education/packages/container/$pkg/settings → Manage Actions access → Add Repository → AIShie-Deploy, role Read. (If the error above is not denied, unauthorized or not found, GHCR may be having trouble: re-run the job.)"
+    echo "::error::Could not pull $img. Servers pull it with no login, so the package must be public: an owner of the AIShie-Education organization (or an admin of the package) makes it so at https://github.com/orgs/AIShie-Education/packages/container/$pkg/settings → Danger Zone → Change visibility → Public. (If the error above is not denied, unauthorized or not found, GHCR may be having trouble: re-run the job.)"
   else
-    echo "e2e: could not pull $img: docker login ${REGISTRY%%/*} with a token that can read the package (classic, read:packages)" >&2
+    echo "e2e: could not pull $img: if the error above is denied or unauthorized, an old login to ${REGISTRY%%/*} is sent with the pull (docker logout ${REGISTRY%%/*}), or the package is not public; docs/troubleshooting.md, An image cannot be pulled" >&2
   fi
 done
 [ -z "$denied" ] || exit 1

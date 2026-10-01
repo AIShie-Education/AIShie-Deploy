@@ -488,20 +488,18 @@ pull_check() {
   [ -z "$bad" ]
 }
 
-login_help() {
+pull_help() {
   cat <<EOF
-   The images are private packages of the AIShie-Education organization on
-   GitHub's registry, ghcr.io, and this server is not logged in there with
-   an account that can read all three. GHCR takes a personal access token
-   (classic), not a fine-grained one. Make one with the scope read:packages
-   and nothing else, on an account that can read the three packages and
-   nothing more, with a long expiry whose date you put in a calendar (once
-   it expires, updates stop: docs/troubleshooting.md, GHCR login expired).
-   Then, as root, paste the token when asked, then Enter and Ctrl-D:
-
-     docker login ghcr.io -u <that account's GitHub user name> --password-stdin
-
-   Docker keeps it in /root/.docker/config.json. Then: aishie-update
+   The images are public packages of the AIShie-Education organization on
+   GitHub's registry, ghcr.io, which this server pulls with no login. The
+   error above says why it could not:
+   - denied or unauthorized: an old login to ghcr.io, whose token has
+     expired, is still sent with every pull. As root: docker logout ghcr.io
+   - not found: the channel in $ETC/aishie.env names an image or a tag that
+     is not published (yet).
+   - anything else: this server cannot reach ghcr.io (DNS, a firewall, a
+     proxy), or GHCR is having trouble.
+   (docs/troubleshooting.md, An image cannot be pulled.) Then: aishie-update
 EOF
 }
 
@@ -618,8 +616,8 @@ MSG
   compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 || true
 
   say "The images"
-  login=
-  pull_check || login=1
+  pull_left=
+  pull_check || pull_left=1
   failed=
   credential_left=
   if [ "$environment" = stable ] && ! grep -q '^CORE_IMAGE=.' "$ETC/aishie.env"; then
@@ -651,10 +649,9 @@ MSG
 
   say "Done. What is left"
   n=1
-  if [ -n "$login" ]; then
-    echo "$n. Let this server pull the images it could not (above; a package that is not"
-    echo "   published yet answers the same):"
-    login_help
+  if [ -n "$pull_left" ]; then
+    echo "$n. Let this server pull the images it could not (above):"
+    pull_help
     n=$((n + 1))
   fi
   if [ -n "$cors_left" ]; then

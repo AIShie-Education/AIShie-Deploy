@@ -313,7 +313,7 @@ called "rm -s -f core" || fail "left the new core in place"
 ! called "runtime" || fail "went on to the runtime"
 grep -q "nothing ran before it, and nothing runs now" "$FAKE/log" || fail "log: $(cat "$FAKE/log")"
 
-# A pull that fails (the server's login to ghcr.io has expired): the run
+# A pull that fails (an old login to ghcr.io whose token has expired): the run
 # stops, the log has it once, and nothing changes.
 setup pull-fails
 deployed
