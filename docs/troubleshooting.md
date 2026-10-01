@@ -236,7 +236,7 @@ Then `aishie-update` runs now instead of in five minutes.
   why it refuses: keys deleted or mistyped, the wrong region, a bucket that
   is gone. Fix `core.env`, then `aishie compose up -d core`. With
   `S3_BUCKET_LOOKUP=dns`, or an AWS region newer than Core's S3 client
-  knows, a Core from before 1 October 2026 addresses the bucket by its
+  knows, a Core from before its PR #46 (d8f256c) addresses the bucket by its
   path, or sends to us-east-1: `aishie core help` names no
   `S3_BUCKET_LOOKUP`. Update Core (on stable, a newer `CORE_IMAGE`).
 - **`needs a Core whose help names S3_BUCKET_LOOKUP`** (from
@@ -244,8 +244,11 @@ Then `aishie-update` runs now instead of in five minutes.
   with `--s3-path-style no`, or in an AWS region newer than the table of
   Core's S3 client, which the Core the server runs does not do: nothing was
   changed. Update Core first (`aishie-update`; on stable, set `CORE_IMAGE`
-  to a release from Core's main since 1 October 2026), then run it again
-  (README.md, Where uploaded files are kept).
+  to a release from Core's main since its PR #46, d8f256c), then run it again
+  (README.md, Where uploaded files are kept). When it says the help `did
+  not run`, Docker could not start Core's container for it: its error is
+  just above (the daemon, or an image it could not pull); fix that and run
+  it again.
 - **`aishie storage migrate` stopped.** Nothing was switched: `core.env`
   is as it was, and if it had stopped Core it started it again. Fix what it
   names and run it again; it copies only what is not there yet. `the two

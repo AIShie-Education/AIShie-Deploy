@@ -563,15 +563,18 @@ means that takes no such name (`ST_AWS_CLIENT_REGIONS` in
 **The Core it needs.** A service that takes only virtual-hosted requests
 (`--s3-path-style no`, which core.env says to Core as
 `S3_BUCKET_LOOKUP=dns`), and an AWS region newer than that table, need a
-Core from its main since 1 October 2026, which reads `S3_BUCKET_LOOKUP`
-and sends a request to `S3_REGION` whatever its S3 client's table says;
-an older Core addresses the bucket by its path, and sends a request for a
-region it does not know to us-east-1, which refuses it. Such a Core names
-`S3_BUCKET_LOOKUP` in `aishie core help`. setup-server.sh and `aishie
-storage migrate` check that the Core the server runs is one before they
-change anything, and say so when none is deployed yet: on edge the first
-update deploys one; on stable, set `CORE_IMAGE` to such a release. Any
-other bucket works with any Core.
+Core from its main since its PR #46 (merge d8f256c, 30 September 2026
+UTC), which reads `S3_BUCKET_LOOKUP` and sends a request to `S3_REGION`
+whatever its S3 client's table says; an older Core addresses the bucket
+by its path, and sends a request for a region it does not know to
+us-east-1, which refuses it. Such a Core names `S3_BUCKET_LOOKUP` in
+`aishie core help`. setup-server.sh and `aishie storage migrate` check
+that the Core the server runs is one before they change anything, and say
+so when none is deployed yet: on edge the first update deploys one; on
+stable, set `CORE_IMAGE` to such a release, as setup-server.sh's last
+steps say (`docker run --rm IMAGE help` names `S3_BUCKET_LOOKUP`):
+`aishie-update` does not check it, and an older Core fails its first
+start. Any other bucket works with any Core.
 
 ### Setting it up
 
@@ -614,7 +617,9 @@ access), with keys that may do what Core does and no more:
   `arn:aws:s3:::BUCKET`, and `s3:GetObject`, `s3:PutObject` and
   `s3:DeleteObject` on `arn:aws:s3:::BUCKET/*`; with `s3:GetBucketCORS` and
   `s3:PutBucketCORS` on the bucket as well, setup-server.sh sets the CORS
-  rule itself.
+  rule itself. Outside the aws partition the ARNs name the region's:
+  `arn:aws-cn:s3:::` in China, `arn:aws-us-gov:s3:::` in GovCloud,
+  `arn:aws-eusc:s3:::` in the European Sovereign Cloud, and so on.
 - *R2*: an R2 API token with Object Read & Write, for that bucket alone.
   The account ID is in the bucket's S3 API address,
   `https://<account>.r2.cloudflarestorage.com/<bucket>`.
