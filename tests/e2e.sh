@@ -85,9 +85,10 @@ done
 [ -z "$denied" ] || exit 1
 
 # The server, set up as a person would set it up, with Core's files on its
-# disk: said, so that a run at a terminal is not asked.
+# disk: said, so that a run at a terminal is not asked. What it prints is
+# kept, to show that no secret is in it.
 echo "# setup-server.sh $name edge --storage fs"
-if ! sh "$root/setup-server.sh" "$name" edge --storage fs; then
+if ! sh "$root/setup-server.sh" "$name" edge --storage fs 2>&1 | tee "$work/setup.out"; then
   diagnose
   die "setup-server.sh failed (above)"
 fi
@@ -295,6 +296,48 @@ restorable() { [ "$(stat -c %a "$1")" = 600 ] && aishie compose exec -T postgres
 for s in core runtime; do
   check "$BACKUPS/$s-daily-$day.dump is a dump PostgreSQL can read, root's alone" restorable "$BACKUPS/$s-daily-$day.dump"
 done
+
+# The runtime's credential for Core, which a Core with the agent_runtime
+# service (migration 0025) issued at setup: in the file the runtime reads,
+# printed nowhere, and taken by Core, through Caddy, as the runtime will
+# send it; then issued anew by aishie runtime-credential, the one before
+# refused. The credential stays in files of root's, and reaches curl on its
+# standard input. A Core from before has no such service: setup-server.sh
+# wrote nothing, and said what is left.
+echo "# the runtime's credential for Core"
+cred=$ETC/runtime/secrets/core/agent_runtime
+# service_status FILE: the status of GET .../agents/<an id no agent has>
+# with the credential in FILE: 404 when Core takes it, 401 when it does not.
+service_status() {
+  local code
+  code=$({ printf 'header = "Authorization: Bearer '; tr -d '\n' < "$1"; printf '"\n'; } |
+    curl -sS --noproxy '*' --max-time 10 --config - --resolve "$name:443:127.0.0.1" --cacert "$work/root.crt" \
+      -o /dev/null -w '%{http_code}' "https://$name/v1/services/agent_runtime/agents/00000000-0000-7000-8000-000000000000") || code=000
+  echo "$code"
+}
+# nowhere_in CREDENTIAL FILE...: the credential is in none of the files.
+nowhere_in() { local c=$1; shift; ! grep -qsFf "$c" "$@"; }
+aishie core help > "$work/core-help" 2>/dev/null || true
+if grep -q 'service issue' "$work/core-help"; then
+  check "setup-server.sh gave the runtime its credential: one aissvc_ line, 0600, the runtime's user's" \
+    is "$(stat -c '%a %u:%g' "$cred") $(wc -l < "$cred") $(grep -cEx 'aissvc_[A-Za-z0-9_-]+' "$cred")" "600 65532:65532 1 1"
+  check "... printed nowhere: not in setup-server.sh's output, nor aishie-update's log" nowhere_in "$cred" "$work/setup.out" "$LOG_FILE"
+  check "... and Core takes it (404 for an id no agent has, not 401)" is "$(service_status "$cred")" 404
+  cp -p "$cred" "$work/before.cred"
+  runtime_before=$(aishie ps -q runtime)
+  aishie runtime-credential > "$work/rotate.out" 2>&1 || { cat "$work/rotate.out" >&2; fail "aishie runtime-credential failed"; }
+  check "aishie runtime-credential issued another, in its place, 0600, the runtime's user's" \
+    is "$(cmp -s "$cred" "$work/before.cred" && echo same) $(stat -c '%a %u:%g' "$cred") $(grep -cEx 'aissvc_[A-Za-z0-9_-]+' "$cred")" " 600 65532:65532 1"
+  check "... printed nowhere" nowhere_in "$cred" "$work/rotate.out"
+  check "... which Core takes" is "$(service_status "$cred")" 404
+  check "... and the one before is revoked" is "$(service_status "$work/before.cred")" 401
+  check "... and the runtime was recreated" test "$(aishie ps -q runtime)" != "$runtime_before"
+  rm -f "$work/before.cred"
+else
+  ok "Core has no agent_runtime service yet (a release from before migration 0025)"
+  check "... so setup-server.sh wrote no credential, and said what is left" \
+    is "$([ -e "$cred" ] && echo written) $(grep -c '^     aishie runtime-credential$' "$work/setup.out")" " 1"
+fi
 
 # Nothing new on the channels: a second run does nothing, and neither does
 # `docker compose up -d`, as after a reboot: what runs is pinned by digest.

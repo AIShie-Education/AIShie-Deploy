@@ -39,8 +39,8 @@ In this repository, and where `setup-server.sh` puts it:
 | `README.md`, `docs/` | `/opt/aishie/` | this, and [when something goes wrong](docs/troubleshooting.md) |
 | | `/etc/aishie/aishie.env` | the operator's settings: `HOST`, `ENVIRONMENT`, the channels, the network |
 | | `/etc/aishie/core.env`, `runtime.env`, `postgres.env` | each service's settings and secrets, root's (0600) |
-| | `/etc/aishie/runtime/agents/` | the agents' YAML, mounted read-only at `/config` |
-| | `/etc/aishie/runtime/secrets/` | their secrets, and `kek/v1`, mounted read-only at `/secrets` |
+| | `/etc/aishie/runtime/agents/` | the operator's agents' YAML, mounted read-only at `/config` |
+| | `/etc/aishie/runtime/secrets/` | their secrets, `kek/v1`, and `core/agent_runtime`, [the runtime's credential for Core](#the-runtimes-credential-for-core); mounted read-only at `/secrets` |
 | | `/var/lib/aishie/images.env` | what each service runs, by digest; `aishie-update` writes it |
 | | `/srv/aishie/core/` | the files people upload to Core, when it keeps them on this disk ([Where uploaded files are kept](#where-uploaded-files-are-kept)) |
 | | `/var/backups/aishie/` | the database backups |
@@ -123,7 +123,11 @@ institution allows for that.
    (`kek/v1`); installs the stack, the scripts and the timers; starts
    PostgreSQL and Caddy; checks that the server can pull the three images;
    and runs the first update, which deploys Core, the runtime and the web in
-   that order. It ends by printing what is left, which is what follows.
+   that order. Then Core, migrated, issues the runtime its credential for
+   Core, which goes into `/etc/aishie` too, printed nowhere, and the runtime
+   is recreated with it
+   ([The runtime's credential for Core](#the-runtimes-credential-for-core)).
+   It ends by printing what is left, which is what follows.
 
    If it stops, fix what it names and run it again: it never overwrites a
    setting, a secret or data.
@@ -142,9 +146,10 @@ institution allows for that.
    ```
 
    Then sign in at `https://test.aishie.app` with that email and password.
-   People have no API tokens, the administrator included: only agents do,
-   which `aishie core token issue` gives them
-   ([Adding an agent](#adding-an-agent)). A Core from before that still
+   People have no API tokens, the administrator included: only agents do.
+   An mcp agent's owner issues its tokens in the site; a runtime agent's one
+   token is issued to this server's runtime, and nobody sees it
+   ([Hosting agents](#hosting-agents)). A Core from before that still
    makes one for the administrator at bootstrap; `aishie admin` does not
    show it, and nothing keeps it. The long form, for a script: the password
    on standard input to
@@ -228,9 +233,10 @@ As root on the server:
 | `journalctl -u aishie-update` | every run, with each step's output |
 | `aishie ps` | the stack's containers |
 | `aishie logs core` | a service's log, followed (`runtime`, `web`, `caddy`, `postgres`) |
-| `aishie core …` | Core's commands with the image that runs: `migrate version`, `token issue --actor AGENT_ID --label L --days 90` (an agent's token), `secrets rewrap` ([Rotating secrets](#rotating-secrets)), `help` |
+| `aishie core …` | Core's commands with the image that runs: `migrate version`, `token issue --actor AGENT_ID --label L --days 90` (an mcp agent's token), `secrets rewrap` ([Rotating secrets](#rotating-secrets)), `help` |
 | `aishie runtime …` | the runtime's: `check --live`, `migrate version`, `help` |
 | `aishie runtime-status` | the runtime's `/status`: agents, seats, spend (it answers its own loopback only, which is what this reaches) |
+| `aishie runtime-credential` | the runtime's credential for Core issued anew, the ones before revoked, and the runtime recreated with it ([The runtime's credential for Core](#the-runtimes-credential-for-core)) |
 | `aishie compose …` | `docker compose` for the stack, with its settings files |
 | `aishie storage` | where Core keeps uploaded files; `check`, `cors`, and `migrate`, which moves them ([Where uploaded files are kept](#where-uploaded-files-are-kept)) |
 
@@ -254,10 +260,13 @@ ones `stack.yaml` sets from `aishie.env` (`PUBLIC_URL`, `TRUSTED_PROXIES`,
 `aishie-update`, `aishie`, the units; images update themselves): as root,
 `git -C AIShie-Deploy pull`, then `sh AIShie-Deploy/setup-server.sh
 <name> <environment>` again. It installs the new files and leaves the
-settings, the secrets and the data as they are, with one exception: a
+settings, the secrets and the data as they are, with two exceptions: a
 `core.env` from before `SECRETS_KEY` is given one, as a line at its end,
-and nothing else in it changes ([Single sign-on](#single-sign-on)). It
-says so when it does: copy `/etc/aishie` off the server again then.
+and nothing else in it changes ([Single sign-on](#single-sign-on)); and a
+runtime with no credential for Core, its file missing or empty, is issued
+one once Core runs
+([The runtime's credential for Core](#the-runtimes-credential-for-core)).
+It says so when it does: copy `/etc/aishie` off the server again then.
 
 **Changing the host name:** `HOST` in `aishie.env`, then
 `aishie compose up -d`: Core, the runtime and Caddy are recreated with the
@@ -351,31 +360,121 @@ The runtime's is the same with `runtime` and `aishie_runtime`. Answers the
 runtime had already posted to Core stay there; the runtime, missing their
 attempts, may find their keys taken and move on to the next attempt.
 
-## Adding an agent
+## Hosting agents
 
-The agents are YAML files in `/etc/aishie/runtime/agents` (the runtime's
-`docs/deploying.md` and `examples/` say what goes in them), and each secret
-a file refers to (`secret://agents/tutor/core_token`) is a file in
-`/etc/aishie/runtime/secrets` (`agents/tutor/core_token` there). Both are
+Every agent in Core is hosted one way, chosen when it is made and never
+changed afterwards:
+
+- **Runtime** (站內託管): run by this server's agent runtime, and by nothing
+  else. Its owner has the runtime host it from the site, choosing its model
+  and key; the runtime asks Core whether that person owns that agent and
+  whether it is a runtime agent, and is then issued the agent's one token,
+  by the agent's id, which it keeps sealed and nobody sees. Owners no longer
+  paste a token into the runtime, and hold none for a runtime agent: Core
+  refuses to issue them one. People ask the agent in the site while the
+  runtime hosts it.
+- **MCP** (MCP 存取): used from its owner's own tools (Claude Desktop, an
+  editor, a script) over MCP, with tokens the owner issues and revokes in
+  the site (`aishie core token issue --actor ID --label L --days 90` does
+  it from here). Nobody asks it in the site.
+
+Only this site's own runtime hosts agents. Core has one `agent_runtime`
+service for the site, whose credentials the operator issues here and the
+site's root and administrators in the site, and nothing but a token issued
+through it makes an agent answer in the site: a runtime set up elsewhere, a
+school's own, say, cannot connect to the site and host agents there. An
+agent used from elsewhere is an mcp agent, reached over MCP.
+
+### The runtime's credential for Core
+
+In Core the runtime is a site service, `agent_runtime`, as its transcriber
+is `document_text`, and it calls Core with a credential of its own, an
+`aissvc_…` token. With it, and with nothing else, it checks an agent's
+owner and is issued and revokes the agents' tokens. Without it, or with one
+Core has revoked, the runtime hosts nothing by agent id; revoking it does
+not revoke the agents' tokens.
+
+- **Made at setup.** Once Core runs, and so has migrated, `setup-server.sh`
+  runs `aishie runtime-credential`: Core's
+  `service issue agent_runtime --label runtime --replace`, in a one-off
+  container of the image Core runs, whose standard output, the credential
+  alone, goes straight into `/etc/aishie/runtime/secrets/core/agent_runtime`,
+  0600, the runtime's user's (65532), in a directory of root's and the
+  runtime's group's, mounted read-only at `/secrets`. The runtime reads it
+  as `secret://core/agent_runtime` (`CORE_SERVICE_CREDENTIAL` in
+  `runtime.env`, whose default that is). It is printed and logged nowhere:
+  what is shown is Core's standard error, which credential it issued (its
+  id and public prefix, as the site lists it) and how many it revoked. The
+  runtime is then recreated, to take it.
+- **Run again,** `setup-server.sh` leaves a file that is there as it is,
+  and issues a new one only when the file is missing or empty, `--replace`
+  revoking the one that was lost. With no Core deployed yet, or a Core from
+  before migration 0025, which has no such service, it says so, and what is
+  left has a step for `aishie runtime-credential`.
+- **Kept with the other secrets,** in `/etc/aishie`: back it up with it
+  ([What to keep off the server](#what-to-keep-off-the-server)). A lost one
+  is no loss: issue another. A copy put back from before a rotation holds a
+  credential Core has revoked, and needs `aishie runtime-credential` too.
+- **Rotating it:** `aishie runtime-credential`, at any time. Core issues a
+  new one and revokes the service's others, the file is replaced whole
+  (never half written; a refusal leaves it as it was), and the runtime is
+  recreated with it; the agents it hosts keep their tokens. Root and the
+  platform's administrators see the service's credentials in the site
+  (`service.list_credentials`) and may revoke one there; the runtime then
+  hosts nothing until `aishie runtime-credential`.
+
+### An operator's own agents
+
+An agent the operator configures, rather than its owner in the site, is a
+YAML file in `/etc/aishie/runtime/agents` (the runtime's
+`docs/deploying.md` and `examples/` say what goes in it). It is a runtime
+agent in Core, made with that hosting (in the site, or by an administrator,
+whose `actor.register` of an agent names its hosting), and its YAML names
+it by its `agent_id`, its actor id in Core, and holds no token: the runtime
+is issued its token with its credential, as for every runtime agent. Each
+secret the file refers to (a model's key, `secret://keys/tutor`, say) is a
+file in `/etc/aishie/runtime/secrets` (`keys/tutor` there). Both are
 root's, readable by group 65532, the runtime's user; the runtime cannot
 write them.
 
 ```
 install -g 65532 -m 640 tutor.yaml /etc/aishie/runtime/agents/
-install -D -g 65532 -m 640 /dev/stdin /etc/aishie/runtime/secrets/agents/tutor/core_token
-    (paste the token, Enter, Ctrl-D)
 aishie runtime check --live
 aishie compose kill -s HUP runtime
 ```
 
 `check --live` loads the configuration as the runtime will, connects each
 agent to Core and tries its model's key; `HUP` makes the runtime read its
-configuration again. An agent's Core token comes from Core:
-`aishie core token issue --actor <the agent's actor id> --label tutor --days 90`
-(Core's `docs/deploying.md`, An agent's token). Its `core.base_url` is
-`https://HOST`, the only Core the runtime here may connect to; inside the
-stack's network that name is Caddy (below), so the agents reach Core without
-leaving the server.
+configuration again. Its `core.base_url` is `https://HOST`, the only Core
+the runtime here may connect to; inside the stack's network that name is
+Caddy ([The network, and HOST inside it](#the-network-and-host-inside-it)),
+so the agents reach Core without leaving the server. An agent's token file
+from before (`/etc/aishie/runtime/secrets/agents/<name>/core_token`) is not
+needed any more: remove it once the runtime hosts the agent by its id.
+
+### Core's migration 0025: one hosting for each agent
+
+When `aishie-update` deploys a Core with migration 0025, every agent is
+given its hosting, for good:
+
+- an agent whose runtime had it answer in the site, with a token still
+  live, becomes a **runtime** agent. That token is taken as the runtime's,
+  so people ask it as before, and **every other live token of the agent is
+  revoked**: an owner's own tool connected to it (Claude Desktop, say) stops
+  working, and needs an mcp agent of its own;
+- every other agent becomes an **mcp** agent, its tokens as they were. One
+  the runtime ran that did not answer in the site, such as an operator's
+  YAML agent nobody owns, is not hosted here any more: make a runtime agent
+  in its place, and name that one in the YAML.
+
+The runtime needs its credential as soon as Core runs that release. On
+edge, the timer deploys Core and then the runtime in one run: run
+`setup-server.sh` again with this copy then
+([Day to day](#day-to-day)), or `aishie runtime-credential`. On stable,
+set Core's release first, `aishie-update`, `aishie runtime-credential`,
+then the runtime's release that hosts by agent id, and `aishie-update`
+again. That runtime issues each agent it hosts a token of its own on its
+first start, which revokes the one it was handed before.
 
 ## The school's AI plan
 
@@ -794,6 +893,12 @@ Framing goes two ways, and this stack allows both.
   are kept, since restoring one needs it back in `SECRETS_KEY_PREVIOUS`
   and a `secrets rewrap`. A key that is not 32 bytes in base64 stops Core
   from starting, and `aishie logs core` says which.
+- **The runtime's credential for Core**
+  (`runtime/secrets/core/agent_runtime`): `aishie runtime-credential` has
+  Core issue a new one and revoke the others, replaces the file whole, and
+  recreates the runtime with it
+  ([The runtime's credential for Core](#the-runtimes-credential-for-core)).
+  Then copy `/etc/aishie` off the server again.
 - **The runtime's key, `kek/v1`** (M2) wraps the secrets the runtime's API
   stores. It is never replaced in place: every file in `kek/` is kept for
   unwrapping, so a new key is added as `kek/v2`, `KMS_KEY_ID` in
@@ -815,16 +920,19 @@ The backups above sit on the same disk as the database. Copy these
 somewhere else, regularly:
 
 - `/etc/aishie/`, encrypted: `SIGNING_KEY`, `SECRETS_KEY`, the runtime's
-  key `runtime/secrets/kek/v1`, the database passwords, the agents' Core
-  tokens and their providers' keys. No backup of the database can bring
-  back `SIGNING_KEY`, `SECRETS_KEY` or the runtime's key. Without
+  key `runtime/secrets/kek/v1`, the database passwords, the runtime's
+  credential for Core (`runtime/secrets/core/agent_runtime`), and the
+  models' keys of the school's plan and of the operator's agents. No backup
+  of the database can bring back `SIGNING_KEY`, `SECRETS_KEY` or the
+  runtime's key; the credential, lost, is issued again
+  (`aishie runtime-credential`). Without
   `SECRETS_KEY`, the client secrets of the site's single sign-on providers,
   which Core's database holds sealed with it, cannot be opened; without the
   runtime's key, the secrets the runtime stores cannot be read. Keep this
   copy apart from the database dumps: together, they are every secret the
   runtime holds, and every provider's client secret. Copy it again after a
-  run of `setup-server.sh` that says it added `SECRETS_KEY`, and after a
-  rotation.
+  run of `setup-server.sh` that says it added `SECRETS_KEY` or issued the
+  runtime its credential, and after a rotation.
 - `/var/backups/aishie/`, the databases.
 - `/srv/aishie/core/`, the files people upload, while Core keeps them on
   this disk. A bucket is kept by its provider, not by `aishie backup`:
@@ -908,7 +1016,10 @@ The stack relies on each image doing the following:
 
 - **Core** (`ghcr.io/aishie-education/aishie-core`): `serve` by default; the
   commands `migrate up`, `seed`, `version` (`vX.Y.Z (commit, date)`),
-  `bootstrap`, `token issue`, and `secrets rewrap` for a rotation of
+  `bootstrap`, `token issue`,
+  `service issue agent_runtime --label L --replace` (from migration 0025),
+  which prints the runtime's credential alone on standard output and
+  nothing of it on standard error, and `secrets rewrap` for a rotation of
   `SECRETS_KEY`, which it reads with `SECRETS_KEY_PREVIOUS` from its env
   file; distroless, user 65532; `/healthz` answers
   JSON with `status`, `version` and `commit`; `GET /v1/auth/methods` says
@@ -917,7 +1028,9 @@ The stack relies on each image doing the following:
 - **The runtime** (`ghcr.io/aishie-education/aishie-agent-runtime`): `run`
   by default; `check [--live]`, `migrate up`, `version`; user 65532;
   `/healthz` on `HTTP_ADDR` answers `status` `ok`, `version` and `commit`;
-  it starts with no agent configured.
+  it starts with no agent configured; it reads its credential for Core
+  where `CORE_SERVICE_CREDENTIAL` says, `secret://core/agent_runtime` by
+  default, and hosts agents by their ids with it.
 - **The web** (`ghcr.io/aishie-education/aishie-frontend`): tags `:edge`
   (main's tip), `:sha-<7 hex>`, and `:X.Y.Z` and `:X.Y` from releases, with
   `:latest` and `:stable` on the highest stable one; the
@@ -950,8 +1063,9 @@ make e2e       # the whole stack for real: as root, on a machine that can be thr
 
 `make test` runs the scripts against stand-ins for docker, curl, flock,
 apt and systemctl (`tests/fakes.sh`), which play a registry, a Docker,
-the services' health checks, an S3 service and rclone's container, whose
-bucket is a directory; nothing reaches the network. `make config` needs no Docker daemon for
+the services' health checks, Core's `service issue`, an S3 service and
+rclone's container, whose bucket is a directory; nothing reaches the
+network. `make config` needs no Docker daemon for
 compose; it validates the Caddyfile with a `caddy` on `PATH` (or `CADDY`),
 else with Caddy's image, and checks the routes Caddy reads from it.
 
@@ -967,7 +1081,10 @@ use the API with that session, as a bearer token and as the web's
 cookie, `/runtime/api/` and no other
 path reaches the runtime's 9090, nothing but Caddy is published beyond the
 loopback, Core is given the `SECRETS_KEY` `setup-server.sh` wrote, the
-runtime reaches Core at `https://HOST` through Caddy's alias,
+runtime reaches Core at `https://HOST` through Caddy's alias, the runtime
+is given its credential for Core (with a Core that has the
+`agent_runtime` service), printed nowhere, which Core takes, and
+`aishie runtime-credential` replaces it, Core refusing the one before,
 the backups can be restored from, and a second `aishie-update` (and a
 `docker compose up -d`, as after a reboot) changes nothing.
 `aishie.internal`, not `localhost`: both get their certificate from Caddy's

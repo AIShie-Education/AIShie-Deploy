@@ -10,6 +10,12 @@ work=$(mktemp -d)
 trap '[ -n "${KEEP:-}" ] || rm -rf "$work"' EXIT
 . "$here/fakes.sh"
 make_fakes "$work/bin"
+# The tests are not root: chown is recorded.
+cat > "$work/bin/chown" <<'EOF'
+#!/bin/sh
+echo "chown $*" >> "$CALLS"
+EOF
+chmod +x "$work/bin/chown"
 
 CORE=ghcr.io/aishie-education/aishie-core@sha256:$(printf 'a%.0s' $(seq 64))
 RUNTIME=ghcr.io/aishie-education/aishie-agent-runtime@sha256:$(printf 'b%.0s' $(seq 64))
@@ -28,7 +34,7 @@ setup() {
   echo "HOST=test.aishie.app" > "$FAKE/etc/aishie.env"
   export AISHIE_ETC=$FAKE/etc AISHIE_STATE=$FAKE/state AISHIE_APP=$root \
     AISHIE_BACKUPS=$FAKE/backups AISHIE_LOCK_FILE=$FAKE/lock
-  unset BACKUP_FAIL FLOCK_FAIL
+  unset BACKUP_FAIL FLOCK_FAIL ISSUE_FAIL SERVICE_TOKEN
   if [ "${2:-}" = deployed ]; then
     printf 'CORE_REF=%s\nRUNTIME_REF=%s\n' "$CORE" "$RUNTIME" > "$FAKE/state/images.env"
     echo "$CORE" > "$FAKE/running/core"
@@ -138,6 +144,75 @@ called "docker run --rm --network container:container-of-runtime --entrypoint wg
 rm "$FAKE/running/runtime"
 if aishie runtime-status; then fail "passed with no runtime running"; fi
 
+# The runtime's credential for Core, issued anew: Core's `service issue`, in
+# the image Core runs, under aishie-update's lock, with --replace; its
+# standard output into the file the runtime reads, whole, 0600, the
+# runtime's user's, and printed nowhere; the runtime recreated after.
+setup runtime-credential deployed
+cred=$FAKE/etc/runtime/secrets/core/agent_runtime
+aishie runtime-credential || fail "exit $?: $(cat "$FAKE/out")"
+grep -q "^docker compose --project-directory $root -f $root/compose.yaml run --rm --no-deps -T core service issue agent_runtime --label runtime --replace$" "$CALLS" ||
+  fail "ran: $(cat "$CALLS")"
+[ "$(cat "$cred")" = "$(cat "$FAKE/issued")" ] || fail "the file is not what Core printed"
+[ "$(stat -c %a "$cred")" = 600 ] || fail "the credential is $(stat -c %a "$cred")"
+[ "$(stat -c %a "$(dirname "$cred")")" = 750 ] || fail "its directory is $(stat -c %a "$(dirname "$cred")")"
+called "chown root:65532 $(dirname "$cred")$" || fail "its directory not given to the runtime's group: $(grep chown "$CALLS")"
+called "chown 65532:65532 $cred.new$" || fail "not given to the runtime's user: $(grep chown "$CALLS")"
+! ls "$cred".* >/dev/null 2>&1 || fail "left $(ls "$cred".*)"
+called "flock -w 600 9" || fail "took no lock"
+[ "$(grep -n 'flock -w 600 9' "$CALLS" | cut -d: -f1)" -lt "$(grep -n 'service issue' "$CALLS" | cut -d: -f1)" ] || fail "issued before it took the lock"
+[ "$(grep -n 'service issue' "$CALLS" | cut -d: -f1)" -lt "$(grep -n 'compose.yaml up -d --no-deps --force-recreate runtime$' "$CALLS" | cut -d: -f1)" ] ||
+  fail "the runtime was not recreated after: $(cat "$CALLS")"
+said "for the site service agent_runtime, 0 other(s) revoked$" || fail "Core's description not shown: $(cat "$FAKE/out")"
+! said "shown once" || fail "said the credential is shown"
+said "the runtime recreated, with it" || fail "said: $(cat "$FAKE/out")"
+first=$(cat "$cred")
+if grep -qF -- "$first" "$FAKE/out" "$CALLS"; then fail "the credential is in the output or on a command line"; fi
+# Again: a new one in its place, the one before revoked by Core.
+inode=$(stat -c %i "$cred")
+aishie runtime-credential || fail "again: exit $?: $(cat "$FAKE/out")"
+[ "$(cat "$cred")" = "$(tail -n 1 "$FAKE/issued")" ] || fail "again: the file is not what Core printed last"
+[ "$(cat "$cred")" != "$first" ] || fail "again: the credential is the one before"
+[ "$(stat -c %i "$cred")" != "$inode" ] || fail "again: written over in place, not put in place whole"
+said "1 other(s) revoked$" || fail "again: said: $(cat "$FAKE/out")"
+if grep -qF -- "$(cat "$cred")" "$FAKE/out" "$CALLS"; then fail "again: the credential is in the output or on a command line"; fi
+# Core refuses (a Core from before the agent_runtime service), or answers
+# with something that is not a credential: the file is left as it was, and
+# so is the runtime; what is not a credential is not shown either.
+for how in refused garbled; do
+  : > "$CALLS"
+  before=$(sha256sum < "$cred")
+  if [ $how = refused ]; then
+    if ISSUE_FAIL=1 aishie runtime-credential; then fail "$how: passed"; fi
+    said "no site service \"agent_runtime\"" || fail "$how: Core's refusal not shown: $(cat "$FAKE/out")"
+    said "Core issued no credential (above)" || fail "$how: said: $(cat "$FAKE/out")"
+  else
+    if SERVICE_TOKEN="api_error_not_a_credential" aishie runtime-credential; then fail "$how: passed"; fi
+    said "is not a site service's credential" || fail "$how: said: $(cat "$FAKE/out")"
+    ! said "api_error_not_a_credential" || fail "$how: showed what Core printed"
+  fi
+  [ "$(sha256sum < "$cred")" = "$before" ] || fail "$how: the file changed"
+  ! ls "$cred".* >/dev/null 2>&1 || fail "$how: left $(ls "$cred".*)"
+  ! called "force-recreate" || fail "$how: recreated the runtime"
+done
+# The runtime not deployed yet: the credential kept for it, nothing
+# recreated.
+setup runtime-credential-no-runtime
+echo "CORE_REF=$CORE" > "$FAKE/state/images.env"
+aishie runtime-credential || fail "exit $?: $(cat "$FAKE/out")"
+[ -s "$FAKE/etc/runtime/secrets/core/agent_runtime" ] || fail "no credential kept"
+! called "force-recreate" || fail "recreated a runtime that is not deployed"
+said "the runtime is not deployed yet" || fail "said: $(cat "$FAKE/out")"
+# Core not deployed, or a deploy holding the lock: nothing run.
+setup runtime-credential-no-core
+if aishie runtime-credential; then fail "passed with no Core"; fi
+said "core is not deployed yet" || fail "said: $(cat "$FAKE/out")"
+[ ! -s "$CALLS" ] || fail "ran: $(cat "$CALLS")"
+setup runtime-credential-locked deployed
+if FLOCK_FAIL=1 aishie runtime-credential; then fail "passed without the lock"; fi
+! called "service issue" || fail "issued without the lock"
+[ ! -e "$FAKE/etc/runtime/secrets/core/agent_runtime" ] || fail "wrote a credential"
+
 # The nightly backup: both databases, one file per day of the week.
 setup backup deployed
 aishie backup || fail "exit $?: $(cat "$FAKE/out")"
@@ -170,7 +245,7 @@ aishie frobnicate || :
 said "aishie storage \[COMMAND\]" || fail "aishie's usage does not name storage: $(cat "$FAKE/out")"
 
 # Anything else: usage, and nothing run.
-for args in "" "core" "frobnicate" "backup now" "runtime-status x"; do
+for args in "" "core" "frobnicate" "backup now" "runtime-status x" "runtime-credential x"; do
   setup usage deployed
   # shellcheck disable=SC2086 # the arguments, split
   if aishie $args; then fail "took «$args»"; fi

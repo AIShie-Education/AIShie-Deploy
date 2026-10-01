@@ -9,6 +9,7 @@
 #   aishie runtime check --live
 #   aishie runtime migrate version
 #   aishie runtime-status          the runtime's /status: its agents, seats and spend
+#   aishie runtime-credential      the runtime's credential for Core issued anew, the ones before revoked
 #   aishie logs SERVICE [OPTIONS]  core, runtime, web, caddy or postgres
 #   aishie ps                      the stack's containers
 #   aishie backup                  both databases, now, as the nightly backup does
@@ -27,6 +28,19 @@
 # in to the site with that email and password: people hold no API tokens,
 # only agents do. The long form, with `aishie core bootstrap`, does the same
 # in three steps.
+#
+# `aishie runtime-credential` gives the runtime a new credential for Core:
+# in Core, the site's agent runtime is the site service agent_runtime, which
+# alone hosts agents, and is issued each runtime agent's token by the
+# agent's id with this credential. Core's `service issue agent_runtime
+# --replace` issues it, revoking the service's others, and prints it once on
+# its standard output, which goes straight into
+# /etc/aishie/runtime/secrets/core/agent_runtime (the runtime reads it as
+# secret://core/agent_runtime): first under another name, and checked, so
+# that the file is the old credential or the new one, whole. It is never
+# printed. Then the runtime is recreated, to take it. setup-server.sh runs
+# this when that file is missing or empty, so it is how a lost credential
+# is replaced, and a leaked one rotated.
 #
 # `aishie storage` is aishie-storage, beside this: where Core keeps the files
 # people upload, this server's disk or a bucket, its check and CORS rule,
@@ -49,6 +63,11 @@ BACKUPS=${AISHIE_BACKUPS:-/var/backups/aishie}
 LOCK_FILE=${AISHIE_LOCK_FILE:-/run/aishie-update.lock}
 # The image stack.yaml's Caddy runs, which has a wget.
 CADDY_IMAGE=caddy:2
+# The images' nonroot user (distroless), which the runtime runs as.
+APP_UID=65532
+# The runtime's credential for Core, secret://core/agent_runtime in the
+# runtime's secrets directory (its CORE_SERVICE_CREDENTIAL by default).
+CREDENTIAL=$ETC/runtime/secrets/core/agent_runtime
 
 # compose.yaml reads these from aishie.env and images.env, and the same
 # names in this process's environment would win over both files.
@@ -147,10 +166,61 @@ aishie: done. Sign in at https://$host with $email and that password.
 EOF
 }
 
+# runtime_credential: the runtime's credential for Core, as the header says.
+# The credential goes from Core's standard output into the file, root's
+# alone (0600) until it is whole and checked, then the runtime's user's,
+# still 0600, in a directory root's and the runtime's group's, as the rest
+# of the secrets directory is; the runtime mounts it read-only. Core's
+# standard error, what it issued and how many it revoked, is shown, without
+# its last words: the credential it says it shows once goes nowhere else.
+runtime_credential() {
+  [ -n "$(setting "$STATE/images.env" CORE_REF)" ] ||
+    die "core is not deployed yet: aishie-update deploys it (aishie-update --status)"
+  # Not in the middle of a deploy: Core's migrations, or the runtime's
+  # recreate.
+  exec 9>"$LOCK_FILE"
+  flock -w 600 9 || die "aishie-update has held the lock for ten minutes: nothing was changed (journalctl -u aishie-update)"
+  f=$CREDENTIAL
+  dir=${f%/*}
+  if [ ! -d "$dir" ]; then
+    install -d -m 750 "$dir"
+    chown "root:$APP_UID" "$dir"
+  fi
+  rm -f "$f.new"
+  said=$(compose run --rm --no-deps -T core service issue agent_runtime --label runtime --replace 2>&1 >"$f.new" </dev/null) || {
+    rm -f "$f.new"
+    printf '%s\n' "$said" >&2
+    die "Core issued no credential (above): $f is left as it was, and so is the runtime"
+  }
+  # One line, and a site service's credential: anything else is not kept,
+  # and not shown either.
+  if [ "$(wc -l < "$f.new")" != 1 ] || ! grep -Eqx 'aissvc_[A-Za-z0-9_-]+' "$f.new"; then
+    rm -f "$f.new"
+    die "Core's answer is not a site service's credential (aissvc_...): it is not kept, and $f is left as it was. Core has revoked the ones before all the same: run this again"
+  fi
+  chmod 600 "$f.new"
+  chown "$APP_UID:$APP_UID" "$f.new"
+  mv "$f.new" "$f"
+  [ -z "$said" ] || printf '%s\n' "$said" | sed 's/, shown once:$//'
+  echo "aishie: kept in $f, which the runtime reads as secret://core/agent_runtime; Core revoked any other the service held"
+  if [ -z "$(setting "$STATE/images.env" RUNTIME_REF)" ]; then
+    echo "aishie: the runtime is not deployed yet, and reads it once aishie-update deploys it"
+    return 0
+  fi
+  # Recreated, not restarted: so it starts afresh with what it reads.
+  compose up -d --no-deps --force-recreate runtime ||
+    die "the runtime could not be recreated (above): it has the credential once it is (aishie compose up -d --force-recreate runtime)"
+  echo "aishie: the runtime recreated, with it"
+}
+
 case ${1:-} in
   admin)
     [ $# -eq 1 ] || usage
     admin
+    ;;
+  runtime-credential)
+    [ $# -eq 1 ] || usage
+    runtime_credential
     ;;
   core | runtime)
     s=$1
