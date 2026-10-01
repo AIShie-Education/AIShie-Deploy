@@ -46,7 +46,7 @@
 # issue` prints a new aissvc_ credential as Core does, or SERVICE_TOKEN;
 # ISSUE_FAIL fails it, as a Core from before the agent_runtime service does.
 # A one-off `help` names S3_BUCKET_LOOKUP, but with OLD_CORE_HELP, as a Core
-# from before it.
+# from before it; HELP_FAIL has its container not start.
 
 # make_fakes DIR: the stand-ins, in DIR, to put first on PATH.
 make_fakes() {
@@ -129,6 +129,10 @@ compose() {
       if [ "$svc ${1:-}" = "core help" ]; then
         # Core's help: a Core from before S3_BUCKET_LOOKUP (OLD_CORE_HELP)
         # names it nowhere.
+        if [ -n "${HELP_FAIL:-}" ]; then
+          echo "Error response from daemon: No such image: $(service_image core)" >&2
+          exit 1
+        fi
         echo "aishie-core — AIshie Core, $(service_image core)"
         echo "  S3_REGION         default us-east-1; the region requests are signed for"
         [ -n "${OLD_CORE_HELP:-}" ] || echo "  S3_BUCKET_LOOKUP  auto (default), path or dns; how a request names the bucket"

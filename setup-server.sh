@@ -25,8 +25,9 @@
 # with the keys before anything is written, by reading alone, and given the
 # CORS rule the site's uploads need when the keys may set it; else the rule
 # is printed, with where to set it. A bucket that needs a Core from its main
-# since 1 October 2026 (--s3-path-style no, or an AWS region newer than the
-# table of Core's S3 client) is said to need one.
+# since its PR #46 (--s3-path-style no, or an AWS region newer than the
+# table of Core's S3 client) is said to need one, and on stable, what is
+# left says CORE_IMAGE must be one.
 #
 # It installs Docker Engine and its compose plugin where they are missing:
 # Ubuntu's own packages (docker.io and docker-compose-v2) when those give
@@ -669,6 +670,14 @@ EOF
 $n. Set the releases stable runs, CORE_IMAGE, RUNTIME_IMAGE and WEB_IMAGE, in
    $ETC/aishie.env (e.g. $REGISTRY/aishie-core:1.2.3), then: aishie-update
 EOF
+    if [ -n "$st_core_first" ]; then
+      cat <<EOF
+   The bucket needs a Core whose help names S3_BUCKET_LOOKUP (above), which
+   aishie-update does not check: CORE_IMAGE must be one, as
+     docker run --rm IMAGE help | grep S3_BUCKET_LOOKUP
+   says, or Core will not reach the bucket and the first update fails.
+EOF
+    fi
     n=$((n + 1))
   fi
   if [ -n "$credential_left" ]; then

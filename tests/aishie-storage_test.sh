@@ -54,7 +54,7 @@ setup() {
   : > "$CALLS"
   export AISHIE_ETC=$FAKE/etc AISHIE_STATE=$FAKE/state AISHIE_APP=$root AISHIE_DATA=$FAKE/srv \
     AISHIE_LOCK_FILE=$FAKE/lock AISHIE_HEALTH_TRIES=3
-  unset S3_LIST S3_HEAD S3_CORS_GET S3_CORS_PUT S3_DOWN RCLONE_PULL_FAIL RCLONE_FAIL RCLONE_CORRUPT RCLONE_ATTACH FLOCK_FAIL NOT_ROOT OLD_CORE_HELP \
+  unset S3_LIST S3_HEAD S3_CORS_GET S3_CORS_PUT S3_DOWN RCLONE_PULL_FAIL RCLONE_FAIL RCLONE_CORRUPT RCLONE_ATTACH FLOCK_FAIL NOT_ROOT OLD_CORE_HELP HELP_FAIL \
     AISHIE_STORAGE AISHIE_S3_BUCKET AISHIE_S3_REGION AISHIE_S3_ENDPOINT AISHIE_S3_PATH_STYLE AISHIE_R2_ACCOUNT_ID \
     AISHIE_R2_JURISDICTION AISHIE_S3_ACCESS_KEY AISHIE_S3_SECRET_KEY
   image core "$A" v0.2.0 abc1234
@@ -526,6 +526,16 @@ said "update it first (aishie-update)" || fail "said: $(cat "$FAKE/out")"
 [ "$(sums)" = "$before" ] || fail "changed core.env"
 ! called "aws-sigv4" || fail "reached the bucket"
 ! called "rclone" || fail "ran rclone"
+# A help that does not run is not taken for an older Core: Docker's error
+# is shown.
+setup to-s3-dns-no-help
+before=$(sums)
+if HELP_FAIL=1 s3dns; then fail "passed with a help that did not run"; fi
+said "the help of the one this server runs, which says whether it is one, did not run (above). Nothing was changed" || fail "said: $(cat "$FAKE/out")"
+said "Error response from daemon: No such image" || fail "Docker's error not shown: $(cat "$FAKE/out")"
+! said "is older" || fail "said the Core is older: $(cat "$FAKE/out")"
+[ "$(sums)" = "$before" ] || fail "changed core.env"
+! called "rclone" || fail "ran rclone"
 # ... and with none deployed yet: said, and done.
 setup to-s3-dns-not-deployed
 echo "# nothing deployed yet" > "$FAKE/state/images.env"
@@ -553,6 +563,24 @@ AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK storage migrate --to s3 --stor
   fail "core.env: $(setting core.env S3_ENDPOINT) $(setting core.env S3_REGION) $(setting core.env S3_BUCKET_LOOKUP)"
 called "curl .*--aws-sigv4 aws:amz:eu-west-9:s3 .*https://files.s3.eu-west-9.amazonaws.com/?list-type=2" || fail "the check: $(grep aws-sigv4 "$CALLS" | head -n 1)"
 grep -qx 'region = eu-west-9' "$FAKE/rclone.conf" || fail "rclone's region: $(grep region "$FAKE/rclone.conf")"
+
+# A bucket of AWS's other partitions, read from core.env: Amazon S3 to the
+# check, the status and rclone, and named in the path, as Core's S3 client
+# does at an endpoint outside amazonaws.com and amazonaws.com.cn.
+for e in s3.eusc-de-east-1.amazonaws.eu s3.us-iso-east-1.c2s.ic.gov s3.us-isob-east-1.sc2s.sgov.gov \
+  s3.us-isof-south-1.csp.hci.ic.gov s3.eu-isoe-west-1.cloud.adc-e.uk; do
+  r=${e#s3.}
+  r=${r%%.*}
+  setup "partition-$r"
+  printf 'S3_ENDPOINT=%s\nS3_BUCKET=files\nS3_REGION=%s\nS3_ACCESS_KEY=%s\nS3_SECRET_KEY=%s\n' "$e" "$r" "$AK" "$SK" >> "$AISHIE_ETC/core.env"
+  storage check || fail "$e: check: exit $?: $(cat "$FAKE/out")"
+  said "the bucket files of Amazon S3, in $r ($e) answers" || fail "$e: check said: $(cat "$FAKE/out")"
+  called "https://$e/files/?list-type=2" || fail "$e: the check: $(grep aws-sigv4 "$CALLS" | head -n 1)"
+  storage migrate --to s3 --dry-run || fail "$e: dry run: exit $?: $(cat "$FAKE/out")"
+  said "the bucket core.env names already: the bucket files of Amazon S3, in $r" || fail "$e: said: $(cat "$FAKE/out")"
+  grep -qx 'provider = AWS' "$FAKE/rclone.conf" || fail "$e: rclone's provider: $(grep provider "$FAKE/rclone.conf")"
+  grep -qx 'force_path_style = true' "$FAKE/rclone.conf" || fail "$e: rclone not told to name the bucket in the path: $(grep force_path_style "$FAKE/rclone.conf")"
+done
 
 [ "$failed" = 0 ] && echo "aishie-storage: ok"
 exit "$failed"

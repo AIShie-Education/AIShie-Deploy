@@ -38,7 +38,7 @@
 # given, as Core's S3 client chooses (auto: in the host name at AWS, Google
 # and Aliyun, after the endpoint anywhere else). A region newer than the
 # table of Core's S3 client, and --s3-path-style no, need a Core from its
-# main since 1 October 2026, whose help names S3_BUCKET_LOOKUP: migrate,
+# main since its PR #46 (d8f256c), whose help names S3_BUCKET_LOOKUP: migrate,
 # and setup-server.sh, check that the Core this server runs is one.
 #
 # The check reads alone: it lists at most one key of the bucket and asks for
@@ -78,7 +78,7 @@ ST_HEALTH_TRIES=${AISHIE_HEALTH_TRIES:-30}
 # The AWS regions at amazonaws.com and amazonaws.com.cn in the table of
 # Core's S3 client (minio-go v7.3.0), which sends a request for one of them
 # to its endpoint. Core sends a request for any other region to the
-# region's endpoint itself (since 1 October 2026), by the means transfer
+# region's endpoint itself (since its PR #46), by the means transfer
 # acceleration uses, which takes no bucket whose name has a dot: such a
 # bucket is refused in a region not here. A list that has fallen behind
 # Core's table refuses more than it need, never less.
@@ -103,7 +103,7 @@ ST_KIND='' ST_BUCKET='' ST_REGION='' ST_ENDPOINT='' ST_PATH_STYLE='' ST_R2_ACCOU
 ST_LOOKUP=auto
 ST_AK='' ST_SK='' ST_SSL=true ST_GIVEN=''
 ST_STORE='' ST_FS_ROOT=''
-st_tmp='' st_echo_off='' st_cors='' st_stopped='' st_root='' st_mount_mode=''
+st_tmp='' st_echo_off='' st_cors='' st_stopped='' st_root='' st_mount_mode='' st_core_first=''
 
 st_die() { echo "$ST_NAME: $*" >&2; exit 1; }
 st_say() { printf '\n== %s\n' "$*"; }
@@ -988,10 +988,12 @@ st_verify() {
 }
 
 # st_core_reads_lookup: refused, before anything is copied, when the bucket
-# needs a Core from its main since 1 October 2026 (its PR #46), which reads
+# needs a Core from its main since its PR #46 (d8f256c), which reads
 # S3_BUCKET_LOOKUP and sends a request for AWS to S3_REGION whatever its S3
 # client's table says, and the Core this server runs is older: its help
-# names no S3_BUCKET_LOOKUP. One not deployed yet is only said to need it.
+# names no S3_BUCKET_LOOKUP. A help that does not run is refused as that,
+# with Docker's error. One not deployed yet is only said to need it, and
+# st_core_first set.
 st_core_reads_lookup() {
   if [ "$ST_LOOKUP" = dns ]; then
     st_needs="--s3-path-style no"
@@ -1000,12 +1002,19 @@ st_core_reads_lookup() {
   else
     return 0
   fi
-  st_needs="$st_needs needs a Core whose help names S3_BUCKET_LOOKUP (any from its main since 1 October 2026)"
+  st_needs="$st_needs needs a Core whose help names S3_BUCKET_LOOKUP (any from its main since its PR #46, d8f256c)"
   if [ -z "$(st_setting "$STATE/images.env" CORE_REF)" ]; then
     echo "$st_needs: the first Core this server deploys must be one"
-  elif ! st_compose run --rm --no-deps -T core help < /dev/null 2> /dev/null | grep -q S3_BUCKET_LOOKUP; then
-    st_die "$st_needs, and the one this server runs is older (aishie core help): update it first (aishie-update), then run this again. Nothing was changed"
+    # shellcheck disable=SC2034 # setup-server.sh's, for what is left
+    st_core_first=1
+    return 0
   fi
+  st_help=$(st_compose run --rm --no-deps -T core help < /dev/null) ||
+    st_die "$st_needs, and the help of the one this server runs, which says whether it is one, did not run (above). Nothing was changed"
+  case $st_help in
+    *S3_BUCKET_LOOKUP*) ;;
+    *) st_die "$st_needs, and the one this server runs is older (aishie core help): update it first (aishie-update), then run this again. Nothing was changed" ;;
+  esac
 }
 
 # st_healthy: Core's /healthz on 127.0.0.1:8080 says ok, within a minute.

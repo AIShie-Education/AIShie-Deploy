@@ -629,9 +629,22 @@ AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage s3 --s3
 [ "$(setting core.env S3_ENDPOINT) $(setting core.env S3_BUCKET_LOOKUP)" = "s3.example.edu dns" ] ||
   fail "s3, virtual-hosted: $(setting core.env S3_ENDPOINT) $(setting core.env S3_BUCKET_LOOKUP)"
 called "https://files.s3.example.edu/?list-type=2" || fail "not in the host name: $(grep aws-sigv4 "$CALLS" | head -n 1)"
-said "--s3-path-style no needs a Core whose help names S3_BUCKET_LOOKUP (any from its main since 1 October 2026): the first Core this server deploys must be one" ||
+said "--s3-path-style no needs a Core whose help names S3_BUCKET_LOOKUP (any from its main since its PR #46, d8f256c): the first Core this server deploys must be one" ||
   fail "said: $(cat "$FAKE/out")"
 grep -q "^CORE_REF=" "$AISHIE_STATE/images.env" || fail "stopped before the first update"
+# ... and on stable, where a person sets the release, what is left says
+# CORE_IMAGE must be one; a bucket any Core reaches is not said to.
+! said "The bucket needs a Core whose help names S3_BUCKET_LOOKUP" || fail "said on edge: $(cat "$FAKE/out")"
+setup s3-dns-stable
+AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage s3 --s3-endpoint s3.example.edu --s3-bucket files --s3-path-style no aishie.example.edu stable ||
+  fail "exit $?: $(cat "$FAKE/out")"
+said "The bucket needs a Core whose help names S3_BUCKET_LOOKUP (above), which" || fail "not in what is left: $(cat "$FAKE/out")"
+said "^     docker run --rm IMAGE help | grep S3_BUCKET_LOOKUP$" || fail "what is left does not say how: $(cat "$FAKE/out")"
+setup s3-stable
+AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage s3 --s3-endpoint s3.example.edu --s3-bucket files aishie.example.edu stable ||
+  fail "exit $?: $(cat "$FAKE/out")"
+said "Set the releases stable runs" || fail "said: $(cat "$FAKE/out")"
+! said "The bucket needs a Core" || fail "said for a bucket any Core reaches: $(cat "$FAKE/out")"
 setup aws-new-region
 AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK setup_server --storage aws --s3-region ap-southeast-9 --s3-bucket aishie-files test.aishie.app edge ||
   fail "exit $?: $(cat "$FAKE/out")"
