@@ -213,7 +213,7 @@ said "Core keeps the files people upload on this server's disk" || fail "did not
 kek=$AISHIE_ETC/runtime/secrets/kek/v1
 [ "$(base64 -d < "$kek" | wc -c)" = 32 ] || fail "kek/v1 is not 32 bytes in base64"
 [ "$(mode "$kek")" = 640 ] || fail "kek/v1 is $(mode "$kek")"
-called "chown root:65532 $kek.new" || fail "kek/v1 not given to the runtime's group"
+called "chown root:65532 ${kek%/*}/.v1.new" || fail "kek/v1 not given to the runtime's group"
 # The directories, each with its owner and mode.
 for d in "$AISHIE_ETC" "$AISHIE_ETC/runtime" "$AISHIE_STATE" "$AISHIE_BACKUPS"; do
   [ "$(mode "$d")" = 700 ] || fail "$d is $(mode "$d")"
@@ -353,7 +353,9 @@ said "warning: .*core.env keeps uploaded files with BLOB_STORE=fs, and is left a
 # ... after a rotation of the runtime's key (README.md, Rotating secrets),
 # v2 in the keyring and v1 removed: no v1 made in its place, and nothing in
 # /etc/aishie changed. A keyring with no key but a file in the making
-# (.v2.new, which the runtime passes over) is given v1.
+# (.v2.new, which the runtime passes over) is given v1, and so is one that
+# holds only what a run of setup-server.sh stopped before its mv left
+# (.v1.new), which is replaced, not left beside v1.
 case=key-rotated
 kek_dir=$AISHIE_ETC/runtime/secrets/kek
 mv "$kek_dir/v1" "$kek_dir/v2"
@@ -366,6 +368,12 @@ rm "$kek_dir/v2"
 echo partial > "$kek_dir/.v2.new"
 setup_server test.aishie.app edge || fail "exit $?: $(cat "$FAKE/out")"
 [ "$(base64 -d < "$kek_dir/v1" | wc -c)" = 32 ] || fail "no v1 made in a keyring with no key"
+said "made $kek_dir/v1" || fail "said: $(cat "$FAKE/out")"
+rm "$kek_dir/v1" "$kek_dir/.v2.new"
+: > "$kek_dir/.v1.new"
+setup_server test.aishie.app edge || fail "exit $?: $(cat "$FAKE/out")"
+[ "$(base64 -d < "$kek_dir/v1" | wc -c)" = 32 ] || fail "no v1 made after an interrupted run"
+[ ! -e "$kek_dir/.v1.new" ] || fail "left .v1.new beside v1"
 said "made $kek_dir/v1" || fail "said: $(cat "$FAKE/out")"
 
 # A server set up before SECRETS_KEY, set up again: core.env is given one,

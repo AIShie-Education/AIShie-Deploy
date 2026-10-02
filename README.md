@@ -40,7 +40,7 @@ In this repository, and where `setup-server.sh` puts it:
 | | `/etc/aishie/aishie.env` | the operator's settings: `HOST`, `ENVIRONMENT`, the channels, the network |
 | | `/etc/aishie/core.env`, `runtime.env`, `postgres.env` | each service's settings and secrets, root's (0600) |
 | | `/etc/aishie/runtime/agents/` | the operator's agents' YAML, mounted read-only at `/config` |
-| | `/etc/aishie/runtime/secrets/` | their secrets, `kek/v1`, and `core/agent_runtime`, [the runtime's credential for Core](#the-runtimes-credential-for-core); mounted read-only at `/secrets` |
+| | `/etc/aishie/runtime/secrets/` | their secrets, `kek/`, the runtime's keyring, and `core/agent_runtime`, [the runtime's credential for Core](#the-runtimes-credential-for-core); mounted read-only at `/secrets` |
 | | `/var/lib/aishie/images.env` | what each service runs, by digest; `aishie-update` writes it |
 | | `/srv/aishie/core/` | the files people upload to Core, when it keeps them on this disk ([Where uploaded files are kept](#where-uploaded-files-are-kept)) |
 | | `/var/backups/aishie/` | the database backups |
@@ -535,19 +535,27 @@ first start, which revokes the one it was handed before.
 ## The school's AI plan
 
 The school may offer the people who host their agents here a model on its
-own key, so that they need no API key of their own: the `school:` section
-of the runtime's settings, a `runtime:` document in
-`/etc/aishie/runtime/agents` (at most one there in all).
+own key, so that they need no API key of their own. The offers come from
+two places. The runtime's administrators make them in the site
+([The runtime's API](#the-runtimes-api)): a provider's model at its own
+endpoint, with a key of the school's that the runtime tries with the model
+before it keeps it, sealed in its database like an owner's key
+([its key](#rotating-secrets)), and shown only as its hint. The operator's
+own are the `school:` section of the runtime's settings, a `runtime:`
+document in `/etc/aishie/runtime/agents` (at most one there in all), which
+the site shows read-only and which alone can offer a server of the
+school's own (a gateway, vLLM, Ollama).
 [`examples/runtime/runtime.yaml`](examples/runtime/runtime.yaml) is one to
-start from; the runtime's `docs/deploying.md` (The school's AI plan) says
-what each setting does. Without it, hosted agents run on their owners' own
-keys alone.
+start from; the runtime's `docs/deploying.md` (The school's AI plan, and
+What the site's administrators change) says what each setting does. With
+neither, hosted agents run on their owners' own keys alone.
 
-Each offer's key is a file under `/etc/aishie/runtime/secrets/school/keys/`,
+Each of `school:`'s offers has its key in a file under
+`/etc/aishie/runtime/secrets/school/keys/`,
 which its `key_ref: secret://school/keys/<name>` names, root's and readable
 by group 65532, the runtime's user (`user: "65532:65532"` in
 `stack.yaml`): the file `0640 root:65532`, the directories `school` and
-`school/keys` `0750 root:65532`. The key never leaves the server: the
+`school/keys` `0750 root:65532`. Such a key never leaves the server: the
 runtime reads it when it calls the model, and it is not stored in the
 database, shown, audited or sent to a browser.
 
@@ -578,8 +586,8 @@ prices/prices.yaml` in the runtime document, or by
 ([`examples/runtime/prices/prices.yaml`](examples/runtime/prices/prices.yaml)).
 Without one, costs are unknown and answers alone are counted.
 
-The runtime's administrators (Core's root and admins, or those
-`ADMIN_ACTOR_IDS` names) read today's use of the plan per person at
+The runtime's administrators (Core's root and admins, or only those of
+them that `ADMIN_ACTOR_IDS` names) read today's use of the plan per person at
 `https://HOST/runtime/api/v1/admin/school-plan/usage`.
 
 ## Where uploaded files are kept
@@ -1018,12 +1026,15 @@ Framing goes two ways, and this stack allows both.
   aishie runtime keys check        # every secret opens, and v2 wraps them all
   ```
 
-  `keys check` names each secret by its id, kind and tenant, and the key
-  that wraps it, never what it holds; run it at any time. Copy
+  `keys check` says how many secrets each key wraps (marking the one
+  `KMS_KEY_ID` names), names by id, kind and tenant only the secrets that
+  do not open, and never prints what any holds; run it at any time. Copy
   `/etc/aishie` off the server again, then `rm $k/v1`, but keep a copy of
-  the old key, apart, until the database's backups from before the rewrap
-  are gone (the nightly ones of a week, and the last ten deploys'): their
-  secrets are still wrapped by it. `setup-server.sh` makes `v1` only in a
+  the old key, apart from the database's backups, for as long as any
+  backup from before the rewrap is kept, the copies of
+  `/var/backups/aishie/` kept elsewhere included: their secrets are still
+  wrapped by it, and restoring one needs it back in `kek/` under its old
+  name (`v1`). `setup-server.sh` makes `v1` only in a
   keyring that holds no key, so it makes none in its place.
 - **The bucket's keys** (`S3_ACCESS_KEY`, `S3_SECRET_KEY` in `core.env`):
   make a new key with the provider, write it in `core.env` (a secret with a
@@ -1127,8 +1138,8 @@ runtime's JSON API, under `/runtime/api/v1/` on the site's own origin:
 people host their agents by their ids, choose each one's model, on their
 own key or an offer of [the school's plan](#the-schools-ai-plan), try a
 key, pause, resume and delete an agent, and ask for a new token for it;
-the runtime's administrators (Core's root and admins, or those
-`ADMIN_ACTOR_IDS` names) set the school's offers and quotas, prices, the
+the runtime's administrators (Core's root and admins, or only those of
+them that `ADMIN_ACTOR_IDS` names) set the school's offers and quotas, prices, the
 quotas of tenants and the hosted agents' daily budgets, OCR and the
 transcriber, and read what the models cost (the routes under `admin/`).
 Every change, and every refusal, is in the runtime's audit, with a key's
