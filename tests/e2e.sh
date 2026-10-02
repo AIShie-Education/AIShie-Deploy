@@ -221,18 +221,16 @@ check "/v1/actors answers the administrator, with the session as a bearer token"
 check "/v1/me answers the administrator, with the session's cookie, as the web asks" is "$(with_session cookie "$session" /v1/me)" 200
 unset session
 
-# The runtime's own endpoints are never routed: /runtime/api/* goes to its
-# API on 9091 (nothing listens there until M2: 502), and its 9090 is not
-# reachable by any path. Each is asked, and answered by something.
-get runtime-api "https://$name/runtime/api/healthz"
-check "/runtime/api/healthz is answered, and not by the runtime's 9090 (answers $status)" \
-  test "$status" != 000 -a "$body" != "$runtime_health"
-if [ "$status" = 502 ]; then
-  ok "/runtime/api/ answers 502: nothing listens on the runtime's 9091 yet (its API comes with M2)"
-else
-  ok "/runtime/api/ answers $status: the runtime serves its API on 9091"
-fi
-for path in /runtime/api/metrics /runtime/api/status /metrics /status /runtime/healthz; do
+# /runtime/api/* is the runtime's API, on its 9091: its /info answers
+# anyone, for this server's name, the audience Core's assertions name and
+# Core as their issuer (README.md, The runtime's API). The runtime's own
+# endpoints, on 9090, are reachable by no path: each is asked, and answered
+# by something else.
+get runtime-api "https://$name/runtime/api/v1/info"
+check "/runtime/api/v1/info is the runtime's API, for https://$name/runtime, hosting by id, of the commit 127.0.0.1:9090 reports" \
+  is "$status $(json '[.api, .api_version, .audience, .issuer, .features.host_by_id, .features.own_key, .commit] | join(" ")')" \
+  "200 aishie-runtime 1 https://$name/runtime https://$name true true $(jq -r .commit <<< "$runtime_health" 2>/dev/null)"
+for path in /runtime/api/healthz /runtime/api/metrics /runtime/api/status /metrics /status /runtime/healthz; do
   get leak "https://$name$path"
   if [ "$status" = 000 ]; then
     fail "$path is not answered at all"

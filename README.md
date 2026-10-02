@@ -9,7 +9,7 @@ The stack is five containers on one network:
 | --- | --- | --- |
 | `caddy` | `caddy:2` | 80 and 443 on every interface: HTTPS for the server's name |
 | `core` | `ghcr.io/aishie-education/aishie-core` | 8080, published on 127.0.0.1 only |
-| `runtime` | `ghcr.io/aishie-education/aishie-agent-runtime` | 9090 on 127.0.0.1 only; 9091 (its API, coming with M2) to Caddy |
+| `runtime` | `ghcr.io/aishie-education/aishie-agent-runtime` | 9090 on 127.0.0.1 only; 9091, [its API](#the-runtimes-api) for the front end, to Caddy alone |
 | `web` | `ghcr.io/aishie-education/aishie-frontend` | 8080, published on 127.0.0.1:8081 only |
 | `postgres` | `postgres:18` | 5432, on the stack's network alone |
 
@@ -40,7 +40,7 @@ In this repository, and where `setup-server.sh` puts it:
 | | `/etc/aishie/aishie.env` | the operator's settings: `HOST`, `ENVIRONMENT`, the channels, the network |
 | | `/etc/aishie/core.env`, `runtime.env`, `postgres.env` | each service's settings and secrets, root's (0600) |
 | | `/etc/aishie/runtime/agents/` | the operator's agents' YAML, mounted read-only at `/config` |
-| | `/etc/aishie/runtime/secrets/` | their secrets, `kek/v1`, and `core/agent_runtime`, [the runtime's credential for Core](#the-runtimes-credential-for-core); mounted read-only at `/secrets` |
+| | `/etc/aishie/runtime/secrets/` | their secrets, `kek/`, the runtime's keyring, and `core/agent_runtime`, [the runtime's credential for Core](#the-runtimes-credential-for-core); mounted read-only at `/secrets` |
 | | `/var/lib/aishie/images.env` | what each service runs, by digest; `aishie-update` writes it |
 | | `/srv/aishie/core/` | the files people upload to Core, when it keeps them on this disk ([Where uploaded files are kept](#where-uploaded-files-are-kept)) |
 | | `/var/backups/aishie/` | the database backups |
@@ -209,14 +209,18 @@ As root on the server:
 | `aishie ps` | the stack's containers |
 | `aishie logs core` | a service's log, followed (`runtime`, `web`, `caddy`, `postgres`) |
 | `aishie core …` | Core's commands with the image that runs: `migrate version`, `token issue --actor AGENT_ID --label L --days 90` (an mcp agent's token), `secrets rewrap` ([Rotating secrets](#rotating-secrets)), `help` |
-| `aishie runtime …` | the runtime's: `check --live`, `migrate version`, `help` |
+| `aishie runtime …` | the runtime's: `check [--live]`, `migrate version`, `keys check` and `keys rewrap` (the secrets its database holds sealed, and [their key](#rotating-secrets)), `version`, `help` |
 | `aishie runtime-status` | the runtime's `/status`: agents, seats, spend (it answers its own loopback only, which is what this reaches) |
 | `aishie runtime-credential` | the runtime's credential for Core issued anew, the ones before revoked, and the runtime recreated with it ([The runtime's credential for Core](#the-runtimes-credential-for-core)) |
 | `aishie compose …` | `docker compose` for the stack, with its settings files |
 | `aishie storage` | where Core keeps uploaded files; `check`, `cors`, and `migrate`, which moves them ([Where uploaded files are kept](#where-uploaded-files-are-kept)) |
 
 `curl -s 127.0.0.1:8080/healthz`, `curl -s 127.0.0.1:9090/healthz` and
-`curl -s 127.0.0.1:8081/version.json` say what each runs.
+`curl -s 127.0.0.1:8081/version.json` say what each runs;
+`curl -s https://HOST/runtime/api/v1/info`, that the runtime's API answers
+through Caddy ([The runtime's API](#the-runtimes-api)). The runtime's
+`migrate up` is `aishie-update`'s to run, and its `migrate down` is never
+for a server: it takes away every piece of the runtime's state.
 
 **Changing a setting:** edit the env file, then recreate that service with
 the image it runs: `aishie compose up -d core` (or `runtime`, or `web` for
@@ -531,19 +535,27 @@ first start, which revokes the one it was handed before.
 ## The school's AI plan
 
 The school may offer the people who host their agents here a model on its
-own key, so that they need no API key of their own: the `school:` section
-of the runtime's settings, a `runtime:` document in
-`/etc/aishie/runtime/agents` (at most one there in all).
+own key, so that they need no API key of their own. The offers come from
+two places. The runtime's administrators make them in the site
+([The runtime's API](#the-runtimes-api)): a provider's model at its own
+endpoint, with a key of the school's that the runtime tries with the model
+before it keeps it, sealed in its database like an owner's key
+([its key](#rotating-secrets)), and shown only as its hint. The operator's
+own are the `school:` section of the runtime's settings, a `runtime:`
+document in `/etc/aishie/runtime/agents` (at most one there in all), which
+the site shows read-only and which alone can offer a server of the
+school's own (a gateway, vLLM, Ollama).
 [`examples/runtime/runtime.yaml`](examples/runtime/runtime.yaml) is one to
-start from; the runtime's `docs/deploying.md` (The school's AI plan) says
-what each setting does. Without it, hosted agents run on their owners' own
-keys alone.
+start from; the runtime's `docs/deploying.md` (The school's AI plan, and
+What the site's administrators change) says what each setting does. With
+neither, hosted agents run on their owners' own keys alone.
 
-Each offer's key is a file under `/etc/aishie/runtime/secrets/school/keys/`,
+Each of `school:`'s offers has its key in a file under
+`/etc/aishie/runtime/secrets/school/keys/`,
 which its `key_ref: secret://school/keys/<name>` names, root's and readable
 by group 65532, the runtime's user (`user: "65532:65532"` in
 `stack.yaml`): the file `0640 root:65532`, the directories `school` and
-`school/keys` `0750 root:65532`. The key never leaves the server: the
+`school/keys` `0750 root:65532`. Such a key never leaves the server: the
 runtime reads it when it calls the model, and it is not stored in the
 database, shown, audited or sent to a browser.
 
@@ -574,8 +586,8 @@ prices/prices.yaml` in the runtime document, or by
 ([`examples/runtime/prices/prices.yaml`](examples/runtime/prices/prices.yaml)).
 Without one, costs are unknown and answers alone are counted.
 
-The runtime's administrators (Core's root and admins, or those
-`ADMIN_ACTOR_IDS` names) read today's use of the plan per person at
+The runtime's administrators (Core's root and admins, or only those of
+them that `ADMIN_ACTOR_IDS` names) read today's use of the plan per person at
 `https://HOST/runtime/api/v1/admin/school-plan/usage`.
 
 ## Where uploaded files are kept
@@ -991,12 +1003,39 @@ Framing goes two ways, and this stack allows both.
   recreates the runtime with it
   ([The runtime's credential for Core](#the-runtimes-credential-for-core)).
   Then copy `/etc/aishie` off the server again.
-- **The runtime's key, `kek/v1`** (M2) wraps the secrets the runtime's API
-  stores. It is never replaced in place: every file in `kek/` is kept for
-  unwrapping, so a new key is added as `kek/v2`, `KMS_KEY_ID` in
-  `runtime.env` points at it, the runtime rewraps its secrets
-  (`aishie runtime keys rewrap`, once M2 has it), and only then is `v1`
-  retired.
+- **The runtime's key, `kek/v1`**, which `KMS_KEY_ID=local:/secrets/kek/v1`
+  in `runtime.env` names, seals the secrets the runtime keeps in its
+  database: the hosted agents' tokens Core issues it, their owners' model
+  keys, the keys of the school's offers made in the site, and the
+  transcriber's credential, each under a data key of its own that the key
+  wraps. The directory `runtime/secrets/kek/` is a keyring: the file
+  `KMS_KEY_ID` names seals what is new, and every other file there still
+  opens what it sealed (a name starting with `.` is passed over; anything
+  else must be a key, or the runtime does not start). So a key is never
+  replaced in place: a new one is added beside it, `KMS_KEY_ID` points at
+  it, every secret is wrapped again under it, and only then is the old one
+  removed:
+
+  ```
+  k=/etc/aishie/runtime/secrets/kek
+  (umask 077 && openssl rand -base64 32 > $k/.v2.new)
+  chown root:65532 $k/.v2.new && chmod 640 $k/.v2.new && mv $k/.v2.new $k/v2
+  sed -i 's|^KMS_KEY_ID=.*|KMS_KEY_ID=local:/secrets/kek/v2|' /etc/aishie/runtime.env
+  aishie compose up -d runtime     # seals with v2, and opens with either
+  aishie runtime keys rewrap       # wraps under v2 every data key v1 wraps
+  aishie runtime keys check        # every secret opens, and v2 wraps them all
+  ```
+
+  `keys check` says how many secrets each key wraps (marking the one
+  `KMS_KEY_ID` names), names by id, kind and tenant only the secrets that
+  do not open, and never prints what any holds; run it at any time. Copy
+  `/etc/aishie` off the server again, then `rm $k/v1`, but keep a copy of
+  the old key, apart from the database's backups, for as long as any
+  backup from before the rewrap is kept, the copies of
+  `/var/backups/aishie/` kept elsewhere included: their secrets are still
+  wrapped by it, and restoring one needs it back in `kek/` under its old
+  name (`v1`). `setup-server.sh` makes `v1` only in a
+  keyring that holds no key, so it makes none in its place.
 - **The bucket's keys** (`S3_ACCESS_KEY`, `S3_SECRET_KEY` in `core.env`):
   make a new key with the provider, write it in `core.env` (a secret with a
   `$` in single quotes), `aishie compose up -d core` and
@@ -1010,19 +1049,21 @@ The backups above sit on the same disk as the database. Copy these
 somewhere else, regularly:
 
 - `/etc/aishie/`, encrypted: `SIGNING_KEY`, `SECRETS_KEY`, the runtime's
-  key `runtime/secrets/kek/v1`, the database passwords, the runtime's
-  credential for Core (`runtime/secrets/core/agent_runtime`), and the
-  models' keys of the school's plan and of the operator's agents. No backup
-  of the database can bring back `SIGNING_KEY`, `SECRETS_KEY` or the
-  runtime's key; the credential, lost, is issued again
-  (`aishie runtime-credential`). Without
+  keys in `runtime/secrets/kek/` (`v1`, and any added since), the database
+  passwords, the runtime's credential for Core
+  (`runtime/secrets/core/agent_runtime`), and the models' keys of the
+  school's plan and of the operator's agents. No backup of the database can
+  bring back `SIGNING_KEY`, `SECRETS_KEY` or the runtime's key; the
+  credential, lost, is issued again (`aishie runtime-credential`). Without
   `SECRETS_KEY`, the client secrets of the site's single sign-on providers,
   which Core's database holds sealed with it, cannot be opened; without the
-  runtime's key, the secrets the runtime stores cannot be read. Keep this
-  copy apart from the database dumps: together, they are every secret the
-  runtime holds, and every provider's client secret. Copy it again after a
-  run of `setup-server.sh` that says it added `SECRETS_KEY` or issued the
-  runtime its credential, and after a rotation.
+  runtime's key, the secrets the runtime keeps sealed in its database (the
+  hosted agents' tokens, their owners' keys, the school's keys set in the
+  site) cannot be read. Keep this copy apart from the database dumps:
+  together, they are every secret the runtime holds, and every provider's
+  client secret. Copy it again after a run of `setup-server.sh` that says
+  it added `SECRETS_KEY` or issued the runtime its credential, and after a
+  rotation.
 - `/var/backups/aishie/`, the databases.
 - `/srv/aishie/core/`, the files people upload, while Core keeps them on
   this disk. A bucket is kept by its provider, not by `aishie backup`:
@@ -1090,15 +1131,78 @@ with a public name that has one), so nothing tries the public address first
 on this IPv4-only network. CI's end to end checks the first part on every
 run (`tests/e2e.sh`, with `HOST=aishie.internal`).
 
-## The runtime's API (M2)
+## The runtime's API
 
-The runtime's API is on its way (M2), and the stack is ready for it:
-Caddy already routes `/runtime/api/*` to the runtime's port 9091, without
-the `Cookie` header, and answers 502 until the runtime serves it;
-`stack.yaml` already sets `API_ADDR=:9091`, `API_AUDIENCE`, `CORE_BASE_URL`
-and `API_TRUSTED_PROXIES` for the runtime, and `RUNTIME_AUDIENCES` for Core;
-`runtime.env` has `KMS_KEY_ID=local:/secrets/kek/v1`; and `setup-server.sh`
-makes `kek/v1`. Until the images read them, nothing does.
+The front end manages what the runtime does for the site through the
+runtime's JSON API, under `/runtime/api/v1/` on the site's own origin:
+people host their agents by their ids, choose each one's model, on their
+own key or an offer of [the school's plan](#the-schools-ai-plan), try a
+key, pause, resume and delete an agent, and ask for a new token for it;
+the runtime's administrators (Core's root and admins, or only those of
+them that `ADMIN_ACTOR_IDS` names) set the school's offers and quotas, prices, the
+quotas of tenants and the hosted agents' daily budgets, OCR and the
+transcriber, and read what the models cost (the routes under `admin/`).
+Every change, and every refusal, is in the runtime's audit, with a key's
+hint and never its value. The keys and tokens it is given are sealed in
+the runtime's database with [its key](#rotating-secrets).
+
+The runtime serves it on its port 9091 (`API_ADDR`), apart from 9090, and
+serves nothing else there. Caddy sends `/runtime/api/*` to it with the
+browser's `Cookie` header removed: the API takes a bearer token alone, an
+assertion Core makes for the person signed in to the site (Core's
+`POST /v1/auth/assertion`), never Core's session. No path reaches 9090,
+and `/status` there refuses any request a proxy forwarded, should one
+ever be pointed at it.
+
+The stack sets everything it needs; nothing has to be added to the env
+files:
+
+| Setting | Value | |
+| --- | --- | --- |
+| `API_ADDR` (the runtime, `stack.yaml`) | `:9091` | where the API listens; with it, the runtime does not start without the four below it |
+| `API_AUDIENCE` (the runtime, `stack.yaml`) | `https://HOST/runtime` | the audience the assertions must name, byte for byte as Core's `RUNTIME_AUDIENCES` lists it |
+| `CORE_BASE_URL` (the runtime, `stack.yaml`) | `https://HOST` | the Core whose assertions it takes (their issuer, Core's `PUBLIC_URL`), whose keys it reads at `/v1/auth/keys`, and at which hosted agents run |
+| `DATABASE_URL` (`runtime.env`) | the runtime's database | where it keeps the hosted agents and the site's settings |
+| `KMS_KEY_ID` (`runtime.env`) | `local:/secrets/kek/v1` | the key that seals what people give it; `setup-server.sh` writes both |
+| `API_TRUSTED_PROXIES` (the runtime, `stack.yaml`) | `AISHIE_CADDY_IP/32` | Caddy, whose `X-Forwarded-For` the audit and the limits per address believe |
+| `RUNTIME_AUDIENCES` (Core, `stack.yaml`) | `https://HOST/runtime` | the one audience Core makes assertions for, signed with a key derived from `SIGNING_KEY` unless `ASSERTION_KEY` is set |
+
+In `runtime.env`, optionally: `ADMIN_ACTOR_IDS`, Core actor ids, comma
+separated, to which the runtime's administrators are narrowed (unset, all
+of Core's root and admins); and `CORE_ASSERTION_KEY`, Core's assertion key
+pinned, as the `x` of Core's `/v1/auth/keys`, in place of reading it from
+Core, which then has to change with `ASSERTION_KEY` (or `SIGNING_KEY`).
+Inside the stack's network `https://HOST` is Caddy
+([The network, and HOST inside it](#the-network-and-host-inside-it)), so
+the runtime reads Core's keys without leaving the server.
+
+What to check:
+
+```
+curl -s https://HOST/runtime/api/v1/info
+```
+
+answers anyone, with `"api":"aishie-runtime"`, `"api_version":1`, the
+runtime's `version` and `commit`, `"audience":"https://HOST/runtime"`,
+`"issuer":"https://HOST"`, and `features`: `host_by_id` and `own_key`
+true, `school_key` true once the school's plan offers a model, and
+`transcription` while the transcriber runs or stands by. The front end
+takes the runtime to be there only when `api` and `api_version` are
+these, and offers what `features` says. If it does not answer so:
+
+- **502** is Caddy's: the runtime is not running, or not listening on
+  9091. `aishie ps`, then `aishie logs runtime`: the line
+  `aishie-runtime started` names the API's address (`api`), and a runtime
+  that refused its settings says which (`API_AUDIENCE: required with
+  API_ADDR`, say).
+- **401, `assertion_invalid`**, to people signed in to the site: the
+  assertion is not for this runtime or not from this Core. `API_AUDIENCE`,
+  `RUNTIME_AUDIENCES`, `CORE_BASE_URL` and `PUBLIC_URL` all come from
+  `HOST`, so they agree unless one service still runs with a name from
+  before: after `HOST` changes, `aishie compose up -d`
+  ([Changing the host name](#day-to-day)).
+- **503, `keys_unavailable`**: the runtime cannot read Core's keys at
+  `https://HOST/v1/auth/keys`, and its log says why.
 
 ## The images
 
@@ -1116,11 +1220,15 @@ The stack relies on each image doing the following:
   whether it offers single sign-on, and as what (a Core from before that
   route answers 404, and the sign-in page then offers none).
 - **The runtime** (`ghcr.io/aishie-education/aishie-agent-runtime`): `run`
-  by default; `check [--live]`, `migrate up`, `version`; user 65532;
-  `/healthz` on `HTTP_ADDR` answers `status` `ok`, `version` and `commit`;
-  it starts with no agent configured; it reads its credential for Core
-  where `CORE_SERVICE_CREDENTIAL` says, `secret://core/agent_runtime` by
-  default, and hosts agents by their ids with it.
+  by default; `check [--live]`, `migrate up`, `keys check`, `keys rewrap`,
+  `version`; user 65532; `/healthz` on `HTTP_ADDR` answers `status` `ok`,
+  `version` and `commit`; it starts with no agent configured; it reads its
+  credential for Core where `CORE_SERVICE_CREDENTIAL` says,
+  `secret://core/agent_runtime` by default, and hosts agents by their ids
+  with it; with `API_ADDR`, it serves its API there under
+  `/runtime/api/v1/` and nothing else, `GET /runtime/api/v1/info` to
+  anyone, the rest to Core's assertions for `API_AUDIENCE` alone, and
+  opens the secrets it seals with the keyring `KMS_KEY_ID` names.
 - **The web** (`ghcr.io/aishie-education/aishie-frontend`): tags `:edge`
   (main's tip), `:sha-<7 hex>`, and `:X.Y.Z` and `:X.Y` from releases, with
   `:latest` and `:stable` on the highest stable one; the
@@ -1168,10 +1276,10 @@ images, then, through Caddy with its local certificate authority, that
 `/v1/auth/methods` says there is no single sign-on), the first
 administrator can be made, sign in with their email and password, and
 use the API with that session, as a bearer token and as the web's
-cookie, `/runtime/api/` and no other
-path reaches the runtime's 9090, nothing but Caddy is published beyond the
-loopback, Core is given the `SECRETS_KEY` `setup-server.sh` wrote, the
-runtime reaches Core at `https://HOST` through Caddy's alias, the runtime
+cookie, `/runtime/api/v1/info` is the runtime's API, for
+`https://NAME/runtime`, no path reaches the runtime's 9090, nothing but
+Caddy is published beyond the loopback, Core is given the `SECRETS_KEY`
+`setup-server.sh` wrote, the runtime reaches Core at `https://HOST` through Caddy's alias, the runtime
 is given its credential for Core (with a Core that has the
 `agent_runtime` service), printed nowhere, which Core takes, and
 `aishie runtime-credential` replaces it, Core refusing the one before,

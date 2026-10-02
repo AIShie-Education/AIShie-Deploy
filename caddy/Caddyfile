@@ -18,10 +18,11 @@
 		reverse_proxy core:8080
 	}
 
-	# The runtime's API, and only it: its /healthz, /metrics and /status on
-	# 9090 are never proxied. The API takes bearer tokens alone, so the
-	# browser's cookies for this site (Core's session) are not passed on.
-	# Until the runtime serves it (M2), this answers 502.
+	# The runtime's API for the front end, on its API_ADDR (9091), and only
+	# it: its /healthz, /metrics and /status on 9090 are never proxied. The
+	# API takes bearer tokens alone, Core's assertions, so the browser's
+	# cookies for this site (Core's session) are not passed on. A 502 here
+	# is a runtime that is not running (README.md, The runtime's API).
 	handle /runtime/api/* {
 		request_header -Cookie
 		reverse_proxy runtime:9091

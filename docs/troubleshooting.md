@@ -209,6 +209,14 @@ Then `aishie-update` runs now instead of in five minutes.
   another and recreates the runtime with it. Never edit or empty the file
   by hand: a run of `setup-server.sh` issues a new one into an empty file,
   but leaves anything else as it is.
+- **The site does not offer hosting agents, or its pages for the runtime
+  fail.** `curl -s https://HOST/runtime/api/v1/info` must answer
+  `"api":"aishie-runtime"` with `"audience":"https://HOST/runtime"`. A 502
+  is a runtime that is not running or not listening on 9091
+  (`aishie logs runtime` says why); a 401 `assertion_invalid` to people
+  signed in, a service still on an old `HOST` (`aishie compose up -d`); a
+  503 `keys_unavailable`, a runtime that cannot read Core's keys
+  (README.md, The runtime's API).
 - **An owner's own tool (Claude Desktop, say) stopped working with an
   agent's token after Core was updated.** Core's migration 0025 made the
   agent a runtime agent, hosted here alone, and revoked its other tokens.

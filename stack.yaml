@@ -60,9 +60,9 @@ services:
       # Caddy, and nothing else: Core takes a client's address from the
       # X-Forwarded-For of this proxy alone.
       TRUSTED_PROXIES: ${AISHIE_CADDY_IP:?set AISHIE_CADDY_IP in /etc/aishie/aishie.env}/32
-      # For the runtime's API (M2): the audience of the assertions Core
-      # issues for it. Core reads it once it has that API; until then,
-      # nothing does.
+      # The runtime's API: the one audience Core makes assertions for, which
+      # the front end sends the runtime as the person signed in. The same
+      # bytes as the runtime's API_AUDIENCE below.
       RUNTIME_AUDIENCES: https://${HOST}/runtime
     volumes:
       # The files people upload (BLOB_FS_ROOT=/data/blobs), in a directory
@@ -96,9 +96,10 @@ services:
       # The one Core its agents may connect to. Inside this network
       # https://HOST is Caddy, by its alias below.
       CORE_BASE_URL_ALLOWLIST: https://${HOST:?set HOST in /etc/aishie/aishie.env}
-      # For the runtime's API (M2), which Caddy proxies to 9091. The runtime
-      # reads these once it has that API; until then, nothing does, and
-      # Caddy answers 502 there.
+      # The runtime's API for the front end, which Caddy proxies to 9091 at
+      # /runtime/api/*: it takes Core's assertions for API_AUDIENCE, issued
+      # by CORE_BASE_URL (Core's PUBLIC_URL), and believes the
+      # X-Forwarded-For of Caddy alone (README.md, The runtime's API).
       API_ADDR: ":9091"
       API_AUDIENCE: https://${HOST}/runtime
       CORE_BASE_URL: https://${HOST}
