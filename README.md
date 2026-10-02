@@ -1265,10 +1265,10 @@ images, then, through Caddy with its local certificate authority, that
 `/v1/auth/methods` says there is no single sign-on), the first
 administrator can be made, sign in with their email and password, and
 use the API with that session, as a bearer token and as the web's
-cookie, `/runtime/api/` and no other
-path reaches the runtime's 9090, nothing but Caddy is published beyond the
-loopback, Core is given the `SECRETS_KEY` `setup-server.sh` wrote, the
-runtime reaches Core at `https://HOST` through Caddy's alias, the runtime
+cookie, `/runtime/api/v1/info` is the runtime's API, for
+`https://NAME/runtime`, no path reaches the runtime's 9090, nothing but
+Caddy is published beyond the loopback, Core is given the `SECRETS_KEY`
+`setup-server.sh` wrote, the runtime reaches Core at `https://HOST` through Caddy's alias, the runtime
 is given its credential for Core (with a Core that has the
 `agent_runtime` service), printed nowhere, which Core takes, and
 `aishie runtime-credential` replaces it, Core refusing the one before,
