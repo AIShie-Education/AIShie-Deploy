@@ -208,7 +208,7 @@ said "with generated passwords, SIGNING_KEY and SECRETS_KEY" || fail "said: $(ca
 said "Core keeps the files people upload on this server's disk" || fail "did not say where the files are kept"
 ! called "aws-sigv4" || fail "asked a bucket something"
 [ "$(setting runtime.env KMS_KEY_ID)" = local:/secrets/kek/v1 ] || fail "KMS_KEY_ID=$(setting runtime.env KMS_KEY_ID)"
-# The key that will wrap the runtime's secrets: 32 random bytes, base64, in
+# The key that seals the runtime's stored secrets: 32 random bytes, base64, in
 # the secrets directory, readable by the runtime's group alone.
 kek=$AISHIE_ETC/runtime/secrets/kek/v1
 [ "$(base64 -d < "$kek" | wc -c)" = 32 ] || fail "kek/v1 is not 32 bytes in base64"
@@ -349,6 +349,24 @@ said "warning: .*core.env keeps uploaded files with BLOB_STORE=fs, and is left a
   fail "no warning: $(cat "$FAKE/out")"
 [ "$(sums)" = "$before" ] || fail "changed $AISHIE_ETC"
 ! called "aws-sigv4" || fail "asked the bucket something"
+
+# ... after a rotation of the runtime's key (README.md, Rotating secrets),
+# v2 in the keyring and v1 removed: no v1 made in its place, and nothing in
+# /etc/aishie changed. A keyring with no key but a file in the making
+# (.v2.new, which the runtime passes over) is given v1.
+case=key-rotated
+kek_dir=$AISHIE_ETC/runtime/secrets/kek
+mv "$kek_dir/v1" "$kek_dir/v2"
+before=$(sums)
+setup_server test.aishie.app edge || fail "exit $?: $(cat "$FAKE/out")"
+[ ! -e "$kek_dir/v1" ] || fail "made v1 beside v2"
+[ "$(sums)" = "$before" ] || fail "changed $AISHIE_ETC: $(diff <(echo "$before") <(sums))"
+said "$kek_dir holds the runtime's key already (v2): no v1 made" || fail "said: $(cat "$FAKE/out")"
+rm "$kek_dir/v2"
+echo partial > "$kek_dir/.v2.new"
+setup_server test.aishie.app edge || fail "exit $?: $(cat "$FAKE/out")"
+[ "$(base64 -d < "$kek_dir/v1" | wc -c)" = 32 ] || fail "no v1 made in a keyring with no key"
+said "made $kek_dir/v1" || fail "said: $(cat "$FAKE/out")"
 
 # A server set up before SECRETS_KEY, set up again: core.env is given one,
 # as one line at its end, and keeps every other line, its mode and its owner

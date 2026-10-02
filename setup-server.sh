@@ -34,8 +34,8 @@
 # compose 2.24 or later, as 24.04's do, and Docker's apt repository
 # otherwise. It writes /etc/aishie: the settings, and the env files with
 # generated database passwords, SIGNING_KEY and SECRETS_KEY. It makes the
-# directories for the runtime's agents and secrets, with the key that will
-# wrap the secrets the runtime stores (kek/v1), Core's files, aishie-update's
+# directories for the runtime's agents and secrets, with the key that seals
+# the secrets the runtime stores (kek/v1), Core's files, aishie-update's
 # state and the backups. It installs the stack in /opt/aishie, aishie-update,
 # aishie and aishie-storage in /usr/local/bin, and the timers; opens 80 and
 # 443 in ufw when ufw is on; checks that the server can pull the three
@@ -405,20 +405,29 @@ make_dirs() {
   fi
 }
 
-# make_kek: kek/v1, 32 random bytes in base64, which the runtime's API (M2)
-# will wrap the secrets it stores with, unless it is there. It must not be
-# lost, nor changed: README.md, Rotating secrets.
+# make_kek: kek/v1, 32 random bytes in base64, the key the runtime seals the
+# secrets it keeps in its database with (KMS_KEY_ID), unless the keyring
+# kek/ holds a key already: v1, or the one a rotation added in its place,
+# which removed v1 (README.md, Rotating secrets). A name starting with . is
+# not a key, as the runtime has it. It must not be lost, nor changed.
 make_kek() {
-  f=$ETC/runtime/secrets/kek/v1
+  d=$ETC/runtime/secrets/kek
+  f=$d/v1
   if [ -e "$f" ]; then
     echo "$f is there already: left as it is"
     return 0
   fi
+  for k in "$d"/*; do
+    if [ -e "$k" ]; then
+      echo "$d holds the runtime's key already (${k##*/}): no v1 made"
+      return 0
+    fi
+  done
   openssl rand -base64 32 > "$f.new"
   chmod 640 "$f.new"
   own "root:$APP_UID" "$f.new"
   mv "$f.new" "$f"
-  echo "made $f, the key that will wrap the runtime's stored secrets: keep a copy off the server"
+  echo "made $f, the key that seals the runtime's stored secrets: keep a copy off the server"
 }
 
 # runtime_credential: the runtime's credential for Core, unless it has one.
