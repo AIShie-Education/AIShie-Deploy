@@ -18,7 +18,10 @@ happened:
 Whatever went wrong, the rule of a deploy holds: up to the moment the
 service is recreated, the version that ran goes on running, and the run
 stops at the step that failed. A run never starts the next service after a
-failure; the next run, five minutes later, goes on with the others.
+failure; the next run, five minutes later, goes on with the others. A
+digest that failed before, and a Core its channel names that is refused
+for Core's migration 0027 (below), are no failure of the run: each is left
+be, logged once, and the run goes on with the next service.
 
 ## A migration failed
 
@@ -56,16 +59,36 @@ though the one running keeps running.
 If you are not sure what the failed migration left, restore the backup
 taken before it instead (README.md, Restoring a backup).
 
+## Core's seed failed after migration 0027
+
+A seed that fails leaves the version that ran running, and records the new
+digest as failed. After a new Core's migration 0027, that is the one case
+where the version that ran goes on running on a schema it does not work
+on: 0027 is in by then. The log says `seed failed (above); sha256:… goes
+on running, but sha256:…'s migrations stop at 26, before Core's migration
+0027`. Fix what the seed says and `aishie-update --retry core`, or go back
+by hand with the image that has 0027 (README.md, Rolling back past Core's
+migration 0027).
+
 ## The new version did not report healthy
 
-The log says `not healthy within 60 seconds`, then one of three things:
+The log says `not healthy within 60 seconds`, then one of four things:
 
 - **`rolled back: sha256:… runs again`.** The version before was started
   again and reports healthy. The new digest is recorded as failed. The
   journal has the new version's last 30 log lines: that is where the reason
   is. The new schema stays (it was migrated before the switch), and the
   version before works with it: every migration leaves the release before
-  it working (Core's and the runtime's CONTRIBUTING.md, Migrations).
+  it working (Core's and the runtime's CONTRIBUTING.md, Migrations), every
+  one but Core's migration 0027, which the next case is about.
+- **`not rolled back: sha256:…'s migrations stop at 26, before Core's
+  migration 0027`.** The new Core brought migration 0027, which the Core
+  before cannot work on: started again, it would report healthy and fail
+  every authenticated call that reads an actor or a document's version.
+  So the new one goes on running, not healthy, and nothing is recorded as
+  failed. `aishie logs core` says why; once that is fixed (most often an
+  env file), `aishie compose up -d core`. To go back instead: README.md,
+  Rolling back past Core's migration 0027.
 - **`rolled back to sha256:…, which does not report healthy either`.**
   Neither version starts. What they share is the settings: most likely an
   env file (`/etc/aishie/core.env`, `runtime.env`) or, for the runtime, the
@@ -82,6 +105,28 @@ What each checks: Core's `/healthz` on 127.0.0.1:8080 must answer status
 503 while its database cannot be reached or its schema is behind); the
 runtime's on 127.0.0.1:9090 the same; the web's `/version.json` on
 127.0.0.1:8081 the commit of the image's revision label.
+
+## Core is refused: its migrations stop before 0027
+
+The log says `refused: sha256:…'s migrations stop at 26, before Core's
+migration 0027, which the schema has`. The Core named, by `--pin` or by the
+channel, is from before Core's migration 0027, and the schema has 0027: it
+would report healthy and fail every authenticated call. Nothing was
+changed, no backup was taken, and the Core that runs goes on running. A
+channel that names it is refused at every run, logged once, and the run
+goes on with the runtime and the web, which update as ever.
+
+A schema left dirty at 27 by a failed `migrate up` of 0027 does not have
+it: a Core from before it is not refused there, and its own `migrate up`
+fails on the dirty schema ([A migration failed](#a-migration-failed)).
+
+- To go back past 0027, migrate down first (README.md, Rolling back past
+  Core's migration 0027), then `--pin` again; a channel's Core goes ahead
+  at the next run.
+- To stay on 0027: on stable, set `CORE_IMAGE` back to the release that
+  runs; on edge, where `:edge` has gone back past 0027, pin the Core that
+  runs (`aishie-update --pin core sha256:<its digest>`, from
+  `aishie-update --status`) until `:edge` has 0027 again.
 
 ## The updater keeps skipping a failed digest
 

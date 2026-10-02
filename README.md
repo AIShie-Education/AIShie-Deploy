@@ -153,8 +153,9 @@ that order:
 3. Anything else is deployed:
    - **Core:** the image must be of `ghcr.io/aishie-education/aishie-core`
      by name, and its `org.opencontainers.image.source` label must be
-     AIShie-Core's repository. Its `version` gives the version and commit.
-     The database `aishie_core` is dumped to
+     AIShie-Core's repository. Its `version` gives the version and commit,
+     and its `migrate version` where its migrations stop (see 4). The
+     database `aishie_core` is dumped to
      `/var/backups/aishie/core-deploy-<UTC time>.dump` (written as `.part`,
      renamed once whole; the last ten kept). A dump that fails stops the run
      with nothing changed. `migrate up` and `seed` run in one-off
@@ -172,8 +173,12 @@ that order:
    it, which is waited for in turn, and its digest is recorded as failed.
    The version before can take over because the migrations went in before
    the switch and every migration leaves the release before it working
-   (Core's and the runtime's `CONTRIBUTING.md`, Migrations). Nothing ever
-   migrates down.
+   (Core's and the runtime's `CONTRIBUTING.md`, Migrations), every one but
+   Core's migration 0027. Nothing here ever migrates down. A Core whose
+   migrations stop before 0027 does not work on a schema that has it, so
+   `aishie-update` does not start one there: a new Core with 0027 that is
+   not healthy is left running, and a Core from before it is refused
+   ([Rolling back past Core's migration 0027](#rolling-back-past-cores-migration-0027)).
 5. After a deploy, the images of the three repositories that no container
    uses are removed (by their source label), and no other image.
 
@@ -245,9 +250,9 @@ new name, and Caddy gets a certificate for it.
 ## Rolling back
 
 Edge rolls itself back: a new version that does not report healthy is
-replaced by the one before. By hand, pin a service to an image, by digest
-or by tag, and it is deployed by the same sequence (backup, `migrate up`,
-the switch, the health check):
+replaced by the one before (not past Core's migration 0027, below). By
+hand, pin a service to an image, by digest or by tag, and it is deployed
+by the same sequence (backup, `migrate up`, the switch, the health check):
 
 ```
 aishie-update --pin core sha256:<digest>                  # the digest from the log or --status
@@ -256,8 +261,83 @@ aishie-update --pin core ghcr.io/aishie-education/aishie-core:1.2.2
 
 A pinned service is left alone by the runs after, whatever its channel
 says, until `aishie-update --unpin core`. The new schema stays, and the
-release before works with it; going back further than one release means
-restoring a backup. Never run `migrate down`: it deletes data.
+release before works with it, but for Core's migration 0027; going back
+further than one release means restoring a backup. Never run
+`migrate down`: it deletes data. The one exception is going back past
+Core's migration 0027, below.
+
+### Rolling back past Core's migration 0027
+
+Core's migration 0027 (AIShie-Core's PR #61) is the one migration that does
+not leave the release before it working: it drops columns that release
+reads and writes. A Core whose migrations stop before 0027, started on a
+schema that has it, reports healthy (its `/healthz` asks only that the
+schema be no older than its own) and fails every authenticated call that
+reads an actor or a document's version. So `aishie-update` asks each
+Core image `migrate version` before it runs it on the schema, and:
+
+- **A new Core with 0027 that does not report healthy is not rolled back**
+  to one from before it. It goes on running, nothing is recorded as
+  failed, and the log says `not rolled back: sha256:…'s
+  migrations stop at 26, before Core's migration 0027`. `aishie logs core`
+  says why it is not healthy; once that is fixed (an env file, say),
+  `aishie compose up -d core`. If it cannot be, go back by hand (below).
+- **A Core whose migrations stop before 0027 is refused** on a schema that
+  has it, whether pinned (`aishie-update --pin core` with the release
+  before) or named by its channel (`CORE_IMAGE` on stable set back to the
+  release before, or `:edge` once Core's `main` has gone back past 0027).
+  It is refused before the backup: nothing is changed, the Core that runs
+  goes on running, nothing is recorded as failed, and the log says
+  `refused: sha256:…'s migrations stop at 26`. A pin stops there. A
+  channel's Core is refused at every run, logged once, and the run goes on
+  with the runtime and the web, as for a digest that failed before. Once
+  the schema is migrated down, the same image goes ahead by itself. A
+  schema left dirty at 27 by a failed `migrate up` does not have 0027:
+  that is [A migration failed](docs/troubleshooting.md#a-migration-failed).
+- **A new Core with 0027 whose seed fails** leaves the Core before it
+  running, as any failed seed does, but on a schema that by then has 0027,
+  where it does not work. The log says so, and the new digest is recorded
+  as failed. Fix what the seed says and `aishie-update --retry core`, or go
+  back by hand (below), naming the image with 0027.
+
+Going back past 0027 is by hand, as root, as Core's `docs/deploying.md`
+says for its own servers: stop Core, take the schema down one migration
+with the image that has 0027 (the one that runs, which `aishie core` uses),
+then deploy the release before. The Core with 0027 must not run on the
+schema the down puts back (it fails to record or purge a version with
+files), so the site is down from the stop until the release before is up,
+which includes the backup `aishie-update` takes first:
+
+```
+aishie compose stop core
+aishie core migrate down --yes      # says: schema version 26 (embedded latest 27)
+aishie-update --pin core ghcr.io/aishie-education/aishie-core:<the release before>
+```
+
+On stable, setting `CORE_IMAGE` to the release before and `aishie-update`
+does the last step instead of the pin. The down puts back what the release
+before reads, from each version's files and each runtime agent's token,
+but not the type and size of a purged version's file, which 0027 dropped.
+Run nothing but this one `migrate down`: each further one deletes data. On
+edge, `aishie-update --unpin core` follows `:edge` again once its cause is
+fixed, and migrates up again.
+
+After a failed seed, the Core that runs, which `aishie core` uses, is the
+one before 0027 already, and its `migrate down` cannot take 0027 out (`no
+migration found for version 27`). Name the image with 0027 for the down,
+by the digest the log gives, then start the one before again, which
+`aishie-update` left in place:
+
+```
+aishie compose stop core
+CORE_REF=ghcr.io/aishie-education/aishie-core@sha256:<the digest with 0027> \
+  docker compose --project-directory /opt/aishie -f /opt/aishie/compose.yaml \
+  run --rm --no-deps -T core migrate down --yes
+aishie compose up -d core
+```
+
+The digest with 0027 stays recorded as failed, so the runs after leave it
+be; on stable, set `CORE_IMAGE` back to the release that runs.
 
 ## Upgrading stable
 
@@ -273,7 +353,9 @@ and run `aishie-update` (or wait five minutes). A channel on stable must be
 a release, `X.Y.Z`, or a digest: `aishie-update` refuses `:edge`, `:1.3`,
 `:latest` or `:stable` there, which move by themselves, so that an upgrade,
 and the migrations that come with it, is somebody's decision. To go back,
-set the release before and run `aishie-update`, or `aishie-update --pin`.
+set the release before and run `aishie-update`, or `aishie-update --pin`;
+from the release with Core's migration 0027, migrate down first
+([Rolling back past Core's migration 0027](#rolling-back-past-cores-migration-0027)).
 
 ## Renaming the settings
 
