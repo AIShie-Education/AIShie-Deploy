@@ -54,7 +54,7 @@ setup() {
   : > "$CALLS"
   export AISHIE_ETC=$FAKE/etc AISHIE_STATE=$FAKE/state AISHIE_APP=$root AISHIE_DATA=$FAKE/srv \
     AISHIE_LOCK_FILE=$FAKE/lock AISHIE_HEALTH_TRIES=3
-  unset S3_LIST S3_HEAD S3_CORS_GET S3_CORS_PUT S3_DOWN RCLONE_PULL_FAIL RCLONE_FAIL RCLONE_CORRUPT RCLONE_ATTACH FLOCK_FAIL NOT_ROOT \
+  unset S3_LIST S3_HEAD S3_CORS_GET S3_CORS_PUT S3_DOWN RCLONE_PULL_FAIL RCLONE_FAIL RCLONE_CORRUPT RCLONE_ATTACH FLOCK_FAIL NOT_ROOT OLD_CORE_HELP HELP_FAIL \
     AISHIE_STORAGE AISHIE_S3_BUCKET AISHIE_S3_REGION AISHIE_S3_ENDPOINT AISHIE_S3_PATH_STYLE AISHIE_R2_ACCOUNT_ID \
     AISHIE_R2_JURISDICTION AISHIE_S3_ACCESS_KEY AISHIE_S3_SECRET_KEY
   image core "$A" v0.2.0 abc1234
@@ -134,14 +134,57 @@ R2=0123456789abcdef0123456789abcdef
   fail "s3: $(resolve 'ST_KIND=s3 ST_ENDPOINT=https://minio.example.edu:9000/ ST_BUCKET=files')"
 [ "$(resolve 'ST_KIND=s3 ST_ENDPOINT=s3.example.com ST_REGION=nl-ams ST_PATH_STYLE=yes ST_BUCKET=files')" = "s3.example.com nl-ams https://s3.example.com/files" ] ||
   fail "s3 with a region: $(resolve 'ST_KIND=s3 ST_ENDPOINT=s3.example.com ST_REGION=nl-ams ST_PATH_STYLE=yes ST_BUCKET=files')"
+# Any AWS region, of every partition, by its endpoint's domain; one newer
+# than the table of Core's S3 client too.
+for r in "ap-southeast-5 amazonaws.com" "mx-central-1 amazonaws.com" "eu-west-9 amazonaws.com" "us-gov-west-1 amazonaws.com" \
+  "cn-northwest-1 amazonaws.com.cn" "eusc-de-east-1 amazonaws.eu" "us-iso-east-1 c2s.ic.gov" "us-isob-east-1 sc2s.sgov.gov" \
+  "us-isof-south-1 csp.hci.ic.gov" "eu-isoe-west-1 cloud.adc-e.uk"; do
+  region=${r% *} domain=${r#* }
+  case $domain in
+    amazonaws.com | amazonaws.com.cn) url=https://files.s3.$region.$domain ;;
+    # Core's S3 client names the bucket in the host at amazonaws.com(.cn)
+    # alone.
+    *) url=https://s3.$region.$domain/files ;;
+  esac
+  [ "$(resolve "ST_KIND=aws ST_REGION=$region ST_BUCKET=files")" = "s3.$region.$domain $region $url" ] ||
+    fail "aws in $region: $(resolve "ST_KIND=aws ST_REGION=$region ST_BUCKET=files" 2>&1)"
+done
+# How the bucket is named at another service: as Core's S3 client chooses
+# when not said (by its path, but at Google's), by its path with yes, in
+# the host name with no; and S3_BUCKET_LOOKUP says the same to Core.
+lookup() { lib "ST_AK=$AK ST_SK=abc; $1; st_resolve; echo \"\$(st_bucket_url) \$(st_env_block s3 | sed -n 's/^S3_BUCKET_LOOKUP=//p')\""; }
+for c in "ST_ENDPOINT=s3.example.com|https://s3.example.com/files auto" \
+  "ST_ENDPOINT=storage.googleapis.com|https://files.storage.googleapis.com auto" \
+  "ST_ENDPOINT=s3.example.com ST_PATH_STYLE=yes|https://s3.example.com/files path" \
+  "ST_ENDPOINT=storage.googleapis.com ST_PATH_STYLE=true|https://storage.googleapis.com/files path" \
+  "ST_ENDPOINT=s3.example.com ST_PATH_STYLE=no|https://files.s3.example.com dns" \
+  "ST_ENDPOINT=minio.example.edu:9000 ST_PATH_STYLE=false|https://files.minio.example.edu:9000 dns"; do
+  [ "$(lookup "ST_KIND=s3 ST_BUCKET=files ${c%|*}")" = "${c#*|}" ] || fail "s3, ${c%|*}: $(lookup "ST_KIND=s3 ST_BUCKET=files ${c%|*}" 2>&1)"
+done
+# AWS, R2 and B2 leave it to Core's S3 client.
+for k in "ST_KIND=aws ST_REGION=ap-east-1" "ST_KIND=r2 ST_R2_ACCOUNT=0123456789abcdef0123456789abcdef" "ST_KIND=b2 ST_REGION=us-west-004"; do
+  [ "$(lookup "$k ST_BUCKET=files ST_PATH_STYLE=no" | cut -d ' ' -f 2)" = auto ] || fail "$k: $(lookup "$k ST_BUCKET=files ST_PATH_STYLE=no" 2>&1)"
+done
 # What is refused, and why.
 refused() {
   if out=$(resolve "$1" 2>&1); then fail "took «$1»: $out"; fi
   [[ $out == *"$2"* ]] || fail "for «$1», said: $out"
 }
 refused 'ST_KIND=disk' "fs, aws, r2, b2 or s3"
-refused 'ST_KIND=aws ST_REGION=mars-north-1 ST_BUCKET=files' "not an AWS region Core's S3 client knows"
-refused 'ST_KIND=aws ST_BUCKET=files' "not an AWS region"
+# shellcheck disable=SC2016 # a $(...) that must stay as it is
+for r in mars-north-1 US-EAST-1 us-east us_east_1 useast1 us-east-1a 'us-east-1 ' ' us-east-1' us-east-1.evil.example \
+  eusc-fr-east-1 us-iso-1-east cn-north us-gov-west 'us-east-1;id' '$(id)' "$(printf 'us-east-1\nus-west-2')"; do
+  refused "ST_KIND=aws ST_REGION='$r' ST_BUCKET=files" "not an AWS region's name"
+done
+refused 'ST_KIND=aws ST_BUCKET=files' "not an AWS region's name"
+# A bucket with a dot: by its path at AWS, which Core reaches in the
+# regions its S3 client's table has alone; and never in the host name over
+# HTTPS.
+refused 'ST_KIND=aws ST_REGION=eu-west-9 ST_BUCKET=files.example.edu' "a region newer than its S3 client's table"
+refused 'ST_KIND=s3 ST_ENDPOINT=s3.eu-west-9.amazonaws.com ST_REGION=eu-west-9 ST_BUCKET=files.example.edu' "a region newer than its S3 client's table"
+[ "$(resolve 'ST_KIND=aws ST_REGION=eusc-de-east-1 ST_BUCKET=files.example.edu')" = "s3.eusc-de-east-1.amazonaws.eu eusc-de-east-1 https://s3.eusc-de-east-1.amazonaws.eu/files.example.edu" ] ||
+  fail "a name with dots where Core sends requests to the endpoint: $(resolve 'ST_KIND=aws ST_REGION=eusc-de-east-1 ST_BUCKET=files.example.edu' 2>&1)"
+refused 'ST_KIND=s3 ST_ENDPOINT=s3.example.com ST_PATH_STYLE=no ST_BUCKET=files.example.edu' "is not a name the service's certificate covers"
 refused 'ST_KIND=aws ST_REGION=ap-east-1 ST_BUCKET=-files' "is not a bucket's name"
 refused 'ST_KIND=aws ST_REGION=ap-east-1 ST_BUCKET=a..b' "is not a bucket's name"
 refused 'ST_KIND=aws ST_REGION=ap-east-1 ST_BUCKET=ab' "3 to 63 characters"
@@ -150,7 +193,7 @@ refused "ST_KIND=r2 ST_R2_ACCOUNT=$R2 ST_R2_JURISDICTION=mars ST_BUCKET=files" "
 refused 'ST_KIND=b2 ST_BUCKET=files' "B2's region is in the bucket's endpoint"
 refused 'ST_KIND=s3 ST_ENDPOINT=http://minio.example.edu ST_BUCKET=files' "refuse to send it to an http:// address"
 refused 'ST_KIND=s3 ST_ENDPOINT=s3.example.com/path ST_BUCKET=files' "HOST or HOST:PORT"
-refused 'ST_KIND=s3 ST_ENDPOINT=s3.example.com ST_PATH_STYLE=no ST_BUCKET=files' "no setting for virtual-hosted addressing yet"
+refused 'ST_KIND=s3 ST_ENDPOINT=s3.example.com ST_PATH_STYLE=maybe ST_BUCKET=files' "yes or no"
 refused "ST_KIND=aws ST_REGION=ap-east-1 ST_BUCKET=files; ST_SK='a b'" "has a space, a quote, a backslash"
 refused "ST_KIND=aws ST_REGION=ap-east-1 ST_BUCKET=files; ST_SK=\"a'b\"" "has a space, a quote, a backslash"
 refused "ST_KIND=aws ST_REGION=ap-east-1 ST_BUCKET=files; ST_SK=''" "the secret key is empty"
@@ -232,10 +275,15 @@ called "compose .* up -d --no-deps core" || fail "Core not started again"
 [ "$(setting core.env S3_ENDPOINT)" = s3.ap-east-1.amazonaws.com ] || fail "S3_ENDPOINT=$(setting core.env S3_ENDPOINT)"
 [ "$(setting core.env S3_BUCKET)" = aishie-files ] || fail "S3_BUCKET=$(setting core.env S3_BUCKET)"
 [ "$(setting core.env S3_REGION)" = ap-east-1 ] || fail "S3_REGION=$(setting core.env S3_REGION)"
+[ "$(setting core.env S3_BUCKET_LOOKUP)" = auto ] || fail "S3_BUCKET_LOOKUP=$(setting core.env S3_BUCKET_LOOKUP)"
 [ "$(setting core.env S3_USE_SSL)" = true ] || fail "S3_USE_SSL=$(setting core.env S3_USE_SSL)"
 [ "$(setting core.env S3_ACCESS_KEY)" = "$AK" ] || fail "S3_ACCESS_KEY is not the key given"
 [ "$(setting core.env S3_SECRET_KEY)" = "'$SK'" ] || fail "S3_SECRET_KEY is not the secret given, in single quotes for its \$"
 [ "$(setting core.env BLOB_FS_ROOT)" = /data/blobs ] || fail "BLOB_FS_ROOT=$(setting core.env BLOB_FS_ROOT)"
+# A region Core's S3 client knows, named as it chooses: nothing of Core's
+# needs asking.
+! called "core help" || fail "asked Core's help"
+grep -qx 'force_path_style = false' "$FAKE/rclone.conf" || fail "rclone not told to name the bucket in the host: $(grep force_path_style "$FAKE/rclone.conf")"
 grep -q '^DATABASE_URL=postgres://aishie_core:pw@' "$AISHIE_ETC/core.env" || fail "DATABASE_URL lost"
 grep -q '^SIGNING_KEY=s' "$AISHIE_ETC/core.env" || fail "SIGNING_KEY lost"
 grep -qxF "SECRETS_KEY=$CORE_SECRETS_KEY" "$AISHIE_ETC/core.env" || fail "SECRETS_KEY lost"
@@ -430,8 +478,108 @@ for kind in r2 b2 s3; do
   esac
   [ "$(setting core.env S3_ENDPOINT) $(setting core.env S3_REGION)" = "$want" ] ||
     fail "S3_ENDPOINT and S3_REGION: $(setting core.env S3_ENDPOINT) $(setting core.env S3_REGION)"
+  [ "$(setting core.env S3_BUCKET_LOOKUP)" = auto ] || fail "S3_BUCKET_LOOKUP=$(setting core.env S3_BUCKET_LOOKUP)"
+  grep -qx 'force_path_style = true' "$FAKE/rclone.conf" || fail "rclone not told to name the bucket in the path: $(grep force_path_style "$FAKE/rclone.conf")"
   [ -f "$FAKE/bucket/courses/$C1/$U3" ] || fail "not copied"
   no_secret
+done
+
+# A service that takes only virtual-hosted requests (--s3-path-style no):
+# S3_BUCKET_LOOKUP=dns, the bucket in the host name for the check, rclone
+# and Core, once the Core this server runs is found to read it.
+s3dns() {
+  AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK storage migrate --to s3 \
+    --storage s3 --s3-endpoint s3.example.com --s3-region nl-ams --s3-bucket files --s3-path-style no
+}
+setup to-s3-dns
+s3dns || fail "exit $?: $(cat "$FAKE/out")"
+[ "$(setting core.env S3_BUCKET_LOOKUP)" = dns ] || fail "S3_BUCKET_LOOKUP=$(setting core.env S3_BUCKET_LOOKUP)"
+[ "$(setting core.env S3_ENDPOINT) $(setting core.env S3_REGION)" = "s3.example.com nl-ams" ] ||
+  fail "S3_ENDPOINT and S3_REGION: $(setting core.env S3_ENDPOINT) $(setting core.env S3_REGION)"
+called "compose .* run --rm --no-deps -T core help" || fail "did not ask Core's help"
+[ "$(line 'core help')" -lt "$(line 'aws-sigv4')" ] || fail "asked Core's help after reaching the bucket"
+grep -q "^GET https://files.s3.example.com/?list-type=2" "$FAKE/s3-requests" || fail "the check, not in the host name: $(head -n 1 "$FAKE/s3-requests")"
+! grep -q "^[A-Z]* https://s3.example.com/" "$FAKE/s3-requests" || fail "a request by the path: $(grep "https://s3.example.com/" "$FAKE/s3-requests")"
+grep -qx 'force_path_style = false' "$FAKE/rclone.conf" || fail "rclone not told to name the bucket in the host: $(grep force_path_style "$FAKE/rclone.conf")"
+said "to: the bucket files at s3.example.com (region nl-ams), named in the host name" || fail "said: $(cat "$FAKE/out")"
+[ -f "$FAKE/bucket/courses/$C1/$U3" ] || fail "not copied"
+no_secret
+# The check, from core.env, the same way; and the setting kept by a move
+# back, for a move there again.
+rm -f "$FAKE/s3-requests"
+storage check || fail "check: exit $?: $(cat "$FAKE/out")"
+grep -q "^GET https://files.s3.example.com/?list-type=2" "$FAKE/s3-requests" || fail "the check from core.env: $(head -n 1 "$FAKE/s3-requests")"
+storage migrate --to fs || fail "back: exit $?: $(cat "$FAKE/out")"
+[ "$(setting core.env BLOB_STORE) $(setting core.env S3_BUCKET_LOOKUP)" = "fs dns" ] ||
+  fail "back: $(setting core.env BLOB_STORE) $(setting core.env S3_BUCKET_LOOKUP)"
+[ "$(grep -c '^S3_BUCKET_LOOKUP=' "$AISHIE_ETC/core.env")" = 1 ] || fail "S3_BUCKET_LOOKUP more than once: $(grep '^S3_BUCKET_LOOKUP=' "$AISHIE_ETC/core.env")"
+grep -qx 'force_path_style = false' "$FAKE/rclone.conf" || fail "rclone, back, not told to name the bucket in the host"
+storage migrate --to s3 --dry-run || fail "there again: exit $?: $(cat "$FAKE/out")"
+said "the bucket core.env names already: the bucket files at s3.example.com (region nl-ams), named in the host name" || fail "said: $(cat "$FAKE/out")"
+# A Core from before S3_BUCKET_LOOKUP: refused before anything is copied
+# or changed.
+setup to-s3-dns-old-core
+before=$(sums)
+if OLD_CORE_HELP=1 s3dns; then fail "passed with a Core that does not read S3_BUCKET_LOOKUP"; fi
+said "--s3-path-style no needs a Core whose help names S3_BUCKET_LOOKUP" || fail "said: $(cat "$FAKE/out")"
+said "update it first (aishie-update)" || fail "said: $(cat "$FAKE/out")"
+[ "$(sums)" = "$before" ] || fail "changed core.env"
+! called "aws-sigv4" || fail "reached the bucket"
+! called "rclone" || fail "ran rclone"
+# A help that does not run is not taken for an older Core: Docker's error
+# is shown.
+setup to-s3-dns-no-help
+before=$(sums)
+if HELP_FAIL=1 s3dns; then fail "passed with a help that did not run"; fi
+said "the help of the one this server runs, which says whether it is one, did not run (above). Nothing was changed" || fail "said: $(cat "$FAKE/out")"
+said "Error response from daemon: No such image" || fail "Docker's error not shown: $(cat "$FAKE/out")"
+! said "is older" || fail "said the Core is older: $(cat "$FAKE/out")"
+[ "$(sums)" = "$before" ] || fail "changed core.env"
+! called "rclone" || fail "ran rclone"
+# ... and with none deployed yet: said, and done.
+setup to-s3-dns-not-deployed
+echo "# nothing deployed yet" > "$FAKE/state/images.env"
+OLD_CORE_HELP=1 s3dns || fail "exit $?: $(cat "$FAKE/out")"
+said "the first Core this server deploys must be one" || fail "said: $(cat "$FAKE/out")"
+! called "core help" || fail "asked the help of a Core not deployed"
+[ "$(setting core.env S3_BUCKET_LOOKUP)" = dns ] || fail "S3_BUCKET_LOOKUP=$(setting core.env S3_BUCKET_LOOKUP)"
+# A setting Core would refuse to start on.
+setup bad-lookup
+printf 'S3_ENDPOINT=s3.example.com\nS3_BUCKET=files\nS3_BUCKET_LOOKUP=virtual\nS3_ACCESS_KEY=%s\nS3_SECRET_KEY=abc\n' "$AK" >> "$AISHIE_ETC/core.env"
+if storage check; then fail "took S3_BUCKET_LOOKUP=virtual"; fi
+said "S3_BUCKET_LOOKUP=virtual in .*core.env: auto, path or dns" || fail "said: $(cat "$FAKE/out")"
+
+# An AWS region newer than the table of Core's S3 client: Core sends its
+# requests there itself, which a Core from before it does not.
+setup new-region
+if OLD_CORE_HELP=1 AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK storage migrate --to s3 --storage aws --s3-region eu-west-9 --s3-bucket files; then
+  fail "passed with a Core that sends eu-west-9's requests to us-east-1"
+fi
+said "the region eu-west-9, newer than the table of Core's S3 client, needs a Core whose help names S3_BUCKET_LOOKUP" || fail "said: $(cat "$FAKE/out")"
+! called "rclone" || fail "ran rclone"
+AISHIE_S3_ACCESS_KEY=$AK AISHIE_S3_SECRET_KEY=$SK storage migrate --to s3 --storage aws --s3-region eu-west-9 --s3-bucket files ||
+  fail "exit $?: $(cat "$FAKE/out")"
+[ "$(setting core.env S3_ENDPOINT) $(setting core.env S3_REGION) $(setting core.env S3_BUCKET_LOOKUP)" = "s3.eu-west-9.amazonaws.com eu-west-9 auto" ] ||
+  fail "core.env: $(setting core.env S3_ENDPOINT) $(setting core.env S3_REGION) $(setting core.env S3_BUCKET_LOOKUP)"
+called "curl .*--aws-sigv4 aws:amz:eu-west-9:s3 .*https://files.s3.eu-west-9.amazonaws.com/?list-type=2" || fail "the check: $(grep aws-sigv4 "$CALLS" | head -n 1)"
+grep -qx 'region = eu-west-9' "$FAKE/rclone.conf" || fail "rclone's region: $(grep region "$FAKE/rclone.conf")"
+
+# A bucket of AWS's other partitions, read from core.env: Amazon S3 to the
+# check, the status and rclone, and named in the path, as Core's S3 client
+# does at an endpoint outside amazonaws.com and amazonaws.com.cn.
+for e in s3.eusc-de-east-1.amazonaws.eu s3.us-iso-east-1.c2s.ic.gov s3.us-isob-east-1.sc2s.sgov.gov \
+  s3.us-isof-south-1.csp.hci.ic.gov s3.eu-isoe-west-1.cloud.adc-e.uk; do
+  r=${e#s3.}
+  r=${r%%.*}
+  setup "partition-$r"
+  printf 'S3_ENDPOINT=%s\nS3_BUCKET=files\nS3_REGION=%s\nS3_ACCESS_KEY=%s\nS3_SECRET_KEY=%s\n' "$e" "$r" "$AK" "$SK" >> "$AISHIE_ETC/core.env"
+  storage check || fail "$e: check: exit $?: $(cat "$FAKE/out")"
+  said "the bucket files of Amazon S3, in $r ($e) answers" || fail "$e: check said: $(cat "$FAKE/out")"
+  called "https://$e/files/?list-type=2" || fail "$e: the check: $(grep aws-sigv4 "$CALLS" | head -n 1)"
+  storage migrate --to s3 --dry-run || fail "$e: dry run: exit $?: $(cat "$FAKE/out")"
+  said "the bucket core.env names already: the bucket files of Amazon S3, in $r" || fail "$e: said: $(cat "$FAKE/out")"
+  grep -qx 'provider = AWS' "$FAKE/rclone.conf" || fail "$e: rclone's provider: $(grep provider "$FAKE/rclone.conf")"
+  grep -qx 'force_path_style = true' "$FAKE/rclone.conf" || fail "$e: rclone not told to name the bucket in the path: $(grep force_path_style "$FAKE/rclone.conf")"
 done
 
 [ "$failed" = 0 ] && echo "aishie-storage: ok"

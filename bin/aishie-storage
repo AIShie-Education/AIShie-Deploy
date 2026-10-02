@@ -19,7 +19,7 @@
 #   --storage aws --s3-region REGION --s3-bucket NAME     Amazon S3
 #   --storage r2 --r2-account-id ID --s3-bucket NAME      Cloudflare R2 [--r2-jurisdiction eu|fedramp]
 #   --storage b2 --s3-region REGION --s3-bucket NAME      Backblaze B2, REGION as in its endpoint (us-west-004)
-#   --storage s3 --s3-endpoint HOST[:PORT] --s3-bucket NAME [--s3-region REGION] [--s3-path-style yes]
+#   --storage s3 --s3-endpoint HOST[:PORT] --s3-bucket NAME [--s3-region REGION] [--s3-path-style yes|no]
 #
 # or, for a run nobody answers, AISHIE_STORAGE, AISHIE_S3_BUCKET,
 # AISHIE_S3_REGION, AISHIE_S3_ENDPOINT, AISHIE_S3_PATH_STYLE,
@@ -28,6 +28,18 @@
 # secret is not shown). They are never on a command line and never printed:
 # curl reads them on its standard input, rclone from a file of root's that
 # is removed when this ends, and core.env (0600) keeps them for Core.
+#
+# With aws, --s3-region is any AWS region, of any partition (us-gov-west-1,
+# cn-north-1, eusc-de-east-1), newer ones included. With s3,
+# --s3-path-style says how a request names the bucket, which core.env
+# tells Core in S3_BUCKET_LOOKUP: yes after the endpoint (path,
+# https://HOST/BUCKET/KEY), no in the host name (dns,
+# https://BUCKET.HOST/KEY), for a service that takes nothing else; not
+# given, as Core's S3 client chooses (auto: in the host name at AWS, Google
+# and Aliyun, after the endpoint anywhere else). A region newer than the
+# table of Core's S3 client, and --s3-path-style no, need a Core from its
+# main since its PR #46 (d8f256c), whose help names S3_BUCKET_LOOKUP: migrate,
+# and setup-server.sh, check that the Core this server runs is one.
 #
 # The check reads alone: it lists at most one key of the bucket and asks for
 # an object that is not there, as Core does when it starts. It writes
@@ -63,11 +75,14 @@ APP_UID=65532
 # rclone 1.75.1, by the digest of its index on Docker Hub (every platform).
 RCLONE_IMAGE=rclone/rclone:1.75.1@sha256:45401ad7410db1d67ffdb58e19059ad20b0d8e0285a60e38bbec55cc1019c7a5
 ST_HEALTH_TRIES=${AISHIE_HEALTH_TRIES:-30}
-# The AWS regions Core's S3 client (minio-go v7.3.0) knows the endpoint of.
-# At AWS it sends each request to the endpoint of the region it is given,
-# and to us-east-1's for one it does not know, where the bucket is not, so a
-# bucket in any other region does not work with Core yet.
-ST_AWS_REGIONS="us-east-1 us-east-2 us-west-1 us-west-2 ca-central-1 ca-west-1 mx-central-1 sa-east-1
+# The AWS regions at amazonaws.com and amazonaws.com.cn in the table of
+# Core's S3 client (minio-go v7.3.0), which sends a request for one of them
+# to its endpoint. Core sends a request for any other region to the
+# region's endpoint itself (since its PR #46), by the means transfer
+# acceleration uses, which takes no bucket whose name has a dot: such a
+# bucket is refused in a region not here. A list that has fallen behind
+# Core's table refuses more than it need, never less.
+ST_AWS_CLIENT_REGIONS="us-east-1 us-east-2 us-west-1 us-west-2 ca-central-1 ca-west-1 mx-central-1 sa-east-1
 eu-west-1 eu-west-2 eu-west-3 eu-central-1 eu-central-2 eu-north-1 eu-south-1 eu-south-2 il-central-1
 me-central-1 me-south-1 af-south-1 ap-east-1 ap-east-2 ap-south-1 ap-south-2 ap-northeast-1 ap-northeast-2
 ap-northeast-3 ap-southeast-1 ap-southeast-2 ap-southeast-3 ap-southeast-4 ap-southeast-5 ap-southeast-6
@@ -84,9 +99,11 @@ ST_NL='
 # The bucket: what the options, the variables or the answers gave, or what
 # core.env says.
 ST_KIND='' ST_BUCKET='' ST_REGION='' ST_ENDPOINT='' ST_PATH_STYLE='' ST_R2_ACCOUNT='' ST_R2_JURISDICTION=''
+# How a request names the bucket (S3_BUCKET_LOOKUP): auto, path or dns.
+ST_LOOKUP=auto
 ST_AK='' ST_SK='' ST_SSL=true ST_GIVEN=''
 ST_STORE='' ST_FS_ROOT=''
-st_tmp='' st_echo_off='' st_cors='' st_stopped='' st_root='' st_mount_mode=''
+st_tmp='' st_echo_off='' st_cors='' st_stopped='' st_root='' st_mount_mode='' st_core_first=''
 
 st_die() { echo "$ST_NAME: $*" >&2; exit 1; }
 st_say() { printf '\n== %s\n' "$*"; }
@@ -249,7 +266,10 @@ st_gather() {
       st_need ST_ENDPOINT "the service's endpoint (--s3-endpoint)" "The service's S3 endpoint, HOST or HOST:PORT: "
       st_need ST_REGION "" "Region [us-east-1]: " us-east-1
       st_need ST_BUCKET "the bucket's name (--s3-bucket)" "Bucket: "
-      st_need ST_PATH_STYLE "" "Path-style addressing, https://HOST/BUCKET/KEY (yes/no) [yes]: " yes
+      # Not given, and Enter, leave it to Core's S3 client.
+      if [ -z "$ST_PATH_STYLE" ] && st_interactive; then
+        st_ask ST_PATH_STYLE "Bucket in the path, https://HOST/BUCKET/KEY (yes), or in the host name, https://BUCKET.HOST/KEY (no) [as Core's S3 client chooses]: "
+      fi
       st_need ST_AK "its access key (AISHIE_S3_ACCESS_KEY)" "Access key: "
       st_need_secret ST_SK "its secret key (AISHIE_S3_SECRET_KEY)" "Secret key (not shown): "
       ;;
@@ -282,18 +302,12 @@ st_resolve() {
     [!a-zA-Z0-9]* | *[!a-zA-Z0-9] | *[!a-zA-Z0-9._-]* | *..*) st_die "--s3-bucket $ST_BUCKET is not a bucket's name" ;;
   esac
   if [ "${#ST_BUCKET}" -lt 3 ] || [ "${#ST_BUCKET}" -gt 63 ]; then st_die "--s3-bucket $ST_BUCKET is not a bucket's name: 3 to 63 characters"; fi
-  ST_SSL=true
+  ST_SSL=true ST_LOOKUP=auto
   case $ST_KIND in
     aws)
-      st_regions=$(printf '%s' "$ST_AWS_REGIONS" | tr '\n' ' ')
-      case " $st_regions " in
-        *" ${ST_REGION:-none} "*) ;;
-        *) st_die "--s3-region ${ST_REGION:-(none)}: not an AWS region Core's S3 client knows, which are $st_regions" ;;
-      esac
-      case $ST_REGION in
-        cn-*) ST_ENDPOINT=s3.$ST_REGION.amazonaws.com.cn ;;
-        *) ST_ENDPOINT=s3.$ST_REGION.amazonaws.com ;;
-      esac
+      st_domain=$(st_aws_domain "$ST_REGION") ||
+        st_die "--s3-region ${ST_REGION:-(none)}: not an AWS region's name, such as ap-east-1, us-gov-west-1 or cn-north-1"
+      ST_ENDPOINT=s3.$ST_REGION.$st_domain
       ;;
     r2)
       case $ST_R2_ACCOUNT in
@@ -330,18 +344,66 @@ st_resolve() {
       esac
       ST_REGION=${ST_REGION:-us-east-1}
       case $ST_REGION in *[!A-Za-z0-9_-]*) st_die "--s3-region $ST_REGION is not a region's name" ;; esac
-      case ${ST_PATH_STYLE:-yes} in
-        yes | true) ST_PATH_STYLE=yes ;;
+      case $ST_PATH_STYLE in
+        '') ;;
+        yes | true) ST_PATH_STYLE=yes ST_LOOKUP=path ;;
         no | false)
-          st_die "--s3-path-style no: Core's S3 client addresses a bucket by its path, https://HOST/BUCKET/KEY, at every endpoint but AWS's, Google's and Aliyun's, and has no setting for virtual-hosted addressing yet. A service that takes only that cannot be used until it has"
+          ST_PATH_STYLE=no ST_LOOKUP=dns
+          case $ST_BUCKET in
+            *.*) st_die "--s3-path-style no: the bucket $ST_BUCKET has a dot in its name, and https://$ST_BUCKET.$ST_ENDPOINT is not a name the service's certificate covers. Use a bucket without one, or --s3-path-style yes" ;;
+          esac
           ;;
         *) st_die "--s3-path-style $ST_PATH_STYLE: yes or no" ;;
       esac
       ;;
   esac
+  # A bucket with a dot in its name at AWS, in a region Core's S3 client
+  # does not know (ST_AWS_CLIENT_REGIONS says why).
+  case $ST_BUCKET in
+    *.*)
+      if st_aws_endpoint && ! st_client_region; then
+        st_die "--s3-bucket $ST_BUCKET: Core cannot reach a bucket whose name has a dot in $ST_REGION, a region newer than its S3 client's table; use a bucket without one"
+      fi
+      ;;
+  esac
   case $ST_AK in *:*) st_die "the access key has a colon in it, which this cannot pass on as it is: nothing was changed" ;; esac
   st_valid_key "the access key" "$ST_AK"
   st_valid_key "the secret key" "$ST_SK"
+}
+
+# st_aws_domain REGION: the domain of the S3 endpoints of the AWS partition
+# REGION is in, by the shape AWS gives each partition's region names (its
+# SDKs' partitions.json); false for a name of no partition's shape.
+st_aws_domain() {
+  case $1 in *"$ST_NL"*) return 1 ;; esac
+  printf '%s\n' "$1" |
+    LC_ALL=C grep -Eqx '(us|eu|ap|sa|ca|me|af|il|mx|cn)-[a-z]+-[0-9]+|us-(gov|iso|isob|isof)-[a-z]+-[0-9]+|eu-isoe-[a-z]+-[0-9]+|eusc-de-[a-z]+-[0-9]+' ||
+    return 1
+  case $1 in
+    cn-*) echo amazonaws.com.cn ;;
+    eusc-*) echo amazonaws.eu ;;
+    us-iso-*) echo c2s.ic.gov ;;
+    us-isob-*) echo sc2s.sgov.gov ;;
+    us-isof-*) echo csp.hci.ic.gov ;;
+    eu-isoe-*) echo cloud.adc-e.uk ;;
+    *) echo amazonaws.com ;;
+  esac
+}
+# st_aws_endpoint: whether Core's S3 client takes the endpoint for AWS's,
+# whose requests it sends where its table of regions says.
+st_aws_endpoint() {
+  case $ST_ENDPOINT in
+    s3.amazonaws.com | s3.*.amazonaws.com | s3-*.amazonaws.com | s3.*.amazonaws.com.cn) ;;
+    *) return 1 ;;
+  esac
+}
+# st_client_region: whether the region is in that table (or none is given,
+# which is us-east-1).
+st_client_region() {
+  case " $(printf '%s' "$ST_AWS_CLIENT_REGIONS" | tr '\n' ' ') " in
+    *" ${ST_REGION:-us-east-1} "*) ;;
+    *) return 1 ;;
+  esac
 }
 
 # st_q VALUE: VALUE for an env file of Docker Compose's: in single quotes,
@@ -366,6 +428,7 @@ st_env_block() {
   echo "S3_ENDPOINT=$ST_ENDPOINT"
   echo "S3_BUCKET=$ST_BUCKET"
   echo "S3_REGION=$ST_REGION"
+  echo "S3_BUCKET_LOOKUP=$ST_LOOKUP"
   echo "S3_USE_SSL=$ST_SSL"
   echo "S3_ACCESS_KEY=$(st_q "$ST_AK")"
   echo "S3_SECRET_KEY=$(st_q "$ST_SK")"
@@ -397,11 +460,17 @@ st_load_bucket() {
   ST_AK=$(st_setting "$f" S3_ACCESS_KEY)
   ST_SK=$(st_setting "$f" S3_SECRET_KEY)
   if [ "$(st_setting "$f" S3_USE_SSL)" = false ]; then ST_SSL=false; else ST_SSL=true; fi
+  ST_LOOKUP=$(st_setting "$f" S3_BUCKET_LOOKUP)
+  ST_LOOKUP=${ST_LOOKUP:-auto}
+  case $ST_LOOKUP in
+    auto | path | dns) ;;
+    *) st_die "S3_BUCKET_LOOKUP=$ST_LOOKUP in $f: auto, path or dns" ;;
+  esac
   if [ -z "$ST_ENDPOINT" ] || [ -z "$ST_BUCKET" ]; then st_die "$f names no bucket (S3_ENDPOINT and S3_BUCKET)"; fi
   case $ST_ENDPOINT in
     *.r2.cloudflarestorage.com) ST_KIND=r2 ;;
     s3.*.backblazeb2.com) ST_KIND=b2 ;;
-    *.amazonaws.com | *.amazonaws.com.cn) ST_KIND=aws ;;
+    *.amazonaws.com | *.amazonaws.com.cn | s3.*.amazonaws.eu | s3.*.c2s.ic.gov | s3.*.sc2s.sgov.gov | s3.*.csp.hci.ic.gov | s3.*.cloud.adc-e.uk) ST_KIND=aws ;;
     *) ST_KIND=s3 ;;
   esac
   case $ST_AK in *:*) st_die "S3_ACCESS_KEY in $f has a colon in it, which this cannot pass on as it is" ;; esac
@@ -415,19 +484,32 @@ st_describe() {
     aws) echo "the bucket $ST_BUCKET of Amazon S3, in $ST_REGION ($ST_ENDPOINT)" ;;
     r2) echo "the bucket $ST_BUCKET of Cloudflare R2 ($ST_ENDPOINT)" ;;
     b2) echo "the bucket $ST_BUCKET of Backblaze B2, in $ST_REGION ($ST_ENDPOINT)" ;;
-    *) echo "the bucket $ST_BUCKET at $ST_ENDPOINT (region $ST_REGION)" ;;
+    *)
+      case $ST_LOOKUP in
+        path) echo "the bucket $ST_BUCKET at $ST_ENDPOINT (region $ST_REGION), named in the path" ;;
+        dns) echo "the bucket $ST_BUCKET at $ST_ENDPOINT (region $ST_REGION), named in the host name" ;;
+        *) echo "the bucket $ST_BUCKET at $ST_ENDPOINT (region $ST_REGION)" ;;
+      esac
+      ;;
   esac
 }
 
 # st_virtual_host: whether Core's S3 client (minio-go) names the bucket in
-# the host rather than in the path, as the check must too: at AWS's,
-# Google's and Aliyun's endpoints, but not for a bucket with a dot in its
-# name over HTTPS, which their certificates do not cover.
+# the host rather than in the path, as the check must too: always with
+# S3_BUCKET_LOOKUP=dns, never with path, and with auto at AWS's, Google's and
+# Aliyun's endpoints, but not for a bucket with a dot in its name over
+# HTTPS, which their certificates do not cover.
 st_virtual_host() {
-  case $ST_ENDPOINT in
-    s3.amazonaws.com | s3.*.amazonaws.com | s3-*.amazonaws.com | s3.*.amazonaws.com.cn | storage.googleapis.com | *.aliyuncs.com) ;;
-    *) return 1 ;;
+  case $ST_LOOKUP in
+    dns) return 0 ;;
+    path) return 1 ;;
   esac
+  if ! st_aws_endpoint; then
+    case $ST_ENDPOINT in
+      storage.googleapis.com | *.aliyuncs.com) ;;
+      *) return 1 ;;
+    esac
+  fi
   case $ST_BUCKET in
     *.*) [ "$ST_SSL" = false ] ;;
     *) return 0 ;;
@@ -905,6 +987,36 @@ st_verify() {
   echo "all $st_n files, $(st_size "$st_b"), are on both sides, the same size$(if [ -z "$st_size_only" ]; then echo ", and the same by checksum"; fi)"
 }
 
+# st_core_reads_lookup: refused, before anything is copied, when the bucket
+# needs a Core from its main since its PR #46 (d8f256c), which reads
+# S3_BUCKET_LOOKUP and sends a request for AWS to S3_REGION whatever its S3
+# client's table says, and the Core this server runs is older: its help
+# names no S3_BUCKET_LOOKUP. A help that does not run is refused as that,
+# with Docker's error. One not deployed yet is only said to need it, and
+# st_core_first set.
+st_core_reads_lookup() {
+  if [ "$ST_LOOKUP" = dns ]; then
+    st_needs="--s3-path-style no"
+  elif st_aws_endpoint && ! st_client_region; then
+    st_needs="the region $ST_REGION, newer than the table of Core's S3 client,"
+  else
+    return 0
+  fi
+  st_needs="$st_needs needs a Core whose help names S3_BUCKET_LOOKUP (any from its main since its PR #46, d8f256c)"
+  if [ -z "$(st_setting "$STATE/images.env" CORE_REF)" ]; then
+    echo "$st_needs: the first Core this server deploys must be one"
+    # shellcheck disable=SC2034 # setup-server.sh's, for what is left
+    st_core_first=1
+    return 0
+  fi
+  st_help=$(st_compose run --rm --no-deps -T core help < /dev/null) ||
+    st_die "$st_needs, and the help of the one this server runs, which says whether it is one, did not run (above). Nothing was changed"
+  case $st_help in
+    *S3_BUCKET_LOOKUP*) ;;
+    *) st_die "$st_needs, and the one this server runs is older (aishie core help): update it first (aishie-update), then run this again. Nothing was changed" ;;
+  esac
+}
+
 # st_healthy: Core's /healthz on 127.0.0.1:8080 says ok, within a minute.
 st_healthy() {
   st_i=0
@@ -938,6 +1050,7 @@ st_migrate() {
     st_die "which bucket? --storage aws, r2, b2 or s3, and its options (aishie storage help)"
   fi
   [ "$ST_KIND" != fs ] || st_die "--storage fs: that is where the files are"
+  if [ "$st_to" = s3 ]; then st_core_reads_lookup; fi
   host=$(st_setting "$ETC/aishie.env" HOST)
   [ -n "$host" ] || st_die "$ETC/aishie.env names no HOST"
 
@@ -1006,7 +1119,7 @@ st_migrate() {
   st_say "Core, on the other side"
   st_backup=$ETC/core.env.before-storage-$(date -u +%Y%m%dT%H%M%SZ)
   cp -p "$ETC/core.env" "$st_backup"
-  LC_ALL=C awk '!/^(BLOB_STORE|BLOB_FS_ROOT|S3_ENDPOINT|S3_BUCKET|S3_REGION|S3_USE_SSL|S3_ACCESS_KEY|S3_SECRET_KEY)=/ && !/^# Uploaded files: /' \
+  LC_ALL=C awk '!/^(BLOB_STORE|BLOB_FS_ROOT|S3_ENDPOINT|S3_BUCKET|S3_REGION|S3_BUCKET_LOOKUP|S3_USE_SSL|S3_ACCESS_KEY|S3_SECRET_KEY)=/ && !/^# Uploaded files: /' \
     "$ETC/core.env" > "$ETC/core.env.new"
   st_env_block "$st_to" >> "$ETC/core.env.new"
   chmod 600 "$ETC/core.env.new"

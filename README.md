@@ -598,10 +598,10 @@ later with `aishie storage migrate`:
 | `--storage` | Service | What setup-server.sh asks for | Core's `S3_ENDPOINT` |
 | --- | --- | --- | --- |
 | `fs` | this server's disk | nothing | none |
-| `aws` | Amazon S3 | region, bucket, access key and secret | `s3.<region>.amazonaws.com` |
+| `aws` | Amazon S3 | region (any, of any partition), bucket, access key and secret | `s3.<region>.amazonaws.com` (`.com.cn` in China, the partition's own domain elsewhere) |
 | `r2` | Cloudflare R2 | account ID, bucket, an R2 API token's access key and secret | `<account>.r2.cloudflarestorage.com`, region `auto` |
 | `b2` | Backblaze B2 | region (from the bucket's endpoint, `s3.<region>.backblazeb2.com`), bucket, keyID and applicationKey | `s3.<region>.backblazeb2.com` |
-| `s3` | another S3-compatible service | endpoint (`HOST[:PORT]`, HTTPS), region (`us-east-1` unless given), bucket, path-style (yes), keys | as given |
+| `s3` | another S3-compatible service | endpoint (`HOST[:PORT]`, HTTPS), region (`us-east-1` unless given), bucket, path-style (`yes`, `no`, or as Core's S3 client chooses), keys | as given |
 
 **Near the people who use it.** Browsers talk to the bucket's region
 directly, so what matters most is that it is close to them: for a school in
@@ -633,16 +633,30 @@ A move to a bucket costs one upload per file; a move back downloads what
 the disk lacks (everything, once its copy is removed), which AWS charges
 as data out.
 
-**Limits of Core today.** Core's S3 client (minio-go 7.3.0) addresses a
-bucket by its path (`https://HOST/BUCKET/KEY`) at every endpoint but
-AWS's, Google's and Aliyun's, and has no setting for virtual-hosted
-addressing, so a service that takes only that cannot be used yet
-(setup-server.sh refuses `--s3-path-style no`). At AWS it sends each
-request to the endpoint of the bucket's region from a table of its own,
-and a region missing from it to us-east-1's, so a bucket in a region newer
-than that table does not work with it yet: setup-server.sh takes only the
-regions it has (`ST_AWS_REGIONS` in `bin/aishie-storage`). The endpoint must be HTTPS: browsers
-upload from the site's `https://` pages, and refuse to send to `http://`.
+**Limits of Core today.** The endpoint must be HTTPS: browsers upload
+from the site's `https://` pages, and refuse to send to `http://`. A bucket
+whose name has a dot is named in the path, since no certificate covers
+`https://NA.ME.HOST`: setup-server.sh refuses one with `--s3-path-style
+no`, and one at AWS in a region newer than the table of regions of Core's
+S3 client (minio-go 7.3.0), whose requests Core sends to the region by a
+means that takes no such name (`ST_AWS_CLIENT_REGIONS` in
+`bin/aishie-storage`). A bucket without a dot works in any region.
+
+**The Core it needs.** A service that takes only virtual-hosted requests
+(`--s3-path-style no`, which core.env says to Core as
+`S3_BUCKET_LOOKUP=dns`), and an AWS region newer than that table, need a
+Core from its main since its PR #46 (merge d8f256c, 30 September 2026
+UTC), which reads `S3_BUCKET_LOOKUP` and sends a request to `S3_REGION`
+whatever its S3 client's table says; an older Core addresses the bucket
+by its path, and sends a request for a region it does not know to
+us-east-1, which refuses it. Such a Core names `S3_BUCKET_LOOKUP` in
+`aishie core help`. setup-server.sh and `aishie storage migrate` check
+that the Core the server runs is one before they change anything, and say
+so when none is deployed yet: on edge the first update deploys one; on
+stable, set `CORE_IMAGE` to such a release, as setup-server.sh's last
+steps say (`docker run --rm IMAGE help` names `S3_BUCKET_LOOKUP`):
+`aishie-update` does not check it, and an older Core fails its first
+start. Any other bucket works with any Core.
 
 ### Setting it up
 
@@ -658,7 +672,17 @@ sh AIShie-Deploy/setup-server.sh test.aishie.app edge --storage aws --s3-region 
 sh AIShie-Deploy/setup-server.sh test.aishie.app edge --storage r2 --r2-account-id <32 hex digits> --s3-bucket aishie-files
 sh AIShie-Deploy/setup-server.sh test.aishie.app edge --storage b2 --s3-region us-west-004 --s3-bucket aishie-files
 sh AIShie-Deploy/setup-server.sh test.aishie.app edge --storage s3 --s3-endpoint s3.example.com --s3-region nl-ams --s3-bucket aishie-files
+sh AIShie-Deploy/setup-server.sh test.aishie.app edge --storage s3 --s3-endpoint s3.example.com --s3-bucket aishie-files --s3-path-style no
 ```
+
+With `--storage s3`, `--s3-path-style` says how a request names the
+bucket, and core.env says it to Core in `S3_BUCKET_LOOKUP`: `yes` after the
+endpoint (`path`, `https://HOST/BUCKET/KEY`); `no` in the host name
+(`dns`, `https://BUCKET.HOST/KEY`), for a service that takes nothing else;
+not given (Enter, when asked) as Core's S3 client chooses (`auto`: in the
+host name at AWS, Google and Aliyun, after the endpoint anywhere else).
+AWS, R2 and B2 are always `auto`. The check (and `aishie storage check`
+later) and rclone, in a migration, name the bucket the same way.
 
 The variables are `AISHIE_STORAGE`, `AISHIE_S3_BUCKET`, `AISHIE_S3_REGION`,
 `AISHIE_S3_ENDPOINT`, `AISHIE_S3_PATH_STYLE`, `AISHIE_R2_ACCOUNT_ID` and
@@ -675,7 +699,9 @@ access), with keys that may do what Core does and no more:
   `arn:aws:s3:::BUCKET`, and `s3:GetObject`, `s3:PutObject` and
   `s3:DeleteObject` on `arn:aws:s3:::BUCKET/*`; with `s3:GetBucketCORS` and
   `s3:PutBucketCORS` on the bucket as well, setup-server.sh sets the CORS
-  rule itself.
+  rule itself. Outside the aws partition the ARNs name the region's:
+  `arn:aws-cn:s3:::` in China, `arn:aws-us-gov:s3:::` in GovCloud,
+  `arn:aws-eusc:s3:::` in the European Sovereign Cloud, and so on.
 - *R2*: an R2 API token with Object Read & Write, for that bucket alone.
   The account ID is in the bucket's S3 API address,
   `https://<account>.r2.cloudflarestorage.com/<bucket>`.
