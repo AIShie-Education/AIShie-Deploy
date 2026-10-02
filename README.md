@@ -874,8 +874,8 @@ OIDC_DISPLAY_NAME=School NetID
 and `aishie compose up -d core`. `OIDC_PROVIDER_NAME` is the provider's
 id, which every account linked to it is recorded under: give it one of your
 own before anyone is linked, and never change it after, or nobody linked
-can sign in. A server that has had single sign-on without it is on Core's
-default, `polyu-adfs`, and keeps it: leave it unset there.
+can sign in. Unset, it is Core's default, `example-adfs`, a placeholder to
+replace before anyone is linked.
 `OIDC_DISPLAY_NAME` is the provider's name on the sign-in page's button: at
 most 64 printable characters, or Core refuses to start (`aishie logs core`
 says why); unset, the page uses words of its own. `env/core.env.example`
@@ -1189,8 +1189,8 @@ the `AISHIE_` paths at the top of each script move where it writes.
 The scripts are POSIX sh, as the server runs them, and shellcheck-clean;
 the tests are bash. Comments say what is true and why.
 Examples, comments and tests name no real school: `school-adfs`,
-`School NetID` and `example.edu` stand for one. Core's default provider id,
-`polyu-adfs`, is named only where that default is described.
+`School NetID` and `example.edu` stand for one, and Core's default provider
+id is the placeholder `example-adfs`.
 
 ## License
 
