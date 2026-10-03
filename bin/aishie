@@ -14,6 +14,7 @@
 #   aishie ps                      the stack's containers
 #   aishie backup                  both databases, now, as the nightly backup does
 #   aishie storage [COMMAND]       where Core keeps uploaded files, and moving them (aishie storage help)
+#   aishie front-proxy             FRONT_PROXY in aishie.env applied to Caddy (Cloudflare's addresses fetched again)
 #   aishie compose ARGS...         docker compose for the stack, e.g. aishie compose up -d core
 #
 # `aishie core ...` and `aishie runtime ...` run a one-off container of the
@@ -45,6 +46,12 @@
 # `aishie storage` is aishie-storage, beside this: where Core keeps the files
 # people upload, this server's disk or a bucket, its check and CORS rule,
 # and `migrate`, which moves the files from one to the other.
+#
+# `aishie front-proxy` is aishie-front-proxy, beside this: what stands in
+# front of this server (FRONT_PROXY in aishie.env, Cloudflare), whose
+# addresses Caddy believes about the visitor's, written into Caddy's
+# settings, and Caddy reloaded when they changed. aishie-front-proxy.timer
+# runs it every week, which fetches Cloudflare's addresses again.
 #
 # `aishie backup` is what aishie-backup.timer runs every night: the two
 # databases dumped to /var/backups/aishie/SERVICE-daily-N.dump, N the day of
@@ -260,6 +267,10 @@ case ${1:-} in
   storage)
     shift
     exec "$(dirname "$0")/aishie-storage" "$@"
+    ;;
+  front-proxy)
+    shift
+    exec "$(dirname "$0")/aishie-front-proxy" "$@"
     ;;
   *) usage ;;
 esac

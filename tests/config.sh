@@ -114,45 +114,120 @@ sed -i '/^HOST=/d' "$work/etc/aishie.env"
 if out=$(compose config -q 2>&1); then fail "took aishie.env without HOST"; fi
 grep -q "set HOST in /etc/aishie/aishie.env" <<< "$out" || fail "said: $out"
 
-# The Caddyfile, for a public name and for localhost (CI's end to end).
-case=caddy
+# Caddy, from a binary on PATH (or $CADDY), else from its image.
 caddy=${CADDY:-$(command -v caddy || true)}
-for host in test.aishie.app localhost; do
+# caddy_in DIR HOST COMMAND: caddy validate, or adapt, of DIR's Caddyfile
+# (a caddy/ directory, front-proxy/ in it), for HOST.
+caddy_in() {
   if [ -n "$caddy" ]; then
-    out=$(HOST=$host "$caddy" validate --config "$root/caddy/Caddyfile" --adapter caddyfile 2>&1) || fail "caddy validate, HOST=$host: $out"
+    HOST=$2 "$caddy" "$3" --config "$1/Caddyfile" --adapter caddyfile
   else
-    out=$(docker run --rm -e "HOST=$host" -v "$root/caddy:/etc/caddy:ro" "${CADDY_IMAGE:-caddy:2}" \
-      caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1) || fail "caddy validate, HOST=$host: $out"
+    docker run --rm -e "HOST=$2" -v "$1:/etc/caddy:ro" "${CADDY_IMAGE:-caddy:2}" caddy "$3" --config /etc/caddy/Caddyfile --adapter caddyfile
   fi
+}
+# routes JSON: the routes for test.aishie.app in Caddy's JSON, one line per
+# route, in order: its paths (or not remote_ip, for the front proxy's
+# refusal) => its handlers.
+routes() {
+  jq -r '
+    .apps.http.servers[].routes[] | select(.match[0].host == ["test.aishie.app"]) | .handle[] | .routes[] |
+    (if .match[0].not then "not remote_ip" else ((.match // [{path: ["*"]}])[0].path | join(" ")) end) + " => " +
+    ([.handle[] | if .handler == "subroute" then .routes[].handle[] else . end |
+      if .handler == "reverse_proxy" then "reverse_proxy " + ([.upstreams[].dial] | join(","))
+      elif .handler == "headers" then "headers -" + (.request.delete | join(" -"))
+      elif .handler == "static_response" then "respond \(.status_code)"
+      else .handler end] | join(", "))' <<< "${1:-null}" 2>&1
+}
+# render NAME SETTING...: a copy of caddy/ in $work/NAME/caddy, with the two
+# files of front-proxy/ as aishie front-proxy writes them from an aishie.env
+# that says the settings given. No network: the fetch of Cloudflare's
+# addresses fails, and the list pinned in caddy/cloudflare-ips is taken.
+render() {
+  local at=$work/$1
+  shift
+  rm -rf "$at"
+  mkdir -p "$at/etc" "$at/state" "$at/bin"
+  cp -R "$root/caddy" "$at/caddy"
+  { echo HOST=test.aishie.app; printf '%s\n' "$@"; } > "$at/etc/aishie.env"
+  printf '#!/bin/sh\necho "curl: (7) no network in tests/config.sh" >&2\nexit 7\n' > "$at/bin/curl"
+  chmod +x "$at/bin/curl"
+  PATH="$at/bin:$PATH" AISHIE_APP=$at AISHIE_ETC=$at/etc AISHIE_STATE=$at/state AISHIE_FRONT_PROXY_LIB=1 \
+    sh -c '. "$0"; fp_write' "$root/bin/aishie-front-proxy" > "$at/out" 2>&1 || fail "aishie front-proxy did not write: $(cat "$at/out")"
+}
+# Core's routes, the runtime's API's and the web's, as with nothing in front.
+want='/v1/* /mcp /mcp/* /healthz /.well-known/oauth-protected-resource /.well-known/oauth-protected-resource/* /.well-known/oauth-authorization-server /.well-known/oauth-authorization-server/* /.well-known/openid-configuration => reverse_proxy core:8080
+/runtime/api/* => headers -Cookie, reverse_proxy runtime:9091
+* => reverse_proxy web:8080'
+
+# The Caddyfile as this repository has it, with nothing in front, for a
+# public name and for localhost (CI's end to end); front-proxy/ is what
+# aishie front-proxy writes with nothing in front.
+case=caddy
+for host in test.aishie.app localhost; do
+  out=$(caddy_in "$root/caddy" "$host" validate 2>&1) || fail "caddy validate, HOST=$host: $out"
+done
+render none
+for f in global site; do
+  cmp -s "$work/none/caddy/front-proxy/$f.caddy" "$root/caddy/front-proxy/$f.caddy" ||
+    fail "caddy/front-proxy/$f.caddy is not what aishie front-proxy writes with nothing in front: $(diff "$root/caddy/front-proxy/$f.caddy" "$work/none/caddy/front-proxy/$f.caddy")"
 done
 
 # Caddy's routes, as Caddy reads them: Core's paths to Core, uncompressed;
 # the runtime's API without the browser's cookies, and nothing else of the
-# runtime's (9090 never); everything else to the web. One line per route,
-# in order: its paths => its handlers.
+# runtime's (9090 never); everything else to the web. Each proxy gives
+# X-Forwarded-For as the client's address Caddy takes ({client_ip}), and
+# Caddy believes no proxy about it.
 case="caddy routes"
-if [ -n "$caddy" ]; then
-  adapted=$(HOST=test.aishie.app "$caddy" adapt --config "$root/caddy/Caddyfile" --adapter caddyfile 2>/dev/null) || adapted=
-else
-  adapted=$(docker run --rm -e HOST=test.aishie.app -v "$root/caddy:/etc/caddy:ro" "${CADDY_IMAGE:-caddy:2}" \
-    caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile 2>/dev/null) || adapted=
-fi
-routes=$(jq -r '
-  .apps.http.servers[].routes[] | select(.match[0].host == ["test.aishie.app"]) | .handle[] | .routes[] |
-  ((.match // [{path: ["*"]}])[0].path | join(" ")) + " => " +
-  ([.handle[] | if .handler == "subroute" then .routes[].handle[] else . end |
-    if .handler == "reverse_proxy" then "reverse_proxy " + ([.upstreams[].dial] | join(","))
-    elif .handler == "headers" then "headers -" + (.request.delete | join(" -"))
-    else .handler end] | join(", "))' <<< "${adapted:-null}" 2>&1) || routes="caddy adapt failed: $routes"
-want='/v1/* /mcp /mcp/* /healthz /.well-known/oauth-protected-resource /.well-known/oauth-protected-resource/* /.well-known/oauth-authorization-server /.well-known/oauth-authorization-server/* /.well-known/openid-configuration => reverse_proxy core:8080
-/runtime/api/* => headers -Cookie, reverse_proxy runtime:9091
-* => reverse_proxy web:8080'
-[ "$routes" = "$want" ] || fail "the routes are
-$routes
+adapted=$(caddy_in "$root/caddy" test.aishie.app adapt 2>/dev/null) || adapted=
+got=$(routes "$adapted")
+[ "$got" = "$want" ] || fail "the routes are
+$got
 not
 $want"
 [ "$(jq '[.. | objects | select(.handler? == "reverse_proxy") | .upstreams[].dial | select(test(":9090$"))] | length' <<< "${adapted:-null}")" = 0 ] ||
   fail "something is routed to the runtime's 9090"
+[ "$(jq -c '[.. | objects | select(.handler? == "reverse_proxy") | .headers.request.set["X-Forwarded-For"]]' <<< "${adapted:-null}")" = \
+  '[["{http.vars.client_ip}"],["{http.vars.client_ip}"],["{http.vars.client_ip}"]]' ] ||
+  fail "a proxy does not give X-Forwarded-For as {client_ip}: $(jq -c '[.. | objects | select(.handler? == "reverse_proxy") | .headers]' <<< "${adapted:-null}")"
+[ "$(jq -c '[.apps.http.servers[] | .trusted_proxies, .client_ip_headers | select(. != null)]' <<< "${adapted:-null}")" = '[]' ] ||
+  fail "Caddy believes a proxy, with nothing in front"
+[ "$(jq -c '.apps.tls.automation // null' <<< "${adapted:-null}")" = null ] || fail "Caddy's certificates are not its defaults: $(jq -c .apps.tls <<< "$adapted")"
+
+# Behind Cloudflare (FRONT_PROXY=cloudflare), as aishie front-proxy writes
+# it: Caddy believes Cloudflare's addresses alone, which name the visitor in
+# CF-Connecting-IP, else in X-Forwarded-For read from the right; gets its
+# certificates as before; and its routes are as before. With
+# FRONT_PROXY_ONLY=yes, a first route refuses (403) a request from neither
+# Cloudflare's addresses nor a private one.
+pinned=$(grep -v '^#' "$root/caddy/cloudflare-ips" | jq -R . | jq -sc .)
+for only in no yes; do
+  case="caddy behind cloudflare, FRONT_PROXY_ONLY=$only"
+  render "cloudflare-$only" FRONT_PROXY=cloudflare "FRONT_PROXY_ONLY=$only"
+  dir=$work/cloudflare-$only/caddy
+  out=$(caddy_in "$dir" test.aishie.app validate 2>&1) || fail "caddy validate: $out"
+  adapted=$(caddy_in "$dir" test.aishie.app adapt 2>/dev/null) || adapted=
+  for s in $(jq -r '.apps.http.servers | keys[]' <<< "${adapted:-null}" 2>/dev/null); do
+    [ "$(jq -c ".apps.http.servers.$s.trusted_proxies" <<< "$adapted")" = "{\"ranges\":$pinned,\"source\":\"static\"}" ] ||
+      fail "server $s trusts $(jq -c ".apps.http.servers.$s.trusted_proxies" <<< "$adapted")"
+    [ "$(jq -c ".apps.http.servers.$s | [.client_ip_headers, .trusted_proxies_strict]" <<< "$adapted")" = '[["CF-Connecting-IP","X-Forwarded-For"],1]' ] ||
+      fail "server $s takes the client's address as $(jq -c ".apps.http.servers.$s | [.client_ip_headers, .trusted_proxies_strict]" <<< "$adapted")"
+  done
+  # One server, 443's: the redirect from 80 is made when Caddy starts.
+  [ "$(jq -r '.apps.http.servers | length' <<< "${adapted:-null}")" = 1 ] || fail "not Caddy's one server: $(jq -c '.apps.http.servers // {} | keys' <<< "${adapted:-null}")"
+  [ "$(jq -c '.apps.tls.automation // null' <<< "${adapted:-null}")" = null ] || fail "Caddy's certificates are not its defaults: $(jq -c .apps.tls <<< "${adapted:-null}")"
+  got=$(routes "$adapted")
+  if [ "$only" = yes ]; then
+    [ "$got" = "not remote_ip => respond 403
+$want" ] || fail "the routes are
+$got"
+    [ "$(jq -c '.apps.http.servers[].routes[] | select(.match[0].host == ["test.aishie.app"]) | .handle[].routes[0].match[0].not[0].remote_ip.ranges' <<< "${adapted:-null}")" = \
+      "$(jq -c '. + ["192.168.0.0/16","172.16.0.0/12","10.0.0.0/8","127.0.0.1/8","fd00::/8","::1"]' <<< "$pinned")" ] ||
+      fail "the refusal lets through $(jq -c '.apps.http.servers[].routes[] | select(.match[0].host == ["test.aishie.app"]) | .handle[].routes[0].match' <<< "${adapted:-null}")"
+  else
+    [ "$got" = "$want" ] || fail "the routes are
+$got"
+  fi
+done
 
 [ "$failed" = 0 ] && echo "config: ok"
 exit "$failed"
