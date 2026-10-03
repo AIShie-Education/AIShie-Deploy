@@ -226,6 +226,8 @@ Then `aishie-update` runs now instead of in five minutes.
 - **Caddy has no certificate.** `aishie logs caddy`. The DNS name must
   resolve to this server, and 80 and 443 must be open to the internet (the
   provider's firewall; ufw does not matter for Docker's published ports).
+  Behind Cloudflare, the name resolves to Cloudflare: [Behind
+  Cloudflare](#behind-cloudflare), 526.
 - **An LMS cannot show AIshie in its frame.** The browser's console says the
   page refused to be framed. `curl -sI https://HOST/ | grep -i
   content-security-policy` shows what the web sends: the LMS's origin must
@@ -316,3 +318,47 @@ Then `aishie-update` runs now instead of in five minutes.
   `setup-server.sh`). Docker Hub limits how often a server may pull, and
   refused for a while (`429 Too Many Requests`). The set-up goes on with
   the images the server has; run it again later for the newest ones.
+
+## Behind Cloudflare
+
+For a server whose name is proxied by Cloudflare (README.md, Behind
+Cloudflare). `aishie front-proxy` says what Caddy believes, where
+Cloudflare's addresses came from, and what answers the certificate's
+challenge path; Cloudflare's error pages name the error by its number.
+
+- **526, "Invalid SSL certificate".** Caddy has no valid certificate for
+  the name: its first could not be had, or it ran out. Plain HTTP to
+  `/.well-known/acme-challenge/` must reach the server: Always Use HTTPS
+  off, or the path kept out of the redirect (README.md, Behind Cloudflare,
+  step 3), and nothing that challenges on the name. `aishie front-proxy`
+  says whether it does now; `aishie logs caddy` has Caddy's attempts, which
+  it makes again by itself, so the site comes back once they pass.
+- **521 or 522.** Cloudflare cannot reach the server: Caddy is not running
+  (`aishie ps`), or the provider's firewall closes 80 or 443.
+- **524.** The server took longer than Cloudflare waits (about two
+  minutes) to begin an answer. Of the site's requests only an export of
+  conversations can: narrow it (a course, a department, a participant, a
+  span of time).
+- **413, from Cloudflare, on an upload.** The file is over 100 MB, which
+  Cloudflare's free plan refuses before the server sees it: possible only
+  with `MAX_UPLOAD_BYTES` raised past 95 MiB in `core.env`. Lower it, or
+  keep the files in a bucket, which browsers upload to directly.
+- **Every visitor has the same address** (in the runtime's audit, or
+  everyone's sign-in refused at once as too many from one address): one of
+  Cloudflare's, when `FRONT_PROXY` is not set (`aishie front-proxy` says);
+  `172.30.83.1`, the stack's gateway, when Cloudflare reaches the server
+  over IPv6, through Docker's proxy: give the name no AAAA record.
+- **403, "This server is reached through Cloudflare alone."** The request
+  did not come through Cloudflare, and `FRONT_PROXY_ONLY=yes` refuses it:
+  the name not proxied (yet), or someone reaching the server's address
+  directly.
+- **`could not fetch https://www.cloudflare.com/ips-v4`** (from `aishie
+  front-proxy`, or its timer in `journalctl -u aishie-front-proxy`). The
+  last list fetched stays in force, as it says, or the list pinned in this
+  repository on a server that never fetched one; the next week's run tries
+  again. Only if it goes on failing for long does the list fall behind
+  Cloudflare's: check that the server reaches www.cloudflare.com.
+- **`Caddy refused them`** (from `aishie front-proxy`). Caddy's error is
+  above it; its files were put back, and Caddy runs as before. A setting in
+  `aishie.env` that means nothing is refused before anything is written,
+  and says which.
