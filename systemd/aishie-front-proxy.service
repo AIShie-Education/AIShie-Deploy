@@ -1,0 +1,17 @@
+# One run of `aishie front-proxy`: Caddy's settings for what stands in front
+# of this server (FRONT_PROXY in /etc/aishie/aishie.env), with Cloudflare's
+# addresses fetched again; Caddy is reloaded only when they changed, and a
+# fetch that fails keeps the last list. Without FRONT_PROXY it fetches
+# nothing and changes nothing. aishie-front-proxy.timer starts it every
+# week; its output is in the journal (journalctl -u aishie-front-proxy).
+[Unit]
+Description=AIshie:Caddy's settings for the front proxy, Cloudflare's addresses fetched again (aishie front-proxy)
+Documentation=https://github.com/AIShie-Education/AIShie-Deploy
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/aishie front-proxy
+TimeoutStartSec=10min

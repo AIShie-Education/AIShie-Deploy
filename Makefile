@@ -7,7 +7,7 @@ SHELL       := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
 
 # The POSIX sh scripts, which the server runs, and the tests', which are bash.
-SH_SCRIPTS   := bin/aishie-update bin/aishie bin/aishie-storage setup-server.sh postgres/initdb/10-aishie.sh
+SH_SCRIPTS   := bin/aishie-update bin/aishie bin/aishie-storage bin/aishie-front-proxy setup-server.sh postgres/initdb/10-aishie.sh
 BASH_SCRIPTS := $(wildcard tests/*.sh)
 
 ACTIONLINT_VERSION ?= v1.7.12

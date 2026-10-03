@@ -224,18 +224,27 @@ for d in agents secrets secrets/kek secrets/core; do
 done
 called "chown 65532:65532 $AISHIE_DATA/core$" || fail "Core's files not given to Core's user"
 # This copy's stack, scripts and units, installed.
-for f in compose.yaml stack.yaml README.md caddy/Caddyfile postgres/initdb/10-aishie.sh env/core.env.example docs/troubleshooting.md; do
+for f in compose.yaml stack.yaml README.md caddy/Caddyfile caddy/cloudflare-ips postgres/initdb/10-aishie.sh env/core.env.example docs/troubleshooting.md; do
   cmp -s "$root/$f" "$AISHIE_APP/$f" || fail "$f not installed in $AISHIE_APP"
 done
+# Caddy's settings for the front proxy: nothing in front (no FRONT_PROXY),
+# which are this copy's two files, written before Caddy's configuration is
+# checked; nothing fetched from Cloudflare.
+for f in global site; do
+  cmp -s "$root/caddy/front-proxy/$f.caddy" "$AISHIE_APP/caddy/front-proxy/$f.caddy" || fail "front-proxy/$f.caddy is not this copy's"
+  [ "$(mode "$AISHIE_APP/caddy/front-proxy/$f.caddy")" = 644 ] || fail "front-proxy/$f.caddy is $(mode "$AISHIE_APP/caddy/front-proxy/$f.caddy")"
+done
+said "aishie front-proxy: FRONT_PROXY is not set: Caddy takes a client's address from the connection" || fail "said: $(cat "$FAKE/out")"
+! called "cloudflare.com" || fail "fetched Cloudflare's addresses with no FRONT_PROXY"
 [ -x "$AISHIE_APP/postgres/initdb/10-aishie.sh" ] || fail "the init script is not executable"
-for f in aishie-update aishie aishie-storage; do
+for f in aishie-update aishie aishie-storage aishie-front-proxy; do
   if ! cmp -s "$root/bin/$f" "$AISHIE_BIN/$f" || [ ! -x "$AISHIE_BIN/$f" ]; then fail "$f not installed in $AISHIE_BIN"; fi
 done
-for f in aishie-update.service aishie-update.timer aishie-backup.service aishie-backup.timer; do
+for f in aishie-update.service aishie-update.timer aishie-backup.service aishie-backup.timer aishie-front-proxy.service aishie-front-proxy.timer; do
   cmp -s "$root/systemd/$f" "$AISHIE_UNITS/$f" || fail "$f not installed in $AISHIE_UNITS"
 done
 called "systemctl daemon-reload" || fail "no daemon-reload"
-called "systemctl enable --now aishie-update.timer aishie-backup.timer" || fail "the timers are not on"
+called "systemctl enable --now aishie-update.timer aishie-backup.timer aishie-front-proxy.timer" || fail "the timers are not on"
 # Caddy's configuration checked before Caddy runs it; PostgreSQL started and
 # never recreated; the three images pulled.
 called "docker run --rm --network none -e HOST=test.aishie.app .* caddy:2 caddy validate" || fail "no caddy validate"
@@ -585,6 +594,39 @@ touch "$FAKE/volumes/aishie_postgres"
 if setup_server test.aishie.app edge; then fail "passed with a volume and no postgres.env"; fi
 said "volume aishie_postgres is there, but" || fail "said: $(cat "$FAKE/out")"
 [ ! -e "$AISHIE_ETC/postgres.env" ] || fail "wrote postgres.env"
+
+# Behind Cloudflare: FRONT_PROXY=cloudflare in aishie.env, then set up
+# again, as README.md says: Caddy's settings written from it, before Caddy's
+# configuration is checked, with the list pinned in this copy when
+# Cloudflare's cannot be fetched; nothing else in /etc/aishie changes; and
+# what is left says how to proxy the name, not to point it here.
+setup front-proxy
+setup_server test.aishie.app edge || fail "exit $?: $(cat "$FAKE/out")"
+echo FRONT_PROXY=cloudflare >> "$AISHIE_ETC/aishie.env"
+before=$(sums)
+: > "$CALLS"
+setup_server test.aishie.app edge || fail "exit $?: $(cat "$FAKE/out")"
+[ "$(sums)" = "$before" ] || fail "changed $AISHIE_ETC: $(diff <(echo "$before") <(sums))"
+grep -qF "trusted_proxies static $(grep -v '^#' "$root/caddy/cloudflare-ips" | tr '\n' ' ' | sed 's/ $//')" "$AISHIE_APP/caddy/front-proxy/global.caddy" ||
+  fail "Caddy does not trust Cloudflare's addresses: $(cat "$AISHIE_APP/caddy/front-proxy/global.caddy")"
+said "aishie front-proxy: FRONT_PROXY=cloudflare: Caddy takes a visitor's address from CF-Connecting-IP on connections from Cloudflare's 22 ranges: the list pinned in" ||
+  fail "said: $(cat "$FAKE/out")"
+called "https://www.cloudflare.com/ips-v4" || fail "Cloudflare's addresses not fetched"
+[ "$(grep -n 'cloudflare.com/ips-v4' "$CALLS" | head -n 1 | cut -d: -f1)" -lt "$(grep -n 'caddy validate' "$CALLS" | head -n 1 | cut -d: -f1)" ] ||
+  fail "Caddy's configuration was checked before the front proxy's settings were written"
+said "Proxy test.aishie.app by Cloudflare (README.md, Behind Cloudflare)" || fail "what is left does not say how to proxy the name: $(cat "$FAKE/out")"
+said "^     aishie front-proxy$" || fail "what is left does not say aishie front-proxy: $(cat "$FAKE/out")"
+! said "Point test.aishie.app at this server in DNS" || fail "said to point the name here: $(cat "$FAKE/out")"
+# ... a FRONT_PROXY that means nothing: the run stops there, before Caddy's
+# configuration is checked, and the files are left as they were.
+sed -i 's/^FRONT_PROXY=cloudflare$/FRONT_PROXY=akamai/' "$AISHIE_ETC/aishie.env"
+fp_before=$(cat "$AISHIE_APP/caddy/front-proxy/global.caddy")
+: > "$CALLS"
+if setup_server test.aishie.app edge; then fail "passed with FRONT_PROXY=akamai"; fi
+said "setup-server.sh: FRONT_PROXY=akamai in .*aishie.env: the front proxy known here is cloudflare (unset for none): .*front-proxy is left as it was" ||
+  fail "said: $(cat "$FAKE/out")"
+! called "caddy validate" || fail "went on to check Caddy's configuration"
+[ "$(cat "$AISHIE_APP/caddy/front-proxy/global.caddy")" = "$fp_before" ] || fail "changed global.caddy"
 
 # A Caddyfile Caddy refuses: Caddy is not started on it.
 setup caddy-refuses

@@ -58,7 +58,9 @@ services:
       HTTP_ADDR: ":8080"
       PUBLIC_URL: https://${HOST:?set HOST in /etc/aishie/aishie.env}
       # Caddy, and nothing else: Core takes a client's address from the
-      # X-Forwarded-For of this proxy alone.
+      # X-Forwarded-For of this proxy alone, where Caddy puts the one address
+      # it takes the client to be (caddy/Caddyfile): behind Cloudflare, the
+      # visitor's (README.md, Behind Cloudflare).
       TRUSTED_PROXIES: ${AISHIE_CADDY_IP:?set AISHIE_CADDY_IP in /etc/aishie/aishie.env}/32
       # The runtime's API: the one audience Core makes assertions for, which
       # the front end sends the runtime as the person signed in. The same

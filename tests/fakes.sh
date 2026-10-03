@@ -55,7 +55,14 @@
 # issue` prints a new aissvc_ credential as Core does, or SERVICE_TOKEN;
 # ISSUE_FAIL fails it, as a Core from before the agent_runtime service does.
 # A one-off `help` names S3_BUCKET_LOOKUP, but with OLD_CORE_HELP, as a Core
-# from before it; HELP_FAIL has its container not start.
+# from before it; HELP_FAIL has its container not start. CADDY_RELOAD_FAIL
+# has Caddy refuse a `caddy reload`. Cloudflare serves its lists of addresses
+# from $FAKE/cloudflare/ips-v4 and ips-v6; CF_DOWN has it not answer, and
+# CF_STATUS answer with that status. CF_EDGE is what answers
+# http://HOST/.well-known/acme-challenge/: 308 (the default), Cloudflare
+# passing it to Caddy, which redirects it; another status, Cloudflare
+# answering it itself; direct, Caddy with no Cloudflare in front; down,
+# nothing.
 
 # make_fakes DIR: the stand-ins, in DIR, to put first on PATH.
 make_fakes() {
@@ -179,6 +186,11 @@ compose() {
     "exec -T postgres pg_dump"*)
       echo "PGDMP a dump of ${*: -1}"
       exit "${BACKUP_FAIL:-0}" ;;
+    "exec -T caddy caddy reload "*)
+      if [ -n "${CADDY_RELOAD_FAIL:-}" ]; then
+        echo "Error: loading new config: loading http app module: provision http: server srv0: setting up route handlers: as the test asks" >&2
+        exit 1
+      fi ;;
     "logs"*) echo "a log line" ;;
     "ps -q "*) [ -e "$FAKE/running/$3" ] && echo "container-of-$3" ;;
     "ps"*) ls "$FAKE/running" ;;
@@ -299,6 +311,31 @@ if [[ " $* " == *" --aws-sigv4 "* ]]; then
   exit 0
 fi
 url=${*: -1}
+# Cloudflare's lists of its addresses, $FAKE/cloudflare/ips-v4 and ips-v6 as
+# it serves them, into the file -o names; and what answers
+# http://HOST/.well-known/acme-challenge/, its headers into the file -D
+# names, as CF_EDGE says (below).
+args=("$@")
+arg() { local i; for ((i = 0; i < ${#args[@]} - 1; i++)); do [ "${args[i]}" != "$1" ] || { echo "${args[i + 1]}"; return; }; done; echo /dev/null; }
+case $url in
+  https://www.cloudflare.com/*)
+    if [ -n "${CF_DOWN:-}" ]; then echo "curl: (6) Could not resolve host: www.cloudflare.com" >&2; exit 6; fi
+    if [ -n "${CF_STATUS:-}" ]; then echo "curl: (22) The requested URL returned error: $CF_STATUS" >&2; exit 22; fi
+    f=$FAKE/cloudflare/${url##*/}
+    [ -f "$f" ] || { echo "curl: (22) The requested URL returned error: 404" >&2; exit 22; }
+    cat "$f" > "$(arg -o)"
+    exit 0 ;;
+  http://*/.well-known/acme-challenge/*)
+    host=${url#http://}
+    host=${host%%/*}
+    case ${CF_EDGE:-308} in
+      down) echo "curl: (7) Failed to connect to $host port 80 after 3 ms: Couldn't connect to server" >&2; exit 7 ;;
+      direct) printf 'HTTP/1.1 308 Permanent Redirect\r\nLocation: https://%s%s\r\nServer: Caddy\r\n\r\n' "$host" "${url#http://"$host"}" > "$(arg -D)" ;;
+      308) printf 'HTTP/1.1 308 Permanent Redirect\r\nLocation: https://%s%s\r\nServer: cloudflare\r\nCF-RAY: 8c0ffee0a1b2c3d4-SIN\r\n\r\n' "$host" "${url#http://"$host"}" > "$(arg -D)" ;;
+      *) printf 'HTTP/1.1 %s Something\r\nServer: cloudflare\r\ncf-ray: 8c0ffee0a1b2c3d4-HKG\r\n\r\n' "$CF_EDGE" > "$(arg -D)" ;;
+    esac
+    exit 0 ;;
+esac
 case $url in
   *:8080/*) svc=core ;;
   *:9090/*) svc=runtime ;;

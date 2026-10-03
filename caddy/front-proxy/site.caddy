@@ -1,0 +1,6 @@
+# Caddy's first route for this server's name, for what stands in front of
+# it, which aishie front-proxy writes from FRONT_PROXY_ONLY in
+# /etc/aishie/aishie.env, and the Caddyfile imports: edit aishie.env, not
+# this (README.md, Behind Cloudflare).
+#
+# FRONT_PROXY_ONLY is not yes: a request is taken wherever it comes from.

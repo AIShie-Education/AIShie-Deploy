@@ -15,8 +15,12 @@ The stack is five containers on one network:
 
 Caddy sends `/v1/*`, `/mcp`, `/mcp/*` and `/healthz` to Core (not
 compressed: MCP streams), `/runtime/api/*` to the runtime's API without the
-browser's `Cookie` header, and everything else to the web front end. The
-runtime's own `/healthz`, `/metrics` and `/status` are never routed.
+browser's `Cookie` header, and everything else to the web front end, each
+with `X-Forwarded-For` saying the one address Caddy takes the client to be.
+The runtime's own `/healthz`, `/metrics` and `/status` are never routed. A
+server whose own address is blocked where its users are, as in mainland
+China, can be put behind Cloudflare
+([Behind Cloudflare](#behind-cloudflare-for-visitors-in-mainland-china)).
 
 Updates are pulled, not pushed: `aishie-update`, on a systemd timer every
 five minutes, looks at the tag each service follows, and deploys a new image
@@ -33,11 +37,14 @@ In this repository, and where `setup-server.sh` puts it:
 | --- | --- | --- |
 | `compose.yaml`, `stack.yaml` | `/opt/aishie/` | the stack; `compose.yaml` names the project and the two files it reads |
 | `caddy/Caddyfile` | `/opt/aishie/caddy/` | Caddy's routes, for `HOST` |
+| `caddy/front-proxy/` | `/opt/aishie/caddy/front-proxy/` | Caddy's settings for what stands in front of the server, which `aishie front-proxy` writes from `aishie.env` ([Behind Cloudflare](#behind-cloudflare-for-visitors-in-mainland-china)) |
+| `caddy/cloudflare-ips` | `/opt/aishie/caddy/` | Cloudflare's addresses, the list taken when none was ever fetched |
+| | `/var/lib/aishie/cloudflare-ips` | the last whole list of Cloudflare's addresses fetched |
 | `postgres/initdb/10-aishie.sh` | `/opt/aishie/postgres/initdb/` | the two databases and their roles, made once |
 | `env/*.env.example` | `/opt/aishie/env/` | every setting, explained |
 | `examples/runtime/` | | a runtime document with [the school's AI plan](#the-schools-ai-plan), and a price table |
 | `README.md`, `docs/` | `/opt/aishie/` | this, and [when something goes wrong](docs/troubleshooting.md) |
-| | `/etc/aishie/aishie.env` | the operator's settings: `HOST`, `ENVIRONMENT`, the channels, the network |
+| | `/etc/aishie/aishie.env` | the operator's settings: `HOST`, `ENVIRONMENT`, the channels, the network, what stands in front |
 | | `/etc/aishie/core.env`, `runtime.env`, `postgres.env` | each service's settings and secrets, root's (0600) |
 | | `/etc/aishie/runtime/agents/` | the operator's agents' YAML, mounted read-only at `/config` |
 | | `/etc/aishie/runtime/secrets/` | their secrets, `kek/`, the runtime's keyring, and `core/agent_runtime`, [the runtime's credential for Core](#the-runtimes-credential-for-core); mounted read-only at `/secrets` |
@@ -48,7 +55,8 @@ In this repository, and where `setup-server.sh` puts it:
 | `bin/aishie-update` | `/usr/local/bin/` | the updater |
 | `bin/aishie` | `/usr/local/bin/` | one-off commands, logs, backups |
 | `bin/aishie-storage` | `/usr/local/bin/` | `aishie storage`: where Core keeps uploaded files, and moving them |
-| `systemd/` | `/etc/systemd/system/` | `aishie-update.timer` (every 5 minutes), `aishie-backup.timer` (nightly) |
+| `bin/aishie-front-proxy` | `/usr/local/bin/` | `aishie front-proxy`: what stands in front of the server, written into Caddy's settings |
+| `systemd/` | `/etc/systemd/system/` | `aishie-update.timer` (every 5 minutes), `aishie-backup.timer` (nightly), `aishie-front-proxy.timer` (weekly) |
 | `setup-server.sh` | | sets a server up, and updates the above on it |
 
 ## A new server
@@ -104,7 +112,9 @@ institution allows for that.
 
 3. Point the name at the server (an A record, and AAAA if it has IPv6).
    Caddy gets a certificate as soon as the name resolves there:
-   `curl https://test.aishie.app/healthz`.
+   `curl https://test.aishie.app/healthz`. For people who cannot reach the
+   server's own address, the name is proxied by Cloudflare instead
+   ([Behind Cloudflare](#behind-cloudflare-for-visitors-in-mainland-china)).
 
 4. The first administrator: the account you sign in to the site with. It
    asks for a name, an email and a password (twice, not shown), makes the
@@ -214,6 +224,7 @@ As root on the server:
 | `aishie runtime-credential` | the runtime's credential for Core issued anew, the ones before revoked, and the runtime recreated with it ([The runtime's credential for Core](#the-runtimes-credential-for-core)) |
 | `aishie compose …` | `docker compose` for the stack, with its settings files |
 | `aishie storage` | where Core keeps uploaded files; `check`, `cors`, and `migrate`, which moves them ([Where uploaded files are kept](#where-uploaded-files-are-kept)) |
+| `aishie front-proxy` | `FRONT_PROXY` in `aishie.env` written into Caddy's settings, Cloudflare's addresses fetched again, and whether Let's Encrypt reaches Caddy through Cloudflare ([Behind Cloudflare](#behind-cloudflare-for-visitors-in-mainland-china)) |
 
 `curl -s 127.0.0.1:8080/healthz`, `curl -s 127.0.0.1:9090/healthz` and
 `curl -s 127.0.0.1:8081/version.json` say what each runs;
@@ -1110,10 +1121,13 @@ volume's files, until the new version has run for a while.
 The stack's network has a subnet of its own, `AISHIE_SUBNET` in
 `aishie.env` (172.30.83.0/24), and Caddy a fixed address in it,
 `AISHIE_CADDY_IP` (172.30.83.10). That address is Core's
-`TRUSTED_PROXIES`: Core takes a client's address from the
-`X-Forwarded-For` of Caddy and of nothing else. If the subnet collides with
-another network on the server, change both, then
-`aishie compose down && aishie compose up -d`.
+`TRUSTED_PROXIES`, and the runtime API's `API_TRUSTED_PROXIES`: they take a
+client's address from the `X-Forwarded-For` of Caddy and of nothing else,
+and Caddy puts there the one address it takes the client to be, the
+connection's, or behind Cloudflare the visitor's
+([Behind Cloudflare](#behind-cloudflare-for-visitors-in-mainland-china)).
+If the subnet collides with another network on the server, change both,
+then `aishie compose down && aishie compose up -d`.
 
 Caddy also has `HOST` as an alias on the network. Docker's embedded DNS
 server, which every container on a user-defined network asks first, answers
@@ -1130,6 +1144,272 @@ IPv6 (AAAA) query itself, with no address, and does not pass it on (checked
 with a public name that has one), so nothing tries the public address first
 on this IPv4-only network. CI's end to end checks the first part on every
 run (`tests/e2e.sh`, with `HOST=aishie.internal`).
+
+## Behind Cloudflare (for visitors in mainland China)
+
+A server's own address can be blocked in mainland China, and then nobody
+there reaches the site, whatever its name. test.aishie.app's was: its
+address (Vultr, Singapore) lost every packet from China Telecom, China
+Unicom and China Mobile, and from Tencent's and Alibaba's probes, while
+Hong Kong, Singapore, Japan and the United States reached it; aishie.app,
+proxied by Cloudflare, answered 200 to the same probes. With the server's
+name proxied by Cloudflare (the orange cloud), people reach Cloudflare's
+addresses, and Cloudflare reaches the server.
+
+Two things to know first:
+
+- **Cloudflare's free plan in mainland China can be slow at times.** Its
+  visitors there reach Cloudflare's data centres outside the mainland, over
+  the international links everyone there shares, which are slow at busy
+  hours and may drop for a while. It is a way past a blocked address, not
+  a fast one. Cloudflare's network inside the mainland (its China Network)
+  is an Enterprise product, run with a local partner, and needs an ICP
+  filing.
+- **Hosting in mainland China needs an ICP filing** (ICP 备案) for the
+  name, made through a provider there, before a server there may serve it.
+  Until there is one, a server outside the mainland behind Cloudflare is
+  the way.
+
+### On the server
+
+In `/etc/aishie/aishie.env`:
+
+```
+FRONT_PROXY=cloudflare
+```
+
+then `aishie front-proxy` (or `setup-server.sh` again, which does the
+same). From then on:
+
+- **Caddy believes Cloudflare's addresses alone about who the visitor is.**
+  On a connection from one of them, the visitor is the address in
+  `CF-Connecting-IP`, which Cloudflare sets on every request, whatever the
+  visitor sent; without it, the last address in `X-Forwarded-For` that is
+  not Cloudflare's (Caddy's `trusted_proxies_strict`). A connection from
+  anywhere else is its own client, whatever headers it brings.
+- **Core and the runtime are given that address.** They believe Caddy
+  alone (`TRUSTED_PROXIES`, `API_TRUSTED_PROXIES`) and take the last address
+  of its `X-Forwarded-For`, so the Caddyfile has Caddy say the visitor's
+  address there and nothing else: by default Caddy would add Cloudflare's
+  own after it, and every visitor would be one of Cloudflare's addresses to
+  them. Core counts sign-in attempts by that address; the runtime's API
+  audits and limits by it.
+- **Cloudflare's addresses are fetched** from
+  `https://www.cloudflare.com/ips-v4` and `/ips-v6` at each
+  `aishie front-proxy`, and every week by `aishie-front-proxy.timer`. A list
+  is taken only whole: every line an address range, both families there,
+  none wider than a /8 (IPv6, a /16). A fetch that fails, or brings anything
+  else, leaves the last list fetched in force
+  (`/var/lib/aishie/cloudflare-ips`), or, on a server that never fetched
+  one, the list pinned in this repository (`caddy/cloudflare-ips`), and
+  says which. Caddy is reloaded only when the list, or a setting, changed;
+  a reload Caddy refuses puts its files back as they were, and Caddy goes
+  on as before.
+- What `aishie front-proxy` writes is `/opt/aishie/caddy/front-proxy/`'s
+  `global.caddy` and `site.caddy`, which the Caddyfile imports: edit
+  `aishie.env`, not them. Last, it asks
+  `http://HOST/.well-known/acme-challenge/` from the server, as Let's
+  Encrypt asks it, and says what answered (below, The certificate).
+
+Without `FRONT_PROXY`, none of this applies: the two files are comments
+alone, and Caddy takes the connection's address, which it sent Core and the
+runtime before this too.
+
+Optionally, once the record is proxied:
+
+```
+FRONT_PROXY_ONLY=yes
+```
+
+and `aishie front-proxy`: a request that comes neither from Cloudflare's
+addresses nor from a private one (the stack's own network, where the
+runtime reaches Core through Caddy, and Docker's proxy, which carries the
+server's own connections) is refused, 403, so that nobody reaches the site
+past Cloudflare. Set before the record is proxied, it refuses everyone who
+reaches the server's own address, and `aishie front-proxy` says so. It does
+not hide the server: its address still answers, with the refusal; anyone's
+Cloudflare account can send a name of theirs to it (Cloudflare's
+Authenticated Origin Pulls is the answer to that, and is not set up here);
+and on a server with IPv6, Docker hands Caddy an IPv6 connection from
+inside the stack's network (the network is IPv4 alone), which the refusal
+lets through as private.
+
+### In Cloudflare's dashboard
+
+For the zone (aishie.app's), by someone who may change it:
+
+1. **SSL/TLS, Overview: Full (strict).** Cloudflare then reaches the server
+   over HTTPS for an HTTPS request, checking Caddy's certificate for the
+   name, and over plain HTTP for a plain HTTP one (the Full modes keep the
+   visitor's scheme). Not Flexible: Caddy redirects plain HTTP to HTTPS,
+   and Flexible would loop. The mode is the zone's: every other proxied
+   name in it that has a server of its own must present a valid
+   certificate too.
+2. **DNS, Records:** the server's name as an A record to the server's IPv4
+   address, **Proxied**, and no AAAA record for it. Visitors still reach
+   Cloudflare over IPv6 (Cloudflare gives the name its own AAAA); Cloudflare
+   reaches the server over IPv4 when the name has an A record. An AAAA record
+   to the server would let it come over IPv6, which Docker hands to Caddy
+   from inside the stack's network: Caddy would see that, not Cloudflare,
+   and every visitor would be that one address.
+3. **Plain HTTP to `/.well-known/acme-challenge/` must reach the server**,
+   for its certificate (below): SSL/TLS, Edge Certificates, **Always Use
+   HTTPS: Off**. Caddy redirects plain HTTP to HTTPS itself (308), so
+   visitors still end up on HTTPS. If other names in the zone need it on,
+   turn it off all the same and add, in Rules, Redirect Rules, one that does
+   the same but for that path: when
+   `(http.request.scheme eq "http") and not starts_with(http.request.uri.path, "/.well-known/acme-challenge/")`,
+   a dynamic redirect to `concat("https://", http.host, http.request.uri.path)`,
+   301, the query string kept.
+4. **Leave these as they are, or check them:**
+   - *Caching.* Cloudflare caches by file extension alone, and never HTML or
+     JSON. Core's and the runtime's APIs (`/v1/*`, `/mcp`,
+     `/runtime/api/*`) answer JSON at paths with no file extension, and
+     Core's file links (`/v1/blobs/…`) have none and say
+     `Cache-Control: private, no-store`: none of it is cached, and no rule is
+     needed for it. The web's `/assets/*`, immutable, are cached, which
+     helps. A "Cache Everything" rule, if the zone ever has one, must leave
+     out `/v1/*`, `/mcp*`, `/runtime/api/*` and `/healthz` (a Cache Rule
+     that bypasses the cache for them, ahead of it).
+   - *Security.* Under Attack mode, Bot Fight Mode, and any rule that
+     challenges, must not cover this name: agents' MCP clients, scripts and
+     Let's Encrypt cannot answer a challenge (and on the free plan Bot Fight
+     Mode cannot be left off for some paths alone).
+   - *Pseudo IPv4*: Off, its default. It would give Caddy a made-up IPv4
+     address for an IPv6 visitor.
+   - *Rocket Loader*: Off, its default. It rewrites the app's scripts.
+   - *WebSockets*: none are used. The chat long-polls, each read waiting 25
+     seconds at most, and the MCP endpoint answers JSON, not a stream.
+
+Then, on the server, `aishie front-proxy`.
+
+### The certificate
+
+Caddy goes on getting its certificate from Let's Encrypt itself. Of its two
+ways, TLS-ALPN-01 cannot pass through Cloudflare, which ends the TLS
+connection itself; HTTP-01 can: Let's Encrypt asks
+`http://HOST/.well-known/acme-challenge/<token>`, Cloudflare in Full
+(strict) passes a plain HTTP request to the server's port 80 as it is, and
+Caddy answers the challenge before any route. Caddy tries one way, then the
+other, and keeps to the one that works: its log (`aishie logs caddy`) may
+have a `tls-alpn-01` challenge failing before an `http-01` one passes,
+which is expected.
+
+With Always Use HTTPS on, Cloudflare answers that request itself, with a
+redirect to HTTPS, which Let's Encrypt follows. A renewal still passes while
+the server's certificate is valid (Cloudflare reaches the server over HTTPS,
+and Caddy answers a challenge over HTTPS too), but a certificate that has
+run out, or a new server's first, cannot be had that way: Full (strict)
+refuses a server with no valid certificate (Cloudflare's 526) before Caddy
+can answer. Hence step 3: a certificate kept by nothing but its being still
+valid is one missed renewal from an outage.
+
+The other ways, and why not:
+
+- *A Cloudflare Origin CA certificate* (fifteen years, nothing to renew):
+  the runtime reaches Core at `https://HOST` through Caddy's alias inside
+  the server ([The network, and HOST inside it](#the-network-and-host-inside-it))
+  and checks Caddy's certificate as a browser does. An Origin CA certificate
+  is trusted by Cloudflare alone: the runtime would refuse it, and with it
+  the agents it hosts and its API. A name set back to DNS only would show
+  every visitor a certificate error too.
+- *DNS-01, with a Cloudflare API token*: it needs a Caddy built with the
+  `caddy-dns/cloudflare` module. The stack's `caddy:2` has none, and a
+  build of our own would be one more image to keep up to date.
+
+**Before the current certificate runs out.** test.aishie.app's certificate
+is Let's Encrypt's, from 2 October to 31 December 2026 (14:10 UTC), and
+Caddy starts renewing it about thirty days before it ends, around
+1 December. By then, with the record proxied, the zone must be in Full
+(strict) and plain HTTP to `/.well-known/acme-challenge/` must reach the
+server (step 3). `aishie front-proxy` says whether it does: `goes through
+Cloudflare (cf-ray …) to Caddy, which answers it (308)` is right; a warning
+says what Cloudflare does instead (a 301 is Always Use HTTPS). The
+certificate the server has, and when it ends:
+
+```
+echo | openssl s_client -connect 127.0.0.1:443 -servername test.aishie.app 2>/dev/null | openssl x509 -noout -issuer -enddate
+```
+
+### Checking it
+
+```
+curl -sI https://test.aishie.app/healthz | grep -i -e '^HTTP' -e '^server' -e '^cf-ray'
+```
+
+answers 200, `server: cloudflare`, and a `cf-ray`: the request went
+through Cloudflare. `aishie front-proxy` says where Cloudflare's addresses
+came from and whether Caddy took them, and what answers the certificate's
+challenge path.
+
+Whose addresses Core and the runtime see: Core keeps none (it counts
+sign-in attempts by address, in memory); the runtime's audit records each
+change made through its API with the address it came from:
+
+```
+aishie compose exec -T postgres psql -U postgres -d aishie_runtime -Atc 'SELECT at, ip, action FROM audit ORDER BY id DESC LIMIT 5'
+```
+
+After someone tries a key or pauses an agent in the site, the address is
+theirs, as a "what is my IP" page shows it to them: not one of Cloudflare's
+(`caddy/cloudflare-ips`), nor the stack's own (`172.30.83.x`).
+
+### Limits of Cloudflare's free plan
+
+- **A request's body: 100 MB.** A larger one is refused by Cloudflare,
+  413, before the server sees it. Core takes each file in a request of its
+  own (`PUT /v1/blobs/…`), of at most `MAX_UPLOAD_BYTES`, 50 MiB unless set
+  (and an attachment, `ATTACHMENT_MAX_BYTES`, never more); a version's files
+  (20 at most unless set, 200 MiB in all) and a conversation's (500 MiB) are
+  as many requests, each under the limit. Everything else Core takes is a
+  megabyte or less (a text version, 2 MiB), and the runtime's API takes
+  64 KiB at most. The runtime's own uploads to Core (a rendition, up to
+  100 MiB) go through Caddy's alias inside the server, not through
+  Cloudflare. So nothing reaches the limit unless `MAX_UPLOAD_BYTES` is
+  raised past 95 MiB (100,000,000 bytes): then a file between the two fails
+  in the browser with Cloudflare's 413, not Core's own refusal. Keep it under
+  that, or keep the files in a bucket (`BLOB_STORE=s3`,
+  [Where uploaded files are kept](#where-uploaded-files-are-kept)), which
+  browsers upload to directly, past Cloudflare.
+- **Waiting for an answer: about two minutes.** Cloudflare gives the server
+  125 seconds to begin its answer (its Proxy Read Timeout as its
+  documentation gives it now; 100 seconds for years), then gives up with
+  its 524. Core answers within 30 seconds, and a read that waits for news
+  (the chat's long poll) within 25; the runtime's API within a minute; the
+  MCP endpoint answers JSON, not a stream; nothing uses WebSockets; and a
+  download begins at once and streams, whatever its size (Cloudflare limits
+  no answer's size). The one exception is an export of conversations
+  (`conversation.export`), which Core lets take up to five minutes to write
+  before it answers: one that takes longer than two minutes gets
+  Cloudflare's 524 instead of the export. Narrow it (a course, a
+  department, a participant, a span of time) until it is written in time.
+
+Nothing in the stack's defaults goes past either limit, so none is changed
+for Cloudflare.
+
+### Going back
+
+To reach the server directly again, in this order, so that nobody is
+refused on the way:
+
+1. `FRONT_PROXY_ONLY`, if it is set, taken out of `aishie.env`, and
+   `aishie front-proxy`. Cloudflare still carries every request; the server
+   now takes the others too.
+2. In Cloudflare's dashboard, the record set to DNS only (the grey cloud).
+   Done before step 1, it has everyone whose resolver then gives them the
+   server's own address refused, 403, until `aishie front-proxy` is run.
+3. `FRONT_PROXY` kept for five minutes at least. Resolvers may keep
+   Cloudflare's addresses for the name that long (300 seconds, the TTL
+   Cloudflare gives a proxied record), and the people they answer still
+   come through Cloudflare. Without `FRONT_PROXY`, Caddy would take
+   Cloudflare's address for theirs, and Core would count their sign-in
+   attempts, and the runtime's API audit and limit them, by Cloudflare's
+   few addresses. Then take it out and run `aishie front-proxy`, or leave
+   it in: Caddy believes connections from Cloudflare's addresses alone, so
+   a visitor who reaches the server directly is their own client either
+   way.
+
+The certificate is Let's Encrypt's, which browsers trust either way.
 
 ## The runtime's API
 
@@ -1254,18 +1534,20 @@ image whose label names another, and prunes by it.
 
 ```
 make ci        # shellcheck, actionlint, the tests, compose config, caddy validate
-make test      # tests/*_test.sh: aishie-update, aishie, aishie-storage and setup-server.sh against stand-ins
-make config    # docker compose config against env/*.example; caddy validate and Caddy's routes
+make test      # tests/*_test.sh: aishie-update, aishie, aishie-storage, aishie-front-proxy and setup-server.sh against stand-ins
+make config    # docker compose config against env/*.example; caddy validate and Caddy's routes, also behind Cloudflare
 make e2e       # the whole stack for real: as root, on a machine that can be thrown away
 ```
 
 `make test` runs the scripts against stand-ins for docker, curl, flock,
 apt and systemctl (`tests/fakes.sh`), which play a registry, a Docker,
 the services' health checks, Core's `service issue`, an S3 service and
-rclone's container, whose bucket is a directory; nothing reaches the
-network. `make config` needs no Docker daemon for
-compose; it validates the Caddyfile with a `caddy` on `PATH` (or `CADDY`),
-else with Caddy's image, and checks the routes Caddy reads from it.
+rclone's container, whose bucket is a directory, and Cloudflare's lists of
+its addresses and its edge; nothing reaches the network. `make config`
+needs no Docker daemon for compose; it validates the Caddyfile with a
+`caddy` on `PATH` (or `CADDY`), else with Caddy's image, and checks the
+routes and settings Caddy reads from it, with nothing in front and with
+what `aishie front-proxy` writes for Cloudflare.
 
 `.github/workflows/ci.yml` runs the same, every day as well as on each
 push, and an end to end (`tests/e2e.sh`) on a runner it then throws away:
@@ -1283,7 +1565,9 @@ Caddy is published beyond the loopback, Core is given the `SECRETS_KEY`
 is given its credential for Core (with a Core that has the
 `agent_runtime` service), printed nowhere, which Core takes, and
 `aishie runtime-credential` replaces it, Core refusing the one before,
-the backups can be restored from, and a second `aishie-update` (and a
+the backups can be restored from, `aishie front-proxy` has Caddy reload
+behind Cloudflare (`FRONT_PROXY_ONLY=yes`) and back, the site answering
+the machine and the runtime all along, and a second `aishie-update` (and a
 `docker compose up -d`, as after a reboot) changes nothing.
 `aishie.internal`, not `localhost`: both get their certificate from Caddy's
 local authority, but inside a container `localhost` is the container

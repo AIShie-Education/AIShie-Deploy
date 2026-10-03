@@ -37,20 +37,24 @@
 # directories for the runtime's agents and secrets, with the key that seals
 # the secrets the runtime stores (kek/v1), Core's files, aishie-update's
 # state and the backups. It installs the stack in /opt/aishie, aishie-update,
-# aishie and aishie-storage in /usr/local/bin, and the timers; opens 80 and
-# 443 in ufw when ufw is on; checks that the server can pull the three
-# images; starts PostgreSQL and Caddy; runs the first update; once Core is
-# migrated, gives the runtime its credential for Core (aishie
-# runtime-credential), which it hosts agents with; and says what is left to
-# do.
+# aishie, aishie-storage and aishie-front-proxy in /usr/local/bin, and the
+# timers; writes Caddy's settings for what stands in front of the server, if
+# anything (FRONT_PROXY in aishie.env: README.md, Behind Cloudflare), before
+# it checks Caddy's configuration; opens 80 and 443 in ufw when ufw is on;
+# checks that the server can pull the three images; starts PostgreSQL and
+# Caddy; runs the first update; once Core is migrated, gives the runtime its
+# credential for Core (aishie runtime-credential), which it hosts agents
+# with; and says what is left to do.
 #
 # Run again, it installs this copy's files over the old ones, and leaves the
 # rest as it is: the settings, the secrets and the data, and where Core
-# keeps its files (`aishie storage migrate` moves them). A core.env from
-# before SECRETS_KEY is given one, as a line at its end, and nothing else in
-# it changes; a runtime with no credential for Core, its file missing or
-# empty, is given one, and one that is there is left as it is. That is how
-# a newer aishie-update, or a change to the stack, reaches the server.
+# keeps its files (`aishie storage migrate` moves them). Caddy's settings
+# for the front proxy are written again from aishie.env, as `aishie
+# front-proxy` writes them. A core.env from before SECRETS_KEY is given one,
+# as a line at its end, and nothing else in it changes; a runtime with no
+# credential for Core, its file missing or empty, is given one, and one that
+# is there is left as it is. That is how a newer aishie-update, or a change
+# to the stack, reaches the server.
 #
 # tests/setup-server_test.sh sources it with AISHIE_SETUP_LIB=1, which
 # defines the functions and runs nothing, and moves the paths below;
@@ -104,6 +108,16 @@ AISHIE_STORAGE_LIB=1
 # shellcheck source=bin/aishie-storage
 . "$storage_lib"
 unset AISHIE_STORAGE_LIB
+
+# What stands in front of this server, and Caddy's settings for it:
+# bin/aishie-front-proxy's functions (fp_*), which `aishie front-proxy` runs
+# later, and aishie-front-proxy.timer every week.
+front_proxy_lib=$(dirname "$0")/bin/aishie-front-proxy
+[ -f "$front_proxy_lib" ] || die "run the setup-server.sh of a whole copy of the repository: $front_proxy_lib is missing"
+AISHIE_FRONT_PROXY_LIB=1
+# shellcheck source=bin/aishie-front-proxy
+. "$front_proxy_lib"
+unset AISHIE_FRONT_PROXY_LIB
 
 usage() {
   cat >&2 <<'EOF'
@@ -464,22 +478,30 @@ runtime_credential() {
 }
 
 # install_files HERE: this copy's stack, scripts and units, over the old ones.
+# Caddy's front-proxy/ is aishie front-proxy's to write (fp_write, after
+# this): it is given this copy's, what that writes with nothing in front,
+# only where it has none, so that the Caddyfile always finds what it
+# imports.
 install_files() {
   here=$1
   umask 022
-  install -d -m 755 "$APP" "$APP/caddy" "$APP/postgres" "$APP/postgres/initdb" "$APP/env" "$APP/docs"
+  install -d -m 755 "$APP" "$APP/caddy" "$APP/caddy/front-proxy" "$APP/postgres" "$APP/postgres/initdb" "$APP/env" "$APP/docs"
   install -m 644 "$here/compose.yaml" "$here/stack.yaml" "$here/README.md" "$APP/"
-  install -m 644 "$here/caddy/Caddyfile" "$APP/caddy/"
+  install -m 644 "$here/caddy/Caddyfile" "$here/caddy/cloudflare-ips" "$APP/caddy/"
+  for f in global site; do
+    [ -e "$APP/caddy/front-proxy/$f.caddy" ] || install -m 644 "$here/caddy/front-proxy/$f.caddy" "$APP/caddy/front-proxy/"
+  done
   install -m 755 "$here/postgres/initdb/10-aishie.sh" "$APP/postgres/initdb/"
   install -m 644 "$here"/env/*.env.example "$APP/env/"
   install -m 644 "$here"/docs/*.md "$APP/docs/"
   install -d -m 755 "$BIN"
-  install -m 755 "$here/bin/aishie-update" "$here/bin/aishie" "$here/bin/aishie-storage" "$BIN/"
+  install -m 755 "$here/bin/aishie-update" "$here/bin/aishie" "$here/bin/aishie-storage" "$here/bin/aishie-front-proxy" "$BIN/"
   install -d -m 755 "$UNITS"
   install -m 644 "$here"/systemd/aishie-update.service "$here"/systemd/aishie-update.timer \
-    "$here"/systemd/aishie-backup.service "$here"/systemd/aishie-backup.timer "$UNITS/"
+    "$here"/systemd/aishie-backup.service "$here"/systemd/aishie-backup.timer \
+    "$here"/systemd/aishie-front-proxy.service "$here"/systemd/aishie-front-proxy.timer "$UNITS/"
   umask 077
-  echo "installed the stack in $APP, aishie-update, aishie and aishie-storage in $BIN, and the units in $UNITS"
+  echo "installed the stack in $APP, aishie-update, aishie, aishie-storage and aishie-front-proxy in $BIN, and the units in $UNITS"
 }
 
 # compose: the stack's, as aishie-update runs it.
@@ -592,6 +614,10 @@ MSG
 
   say "The stack, the scripts and the timers"
   install_files "$here"
+  # What stands in front of this server, if anything (FRONT_PROXY in
+  # aishie.env), in the two files the Caddyfile imports: before Caddy's
+  # configuration is checked, and Caddy started or reloaded with it, below.
+  fp_write || die "$fp_why: $APP/caddy/front-proxy is left as it was. Set it right in $ETC/aishie.env (README.md, Behind Cloudflare), then run this again"
   # The newest PostgreSQL 18 and Caddy 2. Caddy takes its own when it is
   # started below; PostgreSQL's waits for a person (README.md, PostgreSQL's
   # major version). Docker Hub may refuse for a while (it limits pulls): the
@@ -607,8 +633,8 @@ MSG
   rm -f "$STATE/caddy.err"
   if systemd; then
     systemctl daemon-reload
-    systemctl enable --now aishie-update.timer aishie-backup.timer
-    echo "aishie-update.timer and aishie-backup.timer are on"
+    systemctl enable --now aishie-update.timer aishie-backup.timer aishie-front-proxy.timer
+    echo "aishie-update.timer, aishie-backup.timer and aishie-front-proxy.timer are on"
   fi
 
   say "Firewall"
@@ -701,11 +727,21 @@ $n. The runtime's credential for Core, which it hosts agents with, once Core
 EOF
     n=$((n + 1))
   fi
-  cat <<EOF
+  if [ "$fp_proxy" = cloudflare ]; then
+    cat <<EOF
+$n. Proxy $host by Cloudflare (README.md, Behind Cloudflare): an A record to
+   this server, proxied, and no AAAA; SSL/TLS Full (strict); and plain HTTP to
+   /.well-known/acme-challenge/ let through to this server, which renews its
+   certificate so. Then this says whether it goes through:
+     aishie front-proxy
+EOF
+  else
+    cat <<EOF
 $n. Point $host at this server in DNS (A, and AAAA if it has IPv6). Caddy gets
    its certificate once the name resolves here:
      curl https://$host/healthz
 EOF
+  fi
   n=$((n + 1))
   cat <<EOF
 $n. The first administrator, once Core runs (aishie-update --status): it asks

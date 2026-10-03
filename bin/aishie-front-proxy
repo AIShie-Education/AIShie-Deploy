@@ -1,0 +1,383 @@
+#!/bin/sh
+# What stands in front of this server's Caddy, and what Caddy believes of it.
+# As root, after a change to FRONT_PROXY or FRONT_PROXY_ONLY in
+# /etc/aishie/aishie.env:
+#
+#   aishie front-proxy             Caddy's settings written again from aishie.env, Cloudflare's addresses fetched again
+#
+# With FRONT_PROXY unset, nothing stands in front: people reach Caddy at this
+# server's own address, and Caddy takes a client's address from the
+# connection. With FRONT_PROXY=cloudflare, the server's name is proxied by
+# Cloudflare (README.md, Behind Cloudflare): people reach Cloudflare, and
+# Cloudflare reaches Caddy. Caddy then believes a connection from one of
+# Cloudflare's addresses about who the visitor is, in CF-Connecting-IP (or,
+# without it, in the last address of X-Forwarded-For that is not
+# Cloudflare's), and believes nobody else; the Caddyfile gives that address
+# to Core and the runtime in X-Forwarded-For, which they take from Caddy
+# alone (TRUSTED_PROXIES, API_TRUSTED_PROXIES). Caddy's certificate is
+# Let's Encrypt's as before: its TLS-ALPN-01 challenge cannot pass through
+# Cloudflare, and Caddy, when it fails, goes on to HTTP-01, which does (the
+# challenge path below). FRONT_PROXY_ONLY=yes besides
+# refuses (403) a request from neither Cloudflare's addresses nor a private
+# one: the stack's own network, where the runtime reaches Core through Caddy.
+#
+# Cloudflare's addresses are fetched from https://www.cloudflare.com/ips-v4
+# and /ips-v6 at each run, and aishie-front-proxy.timer runs it every week.
+# A list is taken only whole: every line an address range, IPv4 and IPv6
+# both there, none wider than a /8 (an IPv6 /16). A fetch that fails, or
+# that brings anything else, leaves the last list fetched in force
+# (/var/lib/aishie/cloudflare-ips), or, before any was, the one pinned in
+# this repository (caddy/cloudflare-ips), and says so. Without FRONT_PROXY
+# nothing is fetched.
+#
+# It writes /opt/aishie/caddy/front-proxy/global.caddy and site.caddy, which
+# the Caddyfile imports, and reloads Caddy only when they changed; a reload
+# Caddy refuses puts them back as they were, and Caddy goes on as before.
+# Then, behind Cloudflare, it asks http://HOST/.well-known/acme-challenge/
+# from here, as Let's Encrypt asks it, and says whether that goes through
+# Cloudflare to Caddy: the way Caddy renews its certificate there.
+#
+# setup-server.sh sources it with AISHIE_FRONT_PROXY_LIB=1, which defines the
+# functions and runs nothing, and writes the settings (fp_write) before it
+# checks Caddy's configuration; tests/aishie-front-proxy_test.sh sources it
+# too. The variables that move the paths are for the tests.
+set -eu
+umask 077
+
+ETC=${AISHIE_ETC:-/etc/aishie}
+STATE=${AISHIE_STATE:-/var/lib/aishie}
+APP=${AISHIE_APP:-/opt/aishie}
+# Where Cloudflare lists its addresses: /ips-v4 and /ips-v6.
+FP_CF_URL=https://www.cloudflare.com
+# A list longer than this is not Cloudflare's (it has 22 ranges in all).
+FP_MAX_RANGES=200
+
+# compose.yaml reads these from aishie.env and images.env, and the same
+# names in this process's environment would win over both files.
+unset HOST ENVIRONMENT CORE_IMAGE RUNTIME_IMAGE WEB_IMAGE CORE_REF RUNTIME_REF WEB_REF \
+  AISHIE_SUBNET AISHIE_CADDY_IP RUNTIME_STOP_GRACE FRAME_ANCESTORS
+export AISHIE_ETC="$ETC" AISHIE_STATE="$STATE"
+
+fp_proxy='' fp_only='' fp_list='' fp_source='' fp_why='' fp_changed=''
+
+fp_die() { echo "aishie front-proxy: $*" >&2; exit 1; }
+fp_say() { echo "aishie front-proxy: $*"; }
+fp_compose() { docker compose --project-directory "$APP" -f "$APP/compose.yaml" "$@"; }
+fp_dir() { echo "$APP/caddy/front-proxy"; }
+# fp_setting NAME: its last value in aishie.env, without quotes around it.
+fp_setting() {
+  sed -n "s/^$1=//p" "$ETC/aishie.env" 2>/dev/null | tr -d '\r' | tail -n 1 |
+    sed "s/^'\(.*\)'\$/\1/; s/^\"\(.*\)\"\$/\1/"
+}
+
+# fp_settings: FRONT_PROXY and FRONT_PROXY_ONLY from aishie.env, in fp_proxy
+# and fp_only (yes or nothing); false, with fp_why, for a value that means
+# nothing here.
+fp_settings() {
+  fp_proxy=$(fp_setting FRONT_PROXY)
+  fp_only=$(fp_setting FRONT_PROXY_ONLY)
+  case $fp_proxy in
+    '' | cloudflare) ;;
+    *)
+      fp_why="FRONT_PROXY=$fp_proxy in $ETC/aishie.env: the front proxy known here is cloudflare (unset for none)"
+      return 1
+      ;;
+  esac
+  case $fp_only in
+    '' | no) fp_only='' ;;
+    yes)
+      if [ -z "$fp_proxy" ]; then
+        fp_why="FRONT_PROXY_ONLY=yes in $ETC/aishie.env, with no FRONT_PROXY: it would refuse everyone"
+        return 1
+      fi
+      ;;
+    *)
+      fp_why="FRONT_PROXY_ONLY=$fp_only in $ETC/aishie.env: yes, or no (unset is no)"
+      return 1
+      ;;
+  esac
+}
+
+# fp_check_ranges: a list of Cloudflare's address ranges on standard input,
+# one to a line, as its two lists give them (# starts a comment); printed
+# again, IPv4's first, when it is whole: every line a range, no IPv4 one
+# wider than a /8 nor IPv6 one than a /16, both families there, and no more
+# than FP_MAX_RANGES. Else, false, and why on standard output. In awk
+# without interval expressions, which mawk, Ubuntu's, has not always taken.
+fp_check_ranges() {
+  tr -d '\r' | awk -v max="$FP_MAX_RANGES" '
+    function v4(s,   p, a, i) {
+      if (split(s, p, "/") != 2 || p[2] !~ /^[0-9]+$/ || p[2] + 0 < 8 || p[2] + 0 > 32) return 0
+      if (split(p[1], a, ".") != 4) return 0
+      for (i = 1; i <= 4; i++) if (a[i] !~ /^[0-9]+$/ || length(a[i]) > 3 || a[i] + 0 > 255) return 0
+      return 1
+    }
+    function v6(s,   p, g, k, i, dbl, x) {
+      if (split(s, p, "/") != 2 || p[2] !~ /^[0-9]+$/ || p[2] + 0 < 16 || p[2] + 0 > 128) return 0
+      if (p[1] !~ /^[0-9a-f:]+$/ || p[1] !~ /:/) return 0
+      x = p[1]
+      dbl = gsub(/::/, "", x)
+      if (dbl > 1) return 0
+      k = split(p[1], g, ":")
+      if (k > 8 || (dbl == 0 && k != 8)) return 0
+      for (i = 1; i <= k; i++) if (length(g[i]) > 4) return 0
+      return 1
+    }
+    { sub(/^[ \t]+/, ""); sub(/[ \t]+$/, ""); $0 = tolower($0) }
+    /^#/ || $0 == "" { next }
+    v4($0) { four[++n4] = $0; next }
+    v6($0) { six[++n6] = $0; next }
+    bad == "" { bad = $0 }
+    END {
+      if (bad != "") { print "«" bad "» is not an address range"; exit 1 }
+      if (n4 + n6 > max) { print n4 + n6 " ranges, more than Cloudflare has"; exit 1 }
+      if (n4 == 0 || n6 == 0) { print "it has no " (n4 == 0 ? "IPv4" : "IPv6") " range"; exit 1 }
+      for (i = 1; i <= n4; i++) print four[i]
+      for (i = 1; i <= n6; i++) print six[i]
+    }'
+}
+
+# fp_fetch: Cloudflare's two lists, fetched now and checked, kept in
+# $STATE/cloudflare-ips with when they were fetched; false, with fp_why and
+# nothing changed, when either cannot be fetched or they are not whole.
+fp_fetch() {
+  fp_t=$STATE/cloudflare-ips.fetch
+  rm -f "$fp_t" "$fp_t".*
+  : > "$fp_t"
+  for fp_fam in v4 v6; do
+    if ! curl -fsS --proto =https --max-time 20 --retry 2 -o "$fp_t.$fp_fam" "$FP_CF_URL/ips-$fp_fam" 2>"$fp_t.err"; then
+      fp_why="could not fetch $FP_CF_URL/ips-$fp_fam ($(tail -n 1 "$fp_t.err" 2>/dev/null))"
+      rm -f "$fp_t" "$fp_t".*
+      return 1
+    fi
+    # Cloudflare's lists end with no newline.
+    { cat "$fp_t.$fp_fam"; echo; } >> "$fp_t"
+  done
+  if ! fp_check_ranges < "$fp_t" > "$fp_t.ok"; then
+    fp_why="fetched from $FP_CF_URL a list that is not whole: $(cat "$fp_t.ok")"
+    rm -f "$fp_t" "$fp_t".*
+    return 1
+  fi
+  { echo "# Cloudflare's addresses, fetched from $FP_CF_URL/ips-v4 and /ips-v6 at $(date -u +%Y-%m-%dT%H:%M:%SZ) by aishie front-proxy"; cat "$fp_t.ok"; } > "$STATE/cloudflare-ips.new"
+  mv "$STATE/cloudflare-ips.new" "$STATE/cloudflare-ips"
+  rm -f "$fp_t" "$fp_t".*
+}
+
+# fp_ranges: Cloudflare's addresses in fp_list, one to a line, and where they
+# came from in fp_source: fetched now, else the last list fetched, else the
+# list pinned in this repository.
+fp_ranges() {
+  if fp_fetch; then
+    fp_list=$(fp_check_ranges < "$STATE/cloudflare-ips")
+    fp_source="fetched from www.cloudflare.com now"
+    return 0
+  fi
+  if [ -s "$STATE/cloudflare-ips" ] && fp_list=$(fp_check_ranges < "$STATE/cloudflare-ips"); then
+    fp_when=$(sed -n '1s/.* at \([^ ]*\) by aishie front-proxy$/\1/p' "$STATE/cloudflare-ips")
+    fp_source="the last list fetched, ${fp_when:+at $fp_when, }kept, as this time it $fp_why"
+    return 0
+  fi
+  if fp_list=$(fp_check_ranges < "$APP/caddy/cloudflare-ips"); then
+    fp_source="the list pinned in $APP/caddy/cloudflare-ips, as none was fetched before and this time it $fp_why"
+    return 0
+  fi
+  fp_why="no list of Cloudflare's addresses: this time it $fp_why, none was fetched before, and $APP/caddy/cloudflare-ips is not whole either ($fp_list)"
+  return 1
+}
+
+# The two files the Caddyfile imports: the global options (servers) and
+# the site's first route. With nothing in front,
+# they are the copies in this repository, comments alone.
+fp_global() {
+  cat <<'EOF'
+# Caddy's global options for what stands in front of this server, which
+# aishie front-proxy writes from FRONT_PROXY in /etc/aishie/aishie.env, and
+# the Caddyfile imports: edit aishie.env, not this (README.md, Behind
+# Cloudflare).
+EOF
+  if [ -z "$fp_proxy" ]; then
+    cat <<'EOF'
+#
+# FRONT_PROXY is not set: nothing stands in front, and Caddy takes a
+# client's address from the connection.
+EOF
+    return 0
+  fi
+  cat <<'EOF'
+#
+# FRONT_PROXY=cloudflare: a connection from one of Cloudflare's addresses
+# says who the visitor is, in CF-Connecting-IP, or else in the last address
+# of X-Forwarded-For that is not Cloudflare's; anyone else's connection is
+# its own client. The Caddyfile gives Core and the runtime that address in
+# X-Forwarded-For.
+servers {
+EOF
+  printf '\ttrusted_proxies static %s\n' "$(printf '%s\n' "$fp_list" | tr '\n' ' ' | sed 's/ *$//')"
+  cat <<'EOF'
+	trusted_proxies_strict
+	client_ip_headers CF-Connecting-IP X-Forwarded-For
+}
+EOF
+}
+fp_site() {
+  cat <<'EOF'
+# Caddy's first route for this server's name, for what stands in front of
+# it, which aishie front-proxy writes from FRONT_PROXY_ONLY in
+# /etc/aishie/aishie.env, and the Caddyfile imports: edit aishie.env, not
+# this (README.md, Behind Cloudflare).
+EOF
+  if [ -z "$fp_only" ]; then
+    cat <<'EOF'
+#
+# FRONT_PROXY_ONLY is not yes: a request is taken wherever it comes from.
+EOF
+    return 0
+  fi
+  cat <<'EOF'
+#
+# FRONT_PROXY_ONLY=yes: a request that comes from neither Cloudflare's
+# addresses nor a private one (the stack's own network, where the runtime
+# reaches Core through Caddy, and Docker's proxy for this server's own
+# connections) is refused.
+EOF
+  printf '@not_from_front_proxy not remote_ip %s private_ranges\n' "$(printf '%s\n' "$fp_list" | tr '\n' ' ' | sed 's/ *$//')"
+  cat <<'EOF'
+handle @not_from_front_proxy {
+	respond "This server is reached through Cloudflare alone." 403
+}
+EOF
+}
+
+# fp_write: the two files, from aishie.env, in place of the ones there, each
+# whole or not at all; fp_changed when either is another than it was. False,
+# with fp_why and nothing written, for a setting that means nothing, or with
+# no list of Cloudflare's addresses at all. Says what Caddy is told.
+fp_write() {
+  fp_changed=''
+  fp_settings || return 1
+  if [ -n "$fp_proxy" ]; then fp_ranges || return 1; fi
+  fp_d=$(fp_dir)
+  install -d -m 755 "$fp_d"
+  fp_global > "$fp_d/global.caddy.new"
+  fp_site > "$fp_d/site.caddy.new"
+  for fp_f in global site; do
+    if cmp -s "$fp_d/$fp_f.caddy.new" "$fp_d/$fp_f.caddy"; then
+      rm -f "$fp_d/$fp_f.caddy.new"
+    else
+      chmod 644 "$fp_d/$fp_f.caddy.new"
+      mv "$fp_d/$fp_f.caddy.new" "$fp_d/$fp_f.caddy"
+      fp_changed=1
+    fi
+  done
+  if [ -z "$fp_proxy" ]; then
+    fp_say "FRONT_PROXY is not set: Caddy takes a client's address from the connection"
+    return 0
+  fi
+  fp_n=$(printf '%s\n' "$fp_list" | wc -l | tr -d ' ')
+  fp_say "FRONT_PROXY=cloudflare: Caddy takes a visitor's address from CF-Connecting-IP on connections from Cloudflare's $fp_n ranges: $fp_source"
+  if [ -n "$fp_only" ]; then
+    fp_say "FRONT_PROXY_ONLY=yes: a request from anywhere else but a private address is refused (403)"
+  else
+    fp_say "FRONT_PROXY_ONLY is not yes: a request from anywhere else is taken too, its connection's address as its client's"
+  fi
+}
+
+# fp_keep, fp_restore, fp_forget: the two files as they were before a
+# write, kept beside them (the Caddyfile imports neither copy), put back, or
+# removed.
+fp_keep() {
+  fp_d=$(fp_dir)
+  for fp_f in global site; do
+    rm -f "$fp_d/$fp_f.caddy.before"
+    if [ -e "$fp_d/$fp_f.caddy" ]; then cp -p "$fp_d/$fp_f.caddy" "$fp_d/$fp_f.caddy.before"; fi
+  done
+}
+fp_restore() {
+  fp_d=$(fp_dir)
+  for fp_f in global site; do
+    if [ -e "$fp_d/$fp_f.caddy.before" ]; then mv "$fp_d/$fp_f.caddy.before" "$fp_d/$fp_f.caddy"; fi
+  done
+}
+fp_forget() { fp_d=$(fp_dir); rm -f "$fp_d/global.caddy.before" "$fp_d/site.caddy.before"; }
+
+# fp_reload: Caddy, if it runs, made to read them; one it refuses puts the
+# files back, and Caddy goes on with what it had.
+fp_reload() {
+  if [ -z "$(fp_compose ps -q caddy 2>/dev/null)" ]; then
+    fp_say "Caddy is not running: it reads them when it starts"
+    return 0
+  fi
+  if fp_compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >"$STATE/front-proxy.err" 2>&1; then
+    rm -f "$STATE/front-proxy.err"
+    fp_say "Caddy reloaded with them"
+    return 0
+  fi
+  cat "$STATE/front-proxy.err" >&2
+  rm -f "$STATE/front-proxy.err"
+  fp_restore
+  fp_die "Caddy refused them (above): $(fp_dir) is put back as it was, and Caddy goes on as before"
+}
+
+# fp_probe: http://HOST/.well-known/acme-challenge/, asked from here as Let's
+# Encrypt asks it for an HTTP-01 challenge, and what answered: Cloudflare
+# (cf-ray) passing it to Caddy, whose answer to a challenge it is not
+# solving is its redirect to HTTPS (308), or Cloudflare itself. Said, and
+# never a failure of the run: it is the dashboard's to fix.
+fp_probe() {
+  fp_host=$(fp_setting HOST)
+  [ -n "$fp_host" ] || return 0
+  fp_url=http://$fp_host/.well-known/acme-challenge/aishie-front-proxy-check
+  if ! curl -sS --max-time 15 -o /dev/null -D "$STATE/front-proxy.head" "$fp_url" 2>"$STATE/front-proxy.err"; then
+    echo "warning: could not ask $fp_url from this server ($(tail -n 1 "$STATE/front-proxy.err" 2>/dev/null)): whether Let's Encrypt reaches Caddy through Cloudflare is not known" >&2
+    rm -f "$STATE/front-proxy.head" "$STATE/front-proxy.err"
+    return 0
+  fi
+  fp_status=$(tr -d '\r' < "$STATE/front-proxy.head" | awk 'NR == 1 { print $2 }')
+  fp_ray=$(tr -d '\r' < "$STATE/front-proxy.head" | awk 'tolower($0) ~ /^cf-ray:/ { sub(/^[^:]*:[ \t]*/, ""); print; exit }')
+  rm -f "$STATE/front-proxy.head" "$STATE/front-proxy.err"
+  if [ -z "$fp_ray" ]; then
+    fp_say "$fp_url is answered without Cloudflare (no cf-ray): the DNS record of $fp_host is not proxied, as this server sees it, and people reach this server's own address"
+    if [ -n "$fp_only" ]; then
+      echo "warning: FRONT_PROXY_ONLY=yes refuses the people who reach this server's own address: proxy the record first (README.md, Behind Cloudflare)" >&2
+    fi
+    return 0
+  fi
+  case $fp_status in
+    308)
+      fp_say "$fp_url goes through Cloudflare (cf-ray $fp_ray) to Caddy, which answers it (308): Let's Encrypt's HTTP-01 challenges reach Caddy, which renews its certificate so"
+      ;;
+    301 | 302 | 303 | 307)
+      echo "warning: Cloudflare (cf-ray $fp_ray) redirects $fp_url itself ($fp_status): Always Use HTTPS, or a redirect rule. Caddy renews its certificate through that only while the one it has is valid; one that has lapsed, or a new server's, is not issued. Turn Always Use HTTPS off, or keep /.well-known/acme-challenge/ out of the redirect (README.md, Behind Cloudflare)" >&2
+      ;;
+    *)
+      echo "warning: Cloudflare (cf-ray $fp_ray) answers $fp_url with ${fp_status:-nothing}: Let's Encrypt's HTTP-01 challenges do not reach Caddy, which cannot renew its certificate. Under Attack mode, a challenge, or a WAF or IP rule may be stopping them, or this server does not answer Cloudflare (README.md, Behind Cloudflare)" >&2
+      ;;
+  esac
+}
+
+fp_main() {
+  case $# in
+    0) ;;
+    *)
+      echo "usage: aishie front-proxy    FRONT_PROXY and FRONT_PROXY_ONLY in $ETC/aishie.env applied (README.md, Behind Cloudflare)" >&2
+      exit 2
+      ;;
+  esac
+  [ "$(id -u)" = 0 ] || fp_die "run this as root (sudo -i)"
+  [ -r "$ETC/aishie.env" ] || fp_die "$ETC/aishie.env is missing: set the server up with setup-server.sh (README.md)"
+  mkdir -p "$STATE"
+  fp_keep
+  if ! fp_write; then
+    fp_forget
+    fp_die "$fp_why: nothing was changed"
+  fi
+  if [ -n "$fp_changed" ]; then
+    fp_reload
+  else
+    fp_say "Caddy has these settings already: nothing changed"
+  fi
+  fp_forget
+  if [ -n "$fp_proxy" ]; then fp_probe; fi
+}
+
+if [ -z "${AISHIE_FRONT_PROXY_LIB:-}" ]; then fp_main "$@"; fi

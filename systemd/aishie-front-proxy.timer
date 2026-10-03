@@ -1,0 +1,15 @@
+# aishie front-proxy every week, at a time moved by up to six hours so that
+# servers do not all ask Cloudflare at once; one missed while the server was
+# off happens at boot. Cloudflare's addresses change seldom: a week behind
+# misses little, and a list fetched is kept until a whole one replaces it.
+[Unit]
+Description=AIshie:Cloudflare's addresses for Caddy, fetched again every week
+Documentation=https://github.com/AIShie-Education/AIShie-Deploy
+
+[Timer]
+OnCalendar=weekly
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

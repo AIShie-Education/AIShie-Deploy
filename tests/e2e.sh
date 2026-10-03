@@ -27,6 +27,7 @@ name=${E2E_HOST:-aishie.internal}
 REGISTRY=${AISHIE_REGISTRY:-ghcr.io/aishie-education}
 ETC=${AISHIE_ETC:-/etc/aishie}
 STATE=${AISHIE_STATE:-/var/lib/aishie}
+APP=${AISHIE_APP:-/opt/aishie}
 BIN=${AISHIE_BIN:-/usr/local/bin}
 BACKUPS=${AISHIE_BACKUPS:-/var/backups/aishie}
 LOG_FILE=${AISHIE_LOG_FILE:-/var/log/aishie-update.log}
@@ -336,6 +337,39 @@ else
   check "... so setup-server.sh wrote no credential, and said what is left" \
     is "$([ -e "$cred" ] && echo written) $(grep -c '^     aishie runtime-credential$' "$work/setup.out")" " 1"
 fi
+
+# Behind Cloudflare, on this machine's Caddy: FRONT_PROXY=cloudflare and
+# FRONT_PROXY_ONLY=yes, applied by aishie front-proxy with Cloudflare's
+# addresses as it fetches them (or as this copy pins them), which Caddy
+# takes in place, by a reload: it then believes Cloudflare's addresses alone
+# about the visitor's, and the site still answers this machine (through
+# Docker's proxy, from a private address) and the runtime (from the stack's
+# own network). Then nothing in front again, as before. The name is neither
+# public nor proxied: what is said of its challenge path is not checked.
+echo "# behind Cloudflare"
+cp "$ETC/aishie.env" "$work/aishie.env"
+printf 'FRONT_PROXY=cloudflare\nFRONT_PROXY_ONLY=yes\n' >> "$ETC/aishie.env"
+aishie front-proxy > "$work/front-proxy.out" 2>&1 || { cat "$work/front-proxy.out" >&2; fail "aishie front-proxy, behind Cloudflare"; }
+check "aishie front-proxy has Caddy reload with Cloudflare's addresses" grep -q "Caddy reloaded with them" "$work/front-proxy.out"
+# Caddy's admin endpoint, localhost:2019, listens on 127.0.0.1 alone; the
+# image's busybox wget may take localhost for ::1, and tries no other. What
+# wget says, if it fails, is in the log above the check.
+live=$(aishie compose exec -T caddy wget -qO- http://127.0.0.1:2019/config/apps/http/servers/srv0) || live=
+check "... which Caddy runs with: Cloudflare's ranges trusted, strictly, the visitor's address from CF-Connecting-IP" \
+  is "$(jq -c '[(.trusted_proxies.ranges | length > 10), .trusted_proxies_strict, .client_ip_headers]' <<< "${live:-null}" 2>&1)" '[true,1,["CF-Connecting-IP","X-Forwarded-For"]]'
+get front-proxy-healthz "https://$name/healthz"
+check "... and the site still answers this machine, through Docker's proxy (FRONT_PROXY_ONLY=yes)" is "$status $(json .status)" "200 ok"
+# The runtime as it runs now: aishie runtime-credential recreated it.
+runtime=$(aishie ps -q runtime)
+seen=$(docker run --rm --pull never --network "container:$runtime" -v "$work/root.crt:/ca.crt:ro" "$CURL_IMAGE" \
+  -sS --noproxy '*' --max-time 10 --cacert /ca.crt -o /dev/null -w '%{http_code}' "https://$name/healthz" 2>&1) || true
+check "... and the runtime, from the stack's own network" is "$seen" 200
+cp "$work/aishie.env" "$ETC/aishie.env"
+aishie front-proxy > "$work/front-proxy.out" 2>&1 || { cat "$work/front-proxy.out" >&2; fail "aishie front-proxy, with nothing in front again"; }
+check "with nothing in front again, Caddy's front-proxy/ is this copy's, and Caddy reloaded with it" \
+  is "$(cmp -s "$APP/caddy/front-proxy/global.caddy" "$root/caddy/front-proxy/global.caddy" && cmp -s "$APP/caddy/front-proxy/site.caddy" "$root/caddy/front-proxy/site.caddy" && echo same) $(grep -c 'Caddy reloaded with them' "$work/front-proxy.out")" "same 1"
+get front-proxy-healthz "https://$name/healthz"
+check "... and the site answers" is "$status" 200
 
 # Nothing new on the channels: a second run does nothing, and neither does
 # `docker compose up -d`, as after a reboot: what runs is pinned by digest.

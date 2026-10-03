@@ -6,16 +6,36 @@
 #
 # Its admin endpoint stays on localhost inside Caddy's own container, where
 # `caddy reload` reaches it and nothing else does.
+#
+# What stands in front of this server, if anything (FRONT_PROXY in
+# aishie.env: Cloudflare, README.md, Behind Cloudflare), is in the two files
+# of front-proxy/, which `aishie front-proxy` writes from aishie.env: whose
+# connections Caddy believes about the client's address, and, with
+# FRONT_PROXY_ONLY, a first route that refuses the rest. With nothing in
+# front, they are comments alone.
+{
+	import front-proxy/global.caddy
+}
 
 {$HOST} {
+	import front-proxy/site.caddy
+
 	# AIshie Core: the API, the MCP endpoint and the health check. Not
 	# compressed: the MCP endpoint streams. And the documents an MCP client
 	# looks for before it signs in with OAuth: Core answers them, today with
 	# a JSON 404 (it has no OAuth), where the web would answer its page with
 	# 200 and a client would take that for an authorization server.
+	#
+	# Each proxy below gives X-Forwarded-For as the one address Caddy takes
+	# the client to be ({client_ip}): the connection's, or, from the front
+	# proxy, the visitor's it names. Core and the runtime believe Caddy
+	# alone, and take the last address there: by default Caddy would append
+	# the front proxy's own after the visitor's.
 	@core path /v1/* /mcp /mcp/* /healthz /.well-known/oauth-protected-resource /.well-known/oauth-protected-resource/* /.well-known/oauth-authorization-server /.well-known/oauth-authorization-server/* /.well-known/openid-configuration
 	handle @core {
-		reverse_proxy core:8080
+		reverse_proxy core:8080 {
+			header_up X-Forwarded-For {client_ip}
+		}
 	}
 
 	# The runtime's API for the front end, on its API_ADDR (9091), and only
@@ -25,12 +45,16 @@
 	# is a runtime that is not running (README.md, The runtime's API).
 	handle /runtime/api/* {
 		request_header -Cookie
-		reverse_proxy runtime:9091
+		reverse_proxy runtime:9091 {
+			header_up X-Forwarded-For {client_ip}
+		}
 	}
 
 	# Everything else is the web front end, which sets its own caching and
 	# compression, and answers every path that is not a file with the app.
 	handle {
-		reverse_proxy web:8080
+		reverse_proxy web:8080 {
+			header_up X-Forwarded-For {client_ip}
+		}
 	}
 }

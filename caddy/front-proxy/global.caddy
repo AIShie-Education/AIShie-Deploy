@@ -1,0 +1,7 @@
+# Caddy's global options for what stands in front of this server, which
+# aishie front-proxy writes from FRONT_PROXY in /etc/aishie/aishie.env, and
+# the Caddyfile imports: edit aishie.env, not this (README.md, Behind
+# Cloudflare).
+#
+# FRONT_PROXY is not set: nothing stands in front, and Caddy takes a
+# client's address from the connection.
