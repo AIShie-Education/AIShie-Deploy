@@ -350,8 +350,9 @@ challenge path; Cloudflare's error pages name the error by its number.
   over IPv6, through Docker's proxy: give the name no AAAA record.
 - **403, "This server is reached through Cloudflare alone."** The request
   did not come through Cloudflare, and `FRONT_PROXY_ONLY=yes` refuses it:
-  the name not proxied (yet), or someone reaching the server's address
-  directly.
+  the name not proxied (yet), or set back to DNS only before
+  `FRONT_PROXY_ONLY` was taken out (README.md, Behind Cloudflare, Going
+  back), or someone reaching the server's address directly.
 - **`could not fetch https://www.cloudflare.com/ips-v4`** (from `aishie
   front-proxy`, or its timer in `journalctl -u aishie-front-proxy`). The
   last list fetched stays in force, as it says, or the list pinned in this

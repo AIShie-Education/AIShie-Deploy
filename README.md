@@ -1389,10 +1389,27 @@ for Cloudflare.
 
 ### Going back
 
-To reach the server directly again: the record set to DNS only (the grey
-cloud), `FRONT_PROXY_ONLY` and `FRONT_PROXY` taken out of `aishie.env`, and
-`aishie front-proxy`. The certificate is Let's Encrypt's, which browsers
-trust either way.
+To reach the server directly again, in this order, so that nobody is
+refused on the way:
+
+1. `FRONT_PROXY_ONLY`, if it is set, taken out of `aishie.env`, and
+   `aishie front-proxy`. Cloudflare still carries every request; the server
+   now takes the others too.
+2. In Cloudflare's dashboard, the record set to DNS only (the grey cloud).
+   Done before step 1, it has everyone whose resolver then gives them the
+   server's own address refused, 403, until `aishie front-proxy` is run.
+3. `FRONT_PROXY` kept for five minutes at least. Resolvers may keep
+   Cloudflare's addresses for the name that long (300 seconds, the TTL
+   Cloudflare gives a proxied record), and the people they answer still
+   come through Cloudflare. Without `FRONT_PROXY`, Caddy would take
+   Cloudflare's address for theirs, and Core would count their sign-in
+   attempts, and the runtime's API audit and limit them, by Cloudflare's
+   few addresses. Then take it out and run `aishie front-proxy`, or leave
+   it in: Caddy believes connections from Cloudflare's addresses alone, so
+   a visitor who reaches the server directly is their own client either
+   way.
+
+The certificate is Let's Encrypt's, which browsers trust either way.
 
 ## The runtime's API
 
