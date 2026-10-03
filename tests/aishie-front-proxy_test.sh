@@ -73,7 +73,11 @@ fetches() { grep -c 'https://www.cloudflare.com/ips-v' "$CALLS" || true; }
 dir() { echo "$AISHIE_APP/caddy/front-proxy"; }
 # trusted: the ranges global.caddy has Caddy trust, one to a line.
 trusted() { sed -n $'s/^\ttrusted_proxies static //p' "$(dir)/global.caddy" | tr ' ' '\n'; }
-sums() { (cd "$(dir)" && sha256sum global.caddy site.caddy) && sha256sum "$AISHIE_STATE/cloudflare-ips" 2>/dev/null || true; }
+# sums: the two files' sums, and the list kept's, if there is one.
+sums() {
+  (cd "$(dir)" && sha256sum global.caddy site.caddy) || true
+  sha256sum "$AISHIE_STATE/cloudflare-ips" 2>/dev/null || true
+}
 is_repos() { cmp -s "$(dir)/$1.caddy" "$root/caddy/front-proxy/$1.caddy"; }
 # both_repos: both files are this copy's, as with nothing in front.
 both_repos() { is_repos global && is_repos site; }
@@ -306,7 +310,7 @@ if NOT_ROOT=1000 fp; then fail "ran as a user"; fi
 said "run this as root" || fail "said: $(cat "$FAKE/out")"
 if fp now; then fail "took an argument"; fi
 said "usage: aishie front-proxy" || fail "said: $(cat "$FAKE/out")"
-[ "$(sums)" = "$before" ] && [ ! -s "$CALLS" ] || fail "did something"
+if [ "$(sums)" != "$before" ] || [ -s "$CALLS" ]; then fail "did something"; fi
 
 # The weekly timer runs it through aishie, after Docker.
 grep -qx 'ExecStart=/usr/local/bin/aishie front-proxy' "$root/systemd/aishie-front-proxy.service" || fail "the service does not run aishie front-proxy"
