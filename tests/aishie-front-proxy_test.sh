@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # aishie front-proxy (bin/aishie-front-proxy) against the stand-ins of
 # tests/fakes.sh: Cloudflare's two lists of its addresses, and what answers
-# http://HOST/.well-known/acme-challenge/, played by curl; Caddy, its reload
-# included, by docker. Its pure parts are sourced with
+# http://HOST/.well-known/acme-challenge/, played by curl; HOST's address in
+# public DNS by dig, resolvectl and curl, and this server's /etc/hosts,
+# which names HOST 127.0.1.1 as Ubuntu's does; Caddy, its reload included,
+# by docker. Its pure parts are sourced with
 # AISHIE_FRONT_PROXY_LIB=1, in sh as the server runs them; the rest runs
 # whole, through aishie, as root (id played below) and its weekly timer run
 # it. No network is reached. tests/config.sh has Caddy read what it writes.
@@ -30,12 +32,19 @@ fail() { echo "FAIL aishie-front-proxy $case: $*" >&2; failed=1; }
 # the pinned one.
 PINNED=$(grep -v '^#' "$root/caddy/cloudflare-ips")
 NEW4=198.51.100.0/24
+# An address of Cloudflare's, in 104.16.0.0/13, as it gives a proxied name;
+# and one that is not, this server's own, as an unproxied name has it.
+CF_ADDR=104.21.32.1
+OWN_ADDR=203.0.113.10
 
 # setup CASE [SETTING...]: a server set up with this copy (its Caddyfile, and
 # Caddy's front-proxy/ as setup-server.sh installs it), aishie.env saying
 # HOST and the settings given, Caddy running, and Cloudflare listing the
 # pinned addresses and NEW4, each list with no newline at its end, as
-# Cloudflare serves them.
+# Cloudflare serves them. HOST is proxied: public DNS gives it two of
+# Cloudflare's addresses; and /etc/hosts names it as Ubuntu's does, this
+# server itself at 127.0.1.1, where Caddy answers with no Cloudflare in
+# front.
 setup() {
   case=$1
   shift
@@ -43,13 +52,21 @@ setup() {
   mkdir -p "$FAKE/etc" "$FAKE/state" "$FAKE/app/caddy/front-proxy" "$FAKE/running" "$FAKE/cloudflare"
   : > "$CALLS"
   export AISHIE_ETC=$FAKE/etc AISHIE_STATE=$FAKE/state AISHIE_APP=$FAKE/app
-  unset CF_DOWN CF_STATUS CF_EDGE CADDY_RELOAD_FAIL NOT_ROOT
+  unset CF_DOWN CF_STATUS CF_EDGE CADDY_RELOAD_FAIL NOT_ROOT NO_DIG DNS_BLOCKED NO_RESOLVED DOH_DOWN
   cp "$root/caddy/Caddyfile" "$root/caddy/cloudflare-ips" "$FAKE/app/caddy/"
   install -m 644 "$root"/caddy/front-proxy/*.caddy "$FAKE/app/caddy/front-proxy/"
   printf 'HOST=test.aishie.app\nENVIRONMENT=edge\n' > "$FAKE/etc/aishie.env"
   for s in "$@"; do echo "$s" >> "$FAKE/etc/aishie.env"; done
   touch "$FAKE/running/caddy"
   lists "$NEW4"
+  printf '127.0.0.1 localhost\n127.0.1.1 test.aishie.app test\n' > "$FAKE/hosts"
+  record "$CF_ADDR" 172.67.155.1
+}
+# record [ADDRESS...]: HOST's A records in public DNS from now on (none,
+# with no ADDRESS).
+record() {
+  mkdir -p "$FAKE/dns"
+  printf '%s\n' "$@" | sed '/^$/d' > "$FAKE/dns/test.aishie.app"
 }
 # lists [EXTRA4]: what Cloudflare lists from now on: the pinned addresses,
 # and EXTRA4 after its IPv4 ones.
@@ -67,6 +84,11 @@ fp() { PATH="$work/bin:$PATH" "$root/bin/aishie" front-proxy "$@" > "$FAKE/out" 
 # lib FUNCTION ARGS...: one of its functions, in sh.
 lib() { PATH="$work/bin:$PATH" AISHIE_FRONT_PROXY_LIB=1 sh -c '. "$0"; "$@"' "$root/bin/aishie-front-proxy" "$@"; }
 called() { grep -q -- "$1" "$CALLS"; }
+# cloudflares ADDRESS: true when the pinned list holds it, in sh.
+cloudflares() {
+  AISHIE_FRONT_PROXY_LIB=1 sh -c '. "$0"; fp_list=$(fp_check_ranges < "$1"); fp_cloudflare "$2"' \
+    "$root/bin/aishie-front-proxy" "$root/caddy/cloudflare-ips" "$1"
+}
 said() { grep -q -- "$1" "$FAKE/out"; }
 reloads() { grep -c 'exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile$' "$CALLS" || true; }
 fetches() { grep -c 'https://www.cloudflare.com/ips-v' "$CALLS" || true; }
@@ -118,7 +140,9 @@ said "Caddy has these settings already: nothing changed" || fail "said: $(cat "$
 # CF-Connecting-IP (else X-Forwarded-For, from the right), and nothing else
 # changes; requests from anywhere are still taken; Caddy
 # reloaded once; and the challenge path asked from here, which Cloudflare
-# passes to Caddy.
+# passes to Caddy: at the address public DNS gives HOST, Cloudflare's, as
+# Let's Encrypt asks it, not at 127.0.1.1, where this server's own lookup
+# finds HOST in /etc/hosts and Caddy answers with no Cloudflare in front.
 setup cloudflare FRONT_PROXY=cloudflare
 fp || fail "exit $?: $(cat "$FAKE/out")"
 [ "$(trusted)" = "$(grep -F . <<< "$PINNED"; echo "$NEW4"; grep -F : <<< "$PINNED")" ] || fail "Caddy trusts $(trusted | tr '\n' ' ')"
@@ -140,8 +164,12 @@ grep -q "^# Cloudflare's addresses, fetched from https://www.cloudflare.com/ips-
 said "on connections from Cloudflare's 23 ranges: fetched from www.cloudflare.com now" || fail "said: $(cat "$FAKE/out")"
 said "FRONT_PROXY_ONLY is not yes: a request from anywhere else is taken too" || fail "said: $(cat "$FAKE/out")"
 said "Caddy reloaded with them" || fail "said: $(cat "$FAKE/out")"
-called "curl -sS --max-time 15 -o /dev/null -D .* http://test.aishie.app/.well-known/acme-challenge/aishie-front-proxy-check$" ||
-  fail "the challenge path not asked: $(grep acme "$CALLS")"
+called "^dig +short +time=5 +tries=2 A test.aishie.app @1.1.1.1$" || fail "public DNS not asked by dig at 1.1.1.1: $(grep -e '^dig' -e '^resolvectl' "$CALLS")"
+if grep '^dig ' "$CALLS" | grep -qv ' @'; then fail "dig asked systemd-resolved's stub, which answers from /etc/hosts"; fi
+said "the DNS record of test.aishie.app is proxied: public DNS (dig, at 1.1.1.1) gives $CF_ADDR, one of Cloudflare's addresses" || fail "said: $(cat "$FAKE/out")"
+called "curl -sS --max-time 15 --resolve test.aishie.app:80:$CF_ADDR -o /dev/null -D .* http://test.aishie.app/.well-known/acme-challenge/aishie-front-proxy-check$" ||
+  fail "the challenge path not asked at $CF_ADDR: $(grep acme "$CALLS")"
+if grep acme-challenge "$CALLS" | grep -qv -- "--resolve test.aishie.app:80:"; then fail "asked the challenge path where /etc/hosts sends it: $(grep acme "$CALLS")"; fi
 said "goes through Cloudflare (cf-ray 8c0ffee0a1b2c3d4-SIN) to Caddy, which answers it (308)" || fail "said: $(cat "$FAKE/out")"
 ! said "warning" || fail "warned: $(cat "$FAKE/out")"
 ! ls "$(dir)"/*.before "$AISHIE_STATE"/cloudflare-ips.* "$AISHIE_STATE"/front-proxy.* >/dev/null 2>&1 ||
@@ -281,9 +309,10 @@ fp || fail "exit $?: $(cat "$FAKE/out")"
 trusted | grep -qx "$NEW4" || fail "not written"
 said "Caddy is not running: it reads them when it starts" || fail "said: $(cat "$FAKE/out")"
 
-# What answers http://HOST/.well-known/acme-challenge/, as Let's Encrypt
-# asks it: each said, and never a failure of the run.
-for edge in 301 403 521 direct down; do
+# What answers http://HOST/.well-known/acme-challenge/, asked at the address
+# public DNS gives HOST, as Let's Encrypt asks it: each said, and never a
+# failure of the run.
+for edge in 301 403 521 no-ray down; do
   setup "challenge-$edge" FRONT_PROXY=cloudflare
   CF_EDGE=$edge fp || fail "exit $?: $(cat "$FAKE/out")"
   case $edge in
@@ -291,17 +320,88 @@ for edge in 301 403 521 direct down; do
       fail "said: $(cat "$FAKE/out")" ;;
     403 | 521) said "warning: Cloudflare (cf-ray 8c0ffee0a1b2c3d4-HKG) answers .* with $edge: Let's Encrypt's HTTP-01 challenges do not reach Caddy" ||
       fail "said: $(cat "$FAKE/out")" ;;
-    direct)
-      said "is answered without Cloudflare (no cf-ray): the DNS record of test.aishie.app is not proxied" || fail "said: $(cat "$FAKE/out")"
-      ! said "warning" || fail "warned: $(cat "$FAKE/out")" ;;
-    down) said "warning: could not ask .* (curl: (7) Failed to connect" || fail "said: $(cat "$FAKE/out")" ;;
+    no-ray) said "warning: http://test.aishie.app/.well-known/acme-challenge/aishie-front-proxy-check, asked at $CF_ADDR, is answered (200) without a cf-ray" ||
+      fail "said: $(cat "$FAKE/out")" ;;
+    down) said "warning: could not ask .* at $CF_ADDR from this server (curl: (7) Failed to connect" || fail "said: $(cat "$FAKE/out")" ;;
   esac
+  ! ls "$AISHIE_STATE"/front-proxy.* >/dev/null 2>&1 || fail "left $(ls "$AISHIE_STATE"/front-proxy.* 2>/dev/null)"
 done
-# ... with FRONT_PROXY_ONLY=yes and the record not proxied yet: the people
-# who reach this server's own address are refused, which is said.
+
+# The record not proxied: public DNS gives HOST this server's own address,
+# none of Cloudflare's, which is said; the challenge path, which Cloudflare
+# has no part in then, is not asked.
+setup challenge-direct FRONT_PROXY=cloudflare
+record "$OWN_ADDR"
+fp || fail "exit $?: $(cat "$FAKE/out")"
+said "the DNS record of test.aishie.app is not proxied: public DNS (dig, at 1.1.1.1) gives $OWN_ADDR, which is none of Cloudflare's addresses, and people reach this server's own address" ||
+  fail "said: $(cat "$FAKE/out")"
+! said "warning" || fail "warned: $(cat "$FAKE/out")"
+! called "acme-challenge" || fail "asked the challenge path of a name not proxied"
+# ... nor with one address of Cloudflare's and one not: Let's Encrypt may
+# take either.
+record "$CF_ADDR" "$OWN_ADDR"
+fp || fail "two addresses: exit $?: $(cat "$FAKE/out")"
+said "is not proxied: public DNS (dig, at 1.1.1.1) gives $OWN_ADDR, which is none of Cloudflare's" || fail "two addresses: said: $(cat "$FAKE/out")"
+# ... with FRONT_PROXY_ONLY=yes, the people who reach this server's own
+# address are refused, which is said.
 setup challenge-direct-only FRONT_PROXY=cloudflare FRONT_PROXY_ONLY=yes
-CF_EDGE=direct fp || fail "exit $?: $(cat "$FAKE/out")"
+record "$OWN_ADDR"
+fp || fail "exit $?: $(cat "$FAKE/out")"
 said "warning: FRONT_PROXY_ONLY=yes refuses the people who reach this server's own address: proxy the record first" || fail "said: $(cat "$FAKE/out")"
+
+# /etc/hosts decides nothing, either way: every case above has Ubuntu's,
+# naming HOST 127.0.1.1, and HOST is proxied as public DNS has it; nor does
+# one that names HOST at Cloudflare's address make a record proxied that
+# public DNS has at this server's own.
+setup hosts-cloudflare FRONT_PROXY=cloudflare
+printf '127.0.0.1 localhost\n%s test.aishie.app\n' "$CF_ADDR" > "$FAKE/hosts"
+record "$OWN_ADDR"
+fp || fail "exit $?: $(cat "$FAKE/out")"
+said "is not proxied: public DNS (dig, at 1.1.1.1) gives $OWN_ADDR" || fail "said: $(cat "$FAKE/out")"
+
+# How public DNS is asked, which is said: dig at 1.1.1.1, else at 8.8.8.8;
+# with no dig, resolvectl, past /etc/hosts and its cache, which asks the
+# server's DNS servers; with neither, Cloudflare's DNS over HTTPS, by curl.
+setup dns-8888 FRONT_PROXY=cloudflare
+DNS_BLOCKED=1.1.1.1 fp || fail "exit $?: $(cat "$FAKE/out")"
+said "is proxied: public DNS (dig, at 8.8.8.8) gives $CF_ADDR" || fail "said: $(cat "$FAKE/out")"
+said "goes through Cloudflare (cf-ray 8c0ffee0a1b2c3d4-SIN) to Caddy" || fail "said: $(cat "$FAKE/out")"
+setup dns-resolvectl FRONT_PROXY=cloudflare
+NO_DIG=1 fp || fail "exit $?: $(cat "$FAKE/out")"
+[ "$(grep -c '^dig ' "$CALLS")" = 1 ] || fail "dig asked again once it was not installed: $(grep '^dig ' "$CALLS")"
+called "^resolvectl --cache=no --synthesize=no --zone=no --legend=no -4 query test.aishie.app$" || fail "resolvectl not asked past /etc/hosts: $(grep resolvectl "$CALLS")"
+said "is proxied: public DNS (resolvectl, past /etc/hosts and its cache) gives $CF_ADDR" || fail "said: $(cat "$FAKE/out")"
+said "goes through Cloudflare (cf-ray 8c0ffee0a1b2c3d4-SIN) to Caddy" || fail "said: $(cat "$FAKE/out")"
+setup dns-doh FRONT_PROXY=cloudflare
+NO_DIG=1 NO_RESOLVED=1 fp || fail "exit $?: $(cat "$FAKE/out")"
+called "curl -fsS --proto =https .* https://cloudflare-dns.com/dns-query?name=test.aishie.app&type=A$" || fail "DNS over HTTPS not asked: $(grep dns-query "$CALLS")"
+said "is proxied: public DNS (curl, at cloudflare-dns.com/dns-query) gives $CF_ADDR" || fail "said: $(cat "$FAKE/out")"
+said "goes through Cloudflare (cf-ray 8c0ffee0a1b2c3d4-SIN) to Caddy" || fail "said: $(cat "$FAKE/out")"
+# ... none of them answers: said, with what each said, and the challenge
+# path not asked, as where is not known.
+setup dns-down FRONT_PROXY=cloudflare
+DNS_BLOCKED="1.1.1.1 8.8.8.8" NO_RESOLVED=1 DOH_DOWN=1 fp || fail "exit $?: $(cat "$FAKE/out")"
+said "warning: could not find the address of test.aishie.app in public DNS (dig, at 1.1.1.1: no servers could be reached; dig, at 8.8.8.8: no servers could be reached; resolvectl, past /etc/hosts and its cache: test.aishie.app: resolve call failed: Unit dbus-org.freedesktop.resolve1.service not found.; curl, at cloudflare-dns.com/dns-query: curl: (28) Failed to connect to cloudflare-dns.com port 443 after 15002 ms: Timeout was reached): whether Let's Encrypt reaches Caddy through Cloudflare is not known" ||
+  fail "said: $(cat "$FAKE/out")"
+! called "acme-challenge" || fail "asked the challenge path with no address"
+! ls "$AISHIE_STATE"/front-proxy.* >/dev/null 2>&1 || fail "left $(ls "$AISHIE_STATE"/front-proxy.* 2>/dev/null)"
+# ... or a name public DNS does not have.
+setup dns-nxdomain FRONT_PROXY=cloudflare
+record
+fp || fail "exit $?: $(cat "$FAKE/out")"
+said "warning: could not find the address of test.aishie.app in public DNS (dig, at 1.1.1.1: no IPv4 address; dig, at 8.8.8.8: no IPv4 address; resolvectl, past /etc/hosts and its cache: test.aishie.app: resolve call failed: 'test.aishie.app' not found; curl, at cloudflare-dns.com/dns-query: no IPv4 address)" ||
+  fail "said: $(cat "$FAKE/out")"
+! called "acme-challenge" || fail "asked the challenge path with no address"
+
+# An address is Cloudflare's when one of its IPv4 ranges holds it, the
+# first and last of a range included.
+case=cloudflare-address
+for a in 104.21.32.1 172.67.155.1 173.245.48.0 173.245.63.255 131.0.75.255 104.27.255.255 198.41.255.255; do
+  cloudflares "$a" || fail "$a is not taken for Cloudflare's"
+done
+for a in 127.0.1.1 203.0.113.10 173.245.64.0 173.245.47.255 131.0.76.0 104.15.255.255 104.28.0.0 8.8.8.8 0.0.0.0; do
+  if cloudflares "$a"; then fail "$a is taken for Cloudflare's"; fi
+done
 
 # Not root, or with arguments: nothing is done.
 setup not-root FRONT_PROXY=cloudflare

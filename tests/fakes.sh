@@ -1,8 +1,9 @@
 # shellcheck shell=bash
-# Stand-ins for the programs aishie-update, aishie and aishie-storage call,
-# for the tests: docker (and docker compose, and rclone's container), curl
-# (and an S3 service), flock, sleep and logger. Each records its command
-# line in $CALLS, and keeps what it plays in $FAKE:
+# Stand-ins for the programs aishie-update, aishie, aishie-storage and
+# aishie-front-proxy call, for the tests: docker (and docker compose, and
+# rclone's container), curl (and an S3 service, and Cloudflare), dig and
+# resolvectl, flock, sleep and logger. Each records its command line in
+# $CALLS, and keeps what it plays in $FAKE:
 #
 #   registry/tags          "REF HEX" lines: the image a tag names now, by
 #                          its digest's hex; the last line for a tag wins
@@ -40,6 +41,10 @@
 #   rclone.conf            the configuration rclone's container was last
 #                          given
 #
+#   cloudflare/ips-v4, -v6 Cloudflare's lists of its addresses
+#   dns/NAME               NAME's A records in public DNS, one to a line
+#   hosts                  this server's /etc/hosts
+#
 # Knobs, in the environment: PULL_FAIL, MIGRATE_FAIL, VERSION_FAIL (a
 # one-off `migrate version`, its report printed all the same), SEED_FAIL,
 # CHECK_FAIL, BACKUP_FAIL, POSTGRES_FAIL, CADDY_FAIL, COMPOSE_PULL_FAIL and
@@ -58,11 +63,23 @@
 # from before it; HELP_FAIL has its container not start. CADDY_RELOAD_FAIL
 # has Caddy refuse a `caddy reload`. Cloudflare serves its lists of addresses
 # from $FAKE/cloudflare/ips-v4 and ips-v6; CF_DOWN has it not answer, and
-# CF_STATUS answer with that status. CF_EDGE is what answers
-# http://HOST/.well-known/acme-challenge/: 308 (the default), Cloudflare
-# passing it to Caddy, which redirects it; another status, Cloudflare
-# answering it itself; direct, Caddy with no Cloudflare in front; down,
-# nothing.
+# CF_STATUS answer with that status.
+#
+# Names: $FAKE/dns/NAME holds NAME's A records in public DNS, one to a line,
+# which dig at a resolver, resolvectl with --synthesize=no and Cloudflare's
+# DNS over HTTPS (curl) answer; $FAKE/hosts is this server's /etc/hosts,
+# which its own lookup reads first: curl's by itself, dig's with no
+# @SERVER (systemd-resolved's stub), resolvectl's otherwise (fake-lookup).
+# NO_DIG has dig not installed (127, as the shell says for a command it
+# cannot find); DNS_BLOCKED, a list of resolvers, has dig get no reply from
+# those; NO_RESOLVED has resolvectl find no systemd-resolved; DOH_DOWN has
+# the DNS over HTTPS not answer. http://HOST/.well-known/acme-challenge/ is
+# asked at --resolve's address, else at the lookup's: one in 104.21.0.0/16
+# or 172.67.0.0/16 is Cloudflare's, and CF_EDGE is what it does: 308 (the
+# default), passing it to Caddy, which redirects it; another status,
+# answering it itself; no-ray, something that is not Cloudflare answering
+# 200 there; down, nothing. Any other address is this server's Caddy, which
+# redirects it (308), with no Cloudflare in front.
 
 # make_fakes DIR: the stand-ins, in DIR, to put first on PATH.
 make_fakes() {
@@ -312,9 +329,9 @@ if [[ " $* " == *" --aws-sigv4 "* ]]; then
 fi
 url=${*: -1}
 # Cloudflare's lists of its addresses, $FAKE/cloudflare/ips-v4 and ips-v6 as
-# it serves them, into the file -o names; and what answers
-# http://HOST/.well-known/acme-challenge/, its headers into the file -D
-# names, as CF_EDGE says (below).
+# it serves them, into the file -o names; its DNS over HTTPS, in JSON; and
+# what answers http://HOST/.well-known/acme-challenge/, its headers into the
+# file -D names, by the address it is asked at (above).
 args=("$@")
 arg() { local i; for ((i = 0; i < ${#args[@]} - 1; i++)); do [ "${args[i]}" != "$1" ] || { echo "${args[i + 1]}"; return; }; done; echo /dev/null; }
 case $url in
@@ -325,12 +342,37 @@ case $url in
     [ -f "$f" ] || { echo "curl: (22) The requested URL returned error: 404" >&2; exit 22; }
     cat "$f" > "$(arg -o)"
     exit 0 ;;
+  "https://cloudflare-dns.com/dns-query?"*)
+    if [ -n "${DOH_DOWN:-}" ]; then echo "curl: (28) Failed to connect to cloudflare-dns.com port 443 after 15002 ms: Timeout was reached" >&2; exit 28; fi
+    name=${url#*\?name=}
+    name=${name%%&*}
+    # NXDOMAIN (3), with no Answer, for a name public DNS does not have.
+    answers='' status=3
+    while read -r a; do
+      answers+="${answers:+,}{\"name\":\"$name\",\"type\":1,\"TTL\":300,\"data\":\"$a\"}"
+      status=0
+    done < <("$(dirname "$0")/fake-lookup" public "$name")
+    printf '{"Status":%s,"TC":false,"RD":true,"RA":true,"AD":false,"CD":false,"Question":[{"name":"%s","type":1}]%s}\n' \
+      "$status" "$name" "${answers:+,\"Answer\":[$answers]}"
+    exit 0 ;;
   http://*/.well-known/acme-challenge/*)
     host=${url#http://}
     host=${host%%/*}
+    to=$(arg --resolve)
+    case $to in
+      "$host:80:"*) addr=${to#"$host:80:"} ;;
+      *) addr=$("$(dirname "$0")/fake-lookup" own "$host" | head -n 1) ;;
+    esac
+    [ -n "$addr" ] || { echo "curl: (6) Could not resolve host: $host" >&2; exit 6; }
+    case $addr in
+      104.21.* | 172.67.*) ;;
+      *)
+        printf 'HTTP/1.1 308 Permanent Redirect\r\nLocation: https://%s%s\r\nServer: Caddy\r\n\r\n' "$host" "${url#http://"$host"}" > "$(arg -D)"
+        exit 0 ;;
+    esac
     case ${CF_EDGE:-308} in
       down) echo "curl: (7) Failed to connect to $host port 80 after 3 ms: Couldn't connect to server" >&2; exit 7 ;;
-      direct) printf 'HTTP/1.1 308 Permanent Redirect\r\nLocation: https://%s%s\r\nServer: Caddy\r\n\r\n' "$host" "${url#http://"$host"}" > "$(arg -D)" ;;
+      no-ray) printf 'HTTP/1.1 200 OK\r\nServer: nginx\r\n\r\n' > "$(arg -D)" ;;
       308) printf 'HTTP/1.1 308 Permanent Redirect\r\nLocation: https://%s%s\r\nServer: cloudflare\r\nCF-RAY: 8c0ffee0a1b2c3d4-SIN\r\n\r\n' "$host" "${url#http://"$host"}" > "$(arg -D)" ;;
       *) printf 'HTTP/1.1 %s Something\r\nServer: cloudflare\r\ncf-ray: 8c0ffee0a1b2c3d4-HKG\r\n\r\n' "$CF_EDGE" > "$(arg -D)" ;;
     esac
@@ -357,6 +399,63 @@ EOF
 #!/bin/sh
 echo "flock $*" >> "$CALLS"
 exit "${FLOCK_FAIL:-0}"
+EOF
+  cat > "$1/fake-lookup" <<'EOF'
+#!/usr/bin/env bash
+# fake-lookup public|own NAME: NAME's addresses, one to a line: as public
+# DNS has them ($FAKE/dns/NAME); or as this server's own lookup has them,
+# from /etc/hosts ($FAKE/hosts) first.
+set -u
+if [ "$1" = own ]; then
+  a=$(awk -v n="$2" '$1 !~ /^#/ { for (i = 2; i <= NF; i++) if ($i == n) print $1 }' "$FAKE/hosts" 2>/dev/null)
+  if [ -n "$a" ]; then echo "$a"; exit 0; fi
+fi
+cat "$FAKE/dns/$2" 2>/dev/null || true
+EOF
+  cat > "$1/dig" <<'EOF'
+#!/usr/bin/env bash
+# dig +short ... A NAME [@SERVER], as bind9-dnsutils' answers: NAME's
+# addresses, one to a line, nothing for a name it does not have; with no
+# @SERVER, systemd-resolved's stub answers, from /etc/hosts first. Errors
+# go to standard output, as dig's do.
+set -u
+echo "dig $*" >> "$CALLS"
+if [ -n "${NO_DIG:-}" ]; then echo "dig: not found" >&2; exit 127; fi
+server='' name=''
+for a in "$@"; do
+  case $a in
+    @*) server=${a#@} ;;
+    +* | A) ;;
+    *) name=$a ;;
+  esac
+done
+if [ -z "$server" ]; then exec "$(dirname "$0")/fake-lookup" own "$name"; fi
+if [[ " ${DNS_BLOCKED:-} " == *" $server "* ]]; then
+  printf ';; communications error to %s#53: timed out\n;; communications error to %s#53: timed out\n;; no servers could be reached\n' "$server" "$server"
+  exit 9
+fi
+exec "$(dirname "$0")/fake-lookup" public "$name"
+EOF
+  cat > "$1/resolvectl" <<'EOF'
+#!/usr/bin/env bash
+# resolvectl [OPTIONS] query NAME, as systemd-resolved answers it: from
+# /etc/hosts first, unless --synthesize=no, then from DNS.
+set -u
+echo "resolvectl $*" >> "$CALLS"
+name=${*: -1}
+if [ -n "${NO_RESOLVED:-}" ]; then
+  echo "$name: resolve call failed: Unit dbus-org.freedesktop.resolve1.service not found." >&2
+  exit 1
+fi
+how=own
+[[ " $* " != *" --synthesize=no "* ]] || how=public
+addrs=$("$(dirname "$0")/fake-lookup" "$how" "$name")
+if [ -z "$addrs" ]; then echo "$name: resolve call failed: '$name' not found" >&2; exit 1; fi
+lead="$name:"
+while read -r a; do
+  printf '%s %-30s -- link: eth0\n' "$lead" "$a"
+  lead=$(printf '%*s' "$((${#name} + 1))" '')
+done <<< "$addrs"
 EOF
   cat > "$1/rclone-fake" <<'EOF'
 #!/usr/bin/env bash

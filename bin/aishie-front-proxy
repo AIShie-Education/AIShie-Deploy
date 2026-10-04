@@ -35,7 +35,11 @@
 # Caddy refuses puts them back as they were, and Caddy goes on as before.
 # Then, behind Cloudflare, it asks http://HOST/.well-known/acme-challenge/
 # from here, as Let's Encrypt asks it, and says whether that goes through
-# Cloudflare to Caddy: the way Caddy renews its certificate there.
+# Cloudflare to Caddy: the way Caddy renews its certificate there. It asks
+# at the address public DNS gives HOST, as Let's Encrypt finds it, and says
+# the record is proxied when that address is one of Cloudflare's: not at
+# the one this server's own lookup gives, which is /etc/hosts's first, and
+# Ubuntu's names the server itself there (127.0.1.1 HOST).
 #
 # setup-server.sh sources it with AISHIE_FRONT_PROXY_LIB=1, which defines the
 # functions and runs nothing, and writes the settings (fp_write) before it
@@ -51,6 +55,10 @@ APP=${AISHIE_APP:-/opt/aishie}
 FP_CF_URL=https://www.cloudflare.com
 # A list longer than this is not Cloudflare's (it has 22 ranges in all).
 FP_MAX_RANGES=200
+# The public resolvers dig asks for HOST's address, in turn; and Cloudflare's
+# DNS over HTTPS, which curl asks when neither dig nor resolvectl answers.
+FP_RESOLVERS='1.1.1.1 8.8.8.8'
+FP_DOH_URL=https://cloudflare-dns.com/dns-query
 
 # compose.yaml reads these from aishie.env and images.env, and the same
 # names in this process's environment would win over both files.
@@ -318,17 +326,110 @@ fp_reload() {
   fp_die "Caddy refused them (above): $(fp_dir) is put back as it was, and Caddy goes on as before"
 }
 
-# fp_probe: http://HOST/.well-known/acme-challenge/, asked from here as Let's
-# Encrypt asks it for an HTTP-01 challenge, and what answered: Cloudflare
-# (cf-ray) passing it to Caddy, whose answer to a challenge it is not
-# solving is its redirect to HTTPS (308), or Cloudflare itself. Said, and
-# never a failure of the run: it is the dashboard's to fix.
+# fp_ask HOW COMMAND...: the IPv4 addresses in what COMMAND prints, one to a
+# line, in fp_addrs, and HOW in fp_dns. Else false, and HOW with what it
+# said instead added to fp_whys: its last line, on standard error or else
+# on standard output, where dig says it.
+fp_ask() {
+  fp_how=$1
+  shift
+  fp_rc=0
+  fp_out=$("$@" 2>"$STATE/front-proxy.err") || fp_rc=$?
+  fp_addrs=$(printf '%s\n' "$fp_out" | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print $i }')
+  if [ "$fp_rc" = 0 ] && [ -n "$fp_addrs" ]; then
+    fp_dns=$fp_how
+    return 0
+  fi
+  case $fp_rc in
+    0) fp_e="no IPv4 address" ;;
+    127) fp_e="not installed" ;;
+    *)
+      fp_e=$(sed '/^[[:space:]]*$/d' "$STATE/front-proxy.err" | tail -n 1)
+      [ -n "$fp_e" ] || fp_e=$(printf '%s\n' "$fp_out" | sed '/^[[:space:]]*$/d; s/^;; //' | tail -n 1)
+      ;;
+  esac
+  fp_whys="${fp_whys:+$fp_whys; }$fp_how: ${fp_e:-failed ($fp_rc)}"
+  return 1
+}
+
+# fp_doh HOST: the data of each answer Cloudflare's DNS over HTTPS gives for
+# HOST's A record, one to a line.
+fp_doh() {
+  fp_json=$(curl -fsS --proto =https --max-time 15 -H 'accept: application/dns-json' "$FP_DOH_URL?name=$1&type=A") || return
+  printf '%s\n' "$fp_json" | awk '{
+    n = split($0, f, /[,{}]/)
+    for (i = 1; i <= n; i++) if (sub(/^"data":"/, "", f[i])) { sub(/".*/, "", f[i]); print f[i] }
+  }'
+}
+
+# fp_lookup HOST: HOST's IPv4 addresses as public DNS gives them, which is
+# where Let's Encrypt asks, in fp_addrs, one to a line, and how they were
+# asked in fp_dns; false, with fp_why, when nothing gives one. Not as this
+# server's own lookup gives them (getent, or curl by itself): that reads
+# /etc/hosts first, where Ubuntu names the server itself (127.0.1.1 HOST),
+# and systemd-resolved's stub, which dig asks by default, answers from it
+# too. So dig, at each of FP_RESOLVERS; else resolvectl, with /etc/hosts and
+# its cache left out, which asks the server's DNS servers; else curl, which
+# every server here has, at Cloudflare's DNS over HTTPS.
+fp_lookup() {
+  fp_whys=''
+  for fp_r in $FP_RESOLVERS; do
+    if fp_ask "dig, at $fp_r" dig +short +time=5 +tries=2 A "$1" "@$fp_r"; then return 0; fi
+    [ "$fp_rc" != 127 ] || break
+  done
+  if fp_ask "resolvectl, past /etc/hosts and its cache" resolvectl --cache=no --synthesize=no --zone=no --legend=no -4 query "$1"; then
+    return 0
+  fi
+  if fp_ask "curl, at ${FP_DOH_URL#https://}" fp_doh "$1"; then return 0; fi
+  fp_why=$fp_whys
+  return 1
+}
+
+# fp_cloudflare ADDRESS: true when the IPv4 address is in one of
+# Cloudflare's ranges, fp_list.
+fp_cloudflare() {
+  printf '%s\n' "$fp_list" | awk -v a="$1" '
+    function n(s,   o) { split(s, o, "."); return ((o[1] * 256 + o[2]) * 256 + o[3]) * 256 + o[4] }
+    !/:/ {
+      split($0, r, "/")
+      m = 2 ^ (32 - r[2])
+      if (int(n(a) / m) == int(n(r[1]) / m)) { hit = 1; exit }
+    }
+    END { exit !hit }'
+}
+
+# fp_probe: whether HOST is proxied, by the address public DNS gives it:
+# Cloudflare's, or another; and, when it is, http://HOST/.well-known/
+# acme-challenge/ asked at that address, as Let's Encrypt asks it for an
+# HTTP-01 challenge, and what answered: Cloudflare (cf-ray) passing it to
+# Caddy, whose answer to a challenge it is not solving is its redirect to
+# HTTPS (308), or Cloudflare itself. Said, and never a failure of the run:
+# it is the dashboard's to fix.
 fp_probe() {
   fp_host=$(fp_setting HOST)
   [ -n "$fp_host" ] || return 0
   fp_url=http://$fp_host/.well-known/acme-challenge/aishie-front-proxy-check
-  if ! curl -sS --max-time 15 -o /dev/null -D "$STATE/front-proxy.head" "$fp_url" 2>"$STATE/front-proxy.err"; then
-    echo "warning: could not ask $fp_url from this server ($(tail -n 1 "$STATE/front-proxy.err" 2>/dev/null)): whether Let's Encrypt reaches Caddy through Cloudflare is not known" >&2
+  if ! fp_lookup "$fp_host"; then
+    rm -f "$STATE/front-proxy.err"
+    echo "warning: could not find the address of $fp_host in public DNS ($fp_why): whether Let's Encrypt reaches Caddy through Cloudflare is not known" >&2
+    return 0
+  fi
+  rm -f "$STATE/front-proxy.err"
+  # Proxied when every address is Cloudflare's: Let's Encrypt may take any.
+  fp_addr=''
+  for fp_a in $fp_addrs; do
+    if ! fp_cloudflare "$fp_a"; then
+      fp_say "the DNS record of $fp_host is not proxied: public DNS ($fp_dns) gives $fp_a, which is none of Cloudflare's addresses, and people reach this server's own address"
+      if [ -n "$fp_only" ]; then
+        echo "warning: FRONT_PROXY_ONLY=yes refuses the people who reach this server's own address: proxy the record first (README.md, Behind Cloudflare)" >&2
+      fi
+      return 0
+    fi
+    [ -n "$fp_addr" ] || fp_addr=$fp_a
+  done
+  fp_say "the DNS record of $fp_host is proxied: public DNS ($fp_dns) gives $fp_addr, one of Cloudflare's addresses"
+  if ! curl -sS --max-time 15 --resolve "$fp_host:80:$fp_addr" -o /dev/null -D "$STATE/front-proxy.head" "$fp_url" 2>"$STATE/front-proxy.err"; then
+    echo "warning: could not ask $fp_url at $fp_addr from this server ($(tail -n 1 "$STATE/front-proxy.err" 2>/dev/null)): whether Let's Encrypt reaches Caddy through Cloudflare is not known" >&2
     rm -f "$STATE/front-proxy.head" "$STATE/front-proxy.err"
     return 0
   fi
@@ -336,10 +437,7 @@ fp_probe() {
   fp_ray=$(tr -d '\r' < "$STATE/front-proxy.head" | awk 'tolower($0) ~ /^cf-ray:/ { sub(/^[^:]*:[ \t]*/, ""); print; exit }')
   rm -f "$STATE/front-proxy.head" "$STATE/front-proxy.err"
   if [ -z "$fp_ray" ]; then
-    fp_say "$fp_url is answered without Cloudflare (no cf-ray): the DNS record of $fp_host is not proxied, as this server sees it, and people reach this server's own address"
-    if [ -n "$fp_only" ]; then
-      echo "warning: FRONT_PROXY_ONLY=yes refuses the people who reach this server's own address: proxy the record first (README.md, Behind Cloudflare)" >&2
-    fi
+    echo "warning: $fp_url, asked at $fp_addr, is answered (${fp_status:-nothing}) without a cf-ray, which Cloudflare sends with every answer: whether Let's Encrypt reaches Caddy through Cloudflare is not known" >&2
     return 0
   fi
   case $fp_status in
