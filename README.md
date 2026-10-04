@@ -1324,8 +1324,15 @@ Caddy starts renewing it about thirty days before it ends, around
 (strict) and plain HTTP to `/.well-known/acme-challenge/` must reach the
 server (step 3). `aishie front-proxy` says whether it does: `goes through
 Cloudflare (cf-ray …) to Caddy, which answers it (308)` is right; a warning
-says what Cloudflare does instead (a 301 is Always Use HTTPS). The
-certificate the server has, and when it ends:
+says what Cloudflare does instead (a 301 is Always Use HTTPS). It asks at
+the address public DNS gives the name, as Let's Encrypt does, and says the
+record is proxied when that address is one of Cloudflare's: by `dig` at
+1.1.1.1 (else 8.8.8.8), else `resolvectl` with `/etc/hosts` and its cache
+left out, else Cloudflare's DNS over HTTPS by `curl`, and it says which.
+Not as the server itself looks the name up: Ubuntu's `/etc/hosts` names the
+server `127.0.1.1 HOST`, where Caddy answers with no Cloudflare in front,
+and a check by `curl http://HOST/…` on the server would find the record not
+proxied. The certificate the server has, and when it ends:
 
 ```
 echo | openssl s_client -connect 127.0.0.1:443 -servername test.aishie.app 2>/dev/null | openssl x509 -noout -issuer -enddate

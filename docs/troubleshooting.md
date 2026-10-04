@@ -353,6 +353,15 @@ challenge path; Cloudflare's error pages name the error by its number.
   the name not proxied (yet), or set back to DNS only before
   `FRONT_PROXY_ONLY` was taken out (README.md, Behind Cloudflare, Going
   back), or someone reaching the server's address directly.
+- **`could not find the address of HOST in public DNS`** (from `aishie
+  front-proxy`). Neither `dig` at 1.1.1.1 or 8.8.8.8, nor `resolvectl`,
+  nor Cloudflare's DNS over HTTPS gave the name an IPv4 address; what each
+  said is in brackets. Nothing changes for Caddy: only whether its
+  certificate's challenge reaches it is not known. `no IPv4 address` from
+  each: the name has no A record (check it in the dashboard). `no servers
+  could be reached`, or a timeout, from each: something keeps the server
+  from reaching those resolvers (outgoing port 53, or 443 for DNS over
+  HTTPS). `dig` comes with `bind9-dnsutils`, if it is not installed.
 - **`could not fetch https://www.cloudflare.com/ips-v4`** (from `aishie
   front-proxy`, or its timer in `journalctl -u aishie-front-proxy`). The
   last list fetched stays in force, as it says, or the list pinned in this
